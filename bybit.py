@@ -1,227 +1,147 @@
 from __future__ import annotations
 
 import time
-
 from typing import Any
 
 import pandas as pd
-
 import requests
 
-BASE_URL = "https://fapi.binance.com"
+BASE_URL = "https://api.bybit.com"
 
 _SESSION = requests.Session()
-
 _SESSION.headers.update(
-
     {
-
         "User-Agent": "Mozilla/5.0",
-
         "Accept": "application/json",
-
     }
-
 )
 
-class BybitError(RuntimeError):
 
+class BybitError(RuntimeError):
     pass
 
+
 def _get(
-
     path: str,
-
     params: dict[str, Any] | None = None,
-
     retries: int = 3,
-
-) -> Any:
-
+) -> dict[str, Any]:
     last_error: Exception | None = None
 
     for attempt in range(retries):
-
         try:
-
             response = _SESSION.get(
-
                 BASE_URL + path,
-
                 params=params or {},
-
                 timeout=15,
-
             )
-
             response.raise_for_status()
+            payload = response.json()
 
-            return response.json()
+            if payload.get("retCode") != 0:
+                raise BybitError(
+                    f"Bybit 오류 {payload.get('retCode')}: "
+                    f"{payload.get('retMsg', '알 수 없는 오류')}"
+                )
 
-        except (requests.RequestException, ValueError) as exc:
-
+            return payload
+        except (requests.RequestException, ValueError, BybitError) as exc:
             last_error = exc
-
             if attempt < retries - 1:
-
                 time.sleep(1.0 * (attempt + 1))
 
-    raise BybitError(
+    raise BybitError(f"Bybit 데이터를 가져오지 못했습니다: {last_error}")
 
-        f"Binance 선물 데이터를 가져오지 못했습니다: {last_error}"
-
-    )
 
 def list_usdt_perpetual_symbols() -> list[str]:
+    symbols: list[str] = []
+    cursor = ""
 
-    payload = _get("/fapi/v1/exchangeInfo")
+    while True:
+        params: dict[str, Any] = {
+            "category": "linear",
+            "limit": 1000,
+        }
+        if cursor:
+            params["cursor"] = cursor
 
-    rows = payload["symbols"]
+        payload = _get("/v5/market/instruments-info", params)
+        result = payload.get("result", {})
+        rows = result.get("list", [])
 
-    return sorted(
+        symbols.extend(
+            row["symbol"]
+            for row in rows
+            if row.get("quoteCoin") == "USDT"
+            and row.get("contractType") == "LinearPerpetual"
+            and row.get("status") == "Trading"
+        )
 
-        row["symbol"]
+        cursor = result.get("nextPageCursor", "")
+        if not cursor:
+            break
 
-        for row in rows
+    return sorted(set(symbols))
 
-        if row.get("quoteAsset") == "USDT"
-
-        and row.get("contractType") == "PERPETUAL"
-
-        and row.get("status") == "TRADING"
-
-    )
 
 def get_klines(
-
     symbol: str,
-
     interval: str = "15",
-
     limit: int = 240,
-
 ) -> pd.DataFrame:
-
-    interval_map = {
-
-        "1": "1m",
-
-        "3": "3m",
-
-        "5": "5m",
-
-        "15": "15m",
-
-        "30": "30m",
-
-        "60": "1h",
-
-        "240": "4h",
-
-        "D": "1d",
-
-    }
-
-    binance_interval = interval_map.get(interval, interval)
-
-    rows = _get(
-
-        "/fapi/v1/klines",
-
+    payload = _get(
+        "/v5/market/kline",
         {
-
+            "category": "linear",
             "symbol": symbol.upper(),
-
-            "interval": binance_interval,
-
+            "interval": interval,
             "limit": limit,
-
         },
-
     )
 
+    rows = payload.get("result", {}).get("list", [])
     if not rows:
-
         raise BybitError(f"{symbol}: 캔들 데이터가 없습니다.")
 
     columns = [
-
         "start_time",
-
         "open",
-
         "high",
-
         "low",
-
         "close",
-
         "volume",
-
-        "close_time",
-
-        "quote_volume",
-
-        "trade_count",
-
-        "taker_buy_base",
-
-        "taker_buy_quote",
-
-        "ignore",
-
+        "turnover",
     ]
 
     df = pd.DataFrame(rows, columns=columns)
-
     numeric_columns = [
-
         "open",
-
         "high",
-
         "low",
-
         "close",
-
         "volume",
-
-        "quote_volume",
-
+        "turnover",
     ]
-
     df[numeric_columns] = df[numeric_columns].astype(float)
 
-    df["turnover"] = df["quote_volume"]
-
     df["start_time"] = pd.to_datetime(
-
         df["start_time"].astype("int64"),
-
         unit="ms",
-
         utc=True,
-
     )
 
-    return df[
-
-        [
-
-            "start_time",
-
-            "open",
-
-            "high",
-
-            "low",
-
-            "close",
-
-            "volume",
-
-            "turnover",
-
+    return (
+        df[
+            [
+                "start_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "turnover",
+            ]
         ]
-
-    ].sort_values("start_time").reset_index(drop=True)
+        .sort_values("start_time")
+        .reset_index(drop=True)
+    )
