@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,8 @@ class StrategySettings:
     reversal_body_mult: float = 1.20
     allow_early_reversal: bool = True
     take_profit_pct: float = 1.2
+    max_stop_pct: float = 1.0
+    stop_buffer_pct: float = 0.10
     stop_rsi_max: float = 45.0
     stop_vol_mult: float = 1.1
     entry_tolerance_pct: float = 0.30
@@ -41,11 +44,15 @@ class ScanResult:
     max_entry_price: float
     current_price: float
     entry_status: str
-    pullback_score: int
-    current_score: int
+    pullback_score_10: float
+    current_score_10: float
     rsi: float
     candle_time_utc: str
+    stop_price: float
+    stop_pct: float
+    tp_price: float
     reasons: str
+    fail_reasons: str
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -58,12 +65,10 @@ def _rsi(close: pd.Series, length: int) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     avg_loss = loss.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    value = 100 - (100 / (1 + rs))
-    return value.fillna(100.0)
+    return (100 - (100 / (1 + rs))).fillna(100.0)
 
 
 def _session_vwap(df: pd.DataFrame) -> pd.Series:
-    # TradingView ta.vwap(hlc3)와 최대한 가깝게 UTC 일자별로 재시작합니다.
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     day = df["start_time"].dt.floor("D")
     cumulative_pv = (typical * df["volume"]).groupby(day).cumsum()
@@ -80,95 +85,63 @@ def add_indicators(df: pd.DataFrame, s: StrategySettings) -> pd.DataFrame:
     out["vol_avg"] = out["volume"].rolling(s.vol_len).mean()
     out["avg_body"] = (out["close"] - out["open"]).abs().rolling(s.vol_len).mean()
     out["bb_basis"] = out["close"].rolling(s.bb_len).mean()
-    # Pine ta.stdev는 population stdev에 해당하므로 ddof=0
     out["bb_dev"] = out["close"].rolling(s.bb_len).std(ddof=0) * s.bb_mult
     out["bb_upper"] = out["bb_basis"] + out["bb_dev"]
     out["bb_lower"] = out["bb_basis"] - out["bb_dev"]
     return out
 
 
-def analyze_symbol(
-    symbol: str,
-    raw_df: pd.DataFrame,
-    settings: StrategySettings | None = None,
-) -> ScanResult:
-    s = settings or StrategySettings()
-    df = add_indicators(raw_df, s)
+def _closed_only(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Bybit의 마지막 행은 진행 중인 15분봉일 수 있으므로 마감봉만 사용합니다."""
+    if raw_df.empty:
+        return raw_df
+    now = pd.Timestamp(datetime.now(timezone.utc))
+    interval = pd.Timedelta(minutes=15)
+    mask = raw_df["start_time"] + interval <= now
+    closed = raw_df.loc[mask].copy()
+    return closed if len(closed) >= 70 else raw_df.iloc[:-1].copy()
 
+
+def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings | None = None) -> ScanResult:
+    s = settings or StrategySettings()
+    df = add_indicators(_closed_only(raw_df), s)
     if len(df) < max(s.slow_len, s.reversal_lookback, s.vol_len) + 3:
-        raise ValueError(f"{symbol}: 계산에 필요한 캔들이 부족합니다.")
+        raise ValueError(f"{symbol}: 계산에 필요한 마감 캔들이 부족합니다.")
 
     i = len(df) - 1
-    row = df.iloc[i]
-    prev = df.iloc[i - 1]
-
+    row, prev = df.iloc[i], df.iloc[i - 1]
     trend_ok = row.ema_fast > row.ema_slow
     slope_ok = row.ema_fast >= prev.ema_fast
     price_ok = row.close > row.ema_fast and row.close > row.vwap
     rsi_ok = s.buy_rsi_min <= row.rsi <= s.buy_rsi_max
     volume_ok = pd.notna(row.vol_avg) and row.volume >= row.vol_avg * s.buy_vol_mult
-    recent_low = df["low"].iloc[i - s.pullback_bars + 1 : i + 1].min()
+    recent_low = df["low"].iloc[i - s.pullback_bars + 1:i + 1].min()
     pullback_ok = recent_low <= row.ema_fast * (1 + s.ema_tolerance_pct / 100)
-
-    # V1에서는 BTC 필터를 꺼둔 Pine 기본값과 동일하게 1점으로 처리합니다.
     btc_ok = True
-    pullback_score = sum(
-        int(x)
-        for x in [
-            trend_ok,
-            slope_ok,
-            price_ok,
-            rsi_ok,
-            volume_ok,
-            pullback_ok,
-            btc_ok,
-        ]
-    )
-    bullish_breakout = row.close > prev.high and row.close > row.open
-    pullback_setup = (
-        pullback_score >= s.min_pullback_score
-        and trend_ok
-        and bullish_breakout
-        and row.close < row.bb_upper
-    )
+    checks = [trend_ok, slope_ok, price_ok, rsi_ok, volume_ok, pullback_ok, btc_ok]
+    pullback_raw = sum(int(x) for x in checks)
+    pullback_score_10 = round(pullback_raw / 7 * 10, 1)
 
-    recent = df.iloc[i - s.reversal_lookback + 1 : i + 1]
+    bullish_breakout = row.close > prev.high and row.close > row.open
+    pullback_setup = pullback_raw >= s.min_pullback_score and trend_ok and bullish_breakout and row.close < row.bb_upper and rsi_ok
+
+    recent = df.iloc[i - s.reversal_lookback + 1:i + 1]
     recent_bottom = recent["low"].min()
     bottom_near_lower = (recent["low"] - recent["bb_lower"]).min() <= 0
     expanded = row.close >= recent_bottom * 1.006
     bull_body = row.close - row.open
-    strong_bull = (
-        row.close > row.open
-        and pd.notna(row.avg_body)
-        and bull_body >= row.avg_body * s.reversal_body_mult
-    )
+    strong_bull = row.close > row.open and pd.notna(row.avg_body) and bull_body >= row.avg_body * s.reversal_body_mult
     rsi_cross = prev.rsi <= s.reversal_rsi_level < row.rsi
     rsi_rising = row.rsi > s.reversal_rsi_level and row.rsi > prev.rsi
-    reversal_volume = (
-        pd.notna(row.vol_avg)
-        and row.volume >= row.vol_avg * s.reversal_vol_mult
-    )
-    reclaim_fast = (
-        (prev.close <= prev.ema_fast and row.close > row.ema_fast)
-        or (row.close > row.ema_fast and prev.close <= prev.ema_fast)
-    )
-    reclaim_vwap = (
-        (prev.close <= prev.vwap and row.close > row.vwap)
-        or (row.close > row.vwap and prev.close <= prev.vwap)
-    )
-    ema_turning_up = row.ema_fast > prev.ema_fast
-    early_trend_ok = ema_turning_up if s.allow_early_reversal else trend_ok
+    reversal_volume = pd.notna(row.vol_avg) and row.volume >= row.vol_avg * s.reversal_vol_mult
+    reclaim_fast = prev.close <= prev.ema_fast and row.close > row.ema_fast
+    reclaim_vwap = prev.close <= prev.vwap and row.close > row.vwap
+    early_trend_ok = row.ema_fast > prev.ema_fast if s.allow_early_reversal else trend_ok
     reversal_setup = (
-        s.enable_reversal
-        and bottom_near_lower
-        and expanded
-        and strong_bull
-        and (rsi_cross or rsi_rising)
-        and reversal_volume
-        and (reclaim_fast or reclaim_vwap)
-        and early_trend_ok
-        and btc_ok
-        and row.close < row.bb_upper
+        s.enable_reversal and bottom_near_lower and expanded and strong_bull
+        and (rsi_cross or rsi_rising) and reversal_volume
+        and (reclaim_fast or reclaim_vwap) and early_trend_ok
+        and row.close < row.bb_upper and rsi_ok
     )
 
     signal = "BUY-R" if reversal_setup else "BUY-P" if pullback_setup else "-"
@@ -176,46 +149,44 @@ def analyze_symbol(
     buy_price = float(row.close)
     max_entry = buy_price * (1 + s.entry_tolerance_pct / 100)
 
-    structure_broken = (
-        row.close < (recent_bottom if signal == "BUY-R" else row.ema_slow)
-        or row.rsi < s.stop_rsi_max
-    )
-    falling_now = row.close < row.open or row.close < row.ema_fast or not slope_ok
+    previous_bearish = df.iloc[max(0, i - 6):i]
+    previous_bearish = previous_bearish[previous_bearish["close"] < previous_bearish["open"]]
+    bearish_low = float(previous_bearish.iloc[-1]["low"]) if not previous_bearish.empty else float(recent_low)
+    six_low = float(df["low"].iloc[max(0, i - 5):i + 1].min())
+    structural_low = min(bearish_low, six_low)
+    stop_price = structural_low * (1 - s.stop_buffer_pct / 100)
+    stop_pct = max(0.0, (buy_price - stop_price) / buy_price * 100)
+    stop_too_wide = stop_pct > s.max_stop_pct
+    tp_price = buy_price * (1 + s.take_profit_pct / 100)
+
+    hold_checks = [
+        slope_ok,
+        row.close >= row.ema_fast or row.close >= row.vwap,
+        s.stop_rsi_max <= row.rsi <= s.buy_rsi_max + 5,
+        btc_ok,
+        not (row.close < row.open and pd.notna(row.vol_avg) and row.volume >= row.vol_avg * s.stop_vol_mult),
+    ]
+    current_score_10 = round(sum(int(x) for x in hold_checks) / 5 * 10, 1)
+
     if not signal_now:
-        entry_status = "NO SIGNAL"
-    elif structure_broken:
-        entry_status = "PASS"
-    elif falling_now:
-        entry_status = "WAIT"
+        entry_status = "대기"
+    elif stop_too_wide:
+        entry_status = "진입 제외"
+        signal_now = False
+    elif row.close < row.ema_fast or not slope_ok:
+        entry_status = "주의"
     else:
-        entry_status = "ENTRY OK"
+        entry_status = "진입 후보"
 
-    hold_ema = slope_ok
-    hold_zone = row.close >= row.ema_fast or row.close >= row.vwap
-    hold_rsi = s.stop_rsi_max <= row.rsi <= s.buy_rsi_max + 5
-    hold_btc = btc_ok
-    hold_no_dump = not (
-        row.close < row.open
-        and pd.notna(row.vol_avg)
-        and row.volume >= row.vol_avg * s.stop_vol_mult
-    )
-    current_score = sum(
-        int(x) for x in [hold_ema, hold_zone, hold_rsi, hold_btc, hold_no_dump]
-    )
-
-    reason_items = []
-    if trend_ok:
-        reason_items.append("EMA20>EMA60")
-    if slope_ok:
-        reason_items.append("EMA20 상승")
-    if price_ok:
-        reason_items.append("EMA·VWAP 위")
-    if rsi_ok:
-        reason_items.append("RSI 정상")
-    if volume_ok:
-        reason_items.append("거래량 통과")
-    if pullback_ok:
-        reason_items.append("눌림 확인")
+    labels = ["EMA20>EMA60", "EMA20 상승", "EMA·VWAP 위", "RSI 정상", "거래량 통과", "눌림 확인", "BTC 필터"]
+    reasons = [name for name, ok in zip(labels, checks) if ok]
+    failed = [name for name, ok in zip(labels, checks) if not ok]
+    if not bullish_breakout:
+        failed.append("직전 고점 돌파 없음")
+    if row.close >= row.bb_upper:
+        failed.append("볼린저 상단 과열")
+    if stop_too_wide:
+        failed.append(f"손절폭 {stop_pct:.2f}% > {s.max_stop_pct:.2f}%")
 
     return ScanResult(
         symbol=symbol,
@@ -223,11 +194,15 @@ def analyze_symbol(
         signal_now=signal_now,
         buy_price=buy_price,
         max_entry_price=float(max_entry),
-        current_price=float(row.close),
+        current_price=buy_price,
         entry_status=entry_status,
-        pullback_score=int(pullback_score),
-        current_score=int(current_score),
+        pullback_score_10=pullback_score_10,
+        current_score_10=current_score_10,
         rsi=float(row.rsi),
         candle_time_utc=row.start_time.isoformat(),
-        reasons=", ".join(reason_items) or "-",
+        stop_price=float(stop_price),
+        stop_pct=float(stop_pct),
+        tp_price=float(tp_price),
+        reasons=", ".join(reasons) or "-",
+        fail_reasons=", ".join(failed) or "-",
     )
