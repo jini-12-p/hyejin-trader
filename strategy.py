@@ -28,7 +28,7 @@ class StrategySettings:
     reversal_body_mult: float = 1.20
     allow_early_reversal: bool = True
     take_profit_pct: float = 1.2
-    max_stop_pct: float = 1.0
+    max_stop_pct: float = 5.0
     stop_buffer_pct: float = 0.10
     stop_rsi_max: float = 45.0
     stop_vol_mult: float = 1.1
@@ -123,7 +123,7 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
     pullback_score_10 = round(pullback_raw / 7 * 10, 1)
 
     bullish_breakout = row.close > prev.high and row.close > row.open
-    pullback_setup = pullback_raw >= s.min_pullback_score and trend_ok and bullish_breakout and row.close < row.bb_upper and rsi_ok
+    pullback_setup = pullback_raw >= s.min_pullback_score and trend_ok and row.close < row.bb_upper and rsi_ok
 
     recent = df.iloc[i - s.reversal_lookback + 1:i + 1]
     recent_bottom = recent["low"].min()
@@ -170,13 +170,12 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
 
     if not signal_now:
         entry_status = "대기"
-    elif stop_too_wide:
-        entry_status = "진입 제외"
-        signal_now = False
     elif row.close < row.ema_fast or not slope_ok:
-        entry_status = "주의"
+        entry_status = "관찰 BUY"
+    elif not bullish_breakout:
+        entry_status = "관찰 BUY"
     else:
-        entry_status = "진입 후보"
+        entry_status = "BUY"
 
     labels = ["EMA20>EMA60", "EMA20 상승", "EMA·VWAP 위", "RSI 정상", "거래량 통과", "눌림 확인", "BTC 필터"]
     reasons = [name for name, ok in zip(labels, checks) if ok]
@@ -186,7 +185,7 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
     if row.close >= row.bb_upper:
         failed.append("볼린저 상단 과열")
     if stop_too_wide:
-        failed.append(f"손절폭 {stop_pct:.2f}% > {s.max_stop_pct:.2f}%")
+        failed.append(f"구조 손절폭 {stop_pct:.2f}% (참고)")
 
     return ScanResult(
         symbol=symbol,

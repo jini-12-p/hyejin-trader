@@ -11,7 +11,7 @@ import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
 
-from bybit import get_klines, list_usdt_perpetual_symbols
+from bybit import get_klines, get_ticker, list_usdt_perpetual_symbols
 from strategy import StrategySettings, analyze_symbol
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
@@ -39,6 +39,14 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS positions (
             symbol TEXT PRIMARY KEY, entry_price REAL NOT NULL, entry_time_utc TEXT NOT NULL,
             tp_pct REAL NOT NULL, stop_price REAL NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN'
+        );
+        CREATE TABLE IF NOT EXISTS position_live (
+            symbol TEXT PRIMARY KEY, last_price REAL, pnl_pct REAL, tp_price REAL, stop_price REAL,
+            live_action TEXT, trend_action TEXT, hold_score REAL, bars_elapsed INTEGER,
+            updated_at_utc TEXT, latest_closed_start_utc TEXT
+        );
+        CREATE TABLE IF NOT EXISTS position_ticks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, price REAL, pnl_pct REAL, checked_at_utc TEXT, action TEXT
         );
         CREATE TABLE IF NOT EXISTS position_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, candle_time_utc TEXT,
@@ -136,39 +144,26 @@ def save_position(symbol: str, entry_price: float, stop_price: float, tp_pct: fl
 
 def monitor_positions() -> list[dict]:
     with db() as conn:
-        positions = conn.execute("SELECT * FROM positions WHERE status='OPEN'").fetchall()
-    output = []
-    for p in positions:
-        try:
-            raw = get_klines(p["symbol"], "15", 120)
-            result = analyze_symbol(p["symbol"], raw, StrategySettings()).to_dict()
-            last = raw.iloc[-2] if len(raw) >= 2 else raw.iloc[-1]
-            entry = float(p["entry_price"]); current = float(last.close)
-            pnl = (current-entry)/entry*100; tp = entry*(1+float(p["tp_pct"])/100); stop=float(p["stop_price"])
-            bars = max(0, int((pd.Timestamp(last.start_time)-pd.Timestamp(p["entry_time_utc"]))/pd.Timedelta(minutes=15)))
-            if float(last.high) >= tp: action="TP 도달"
-            elif float(last.low) <= stop: action="STOP 도달"
-            elif bars >= 6: action="6봉 종료"
-            elif result["current_score_10"] >= 8: action="HOLD"
-            elif result["current_score_10"] >= 6: action="주의"
-            else: action="STOP 권고"
-            with db() as conn:
-                conn.execute("INSERT OR IGNORE INTO position_checks(symbol,candle_time_utc,checked_at_utc,close_price,high_price,low_price,pnl_pct,hold_score,action,bars_elapsed) VALUES(?,?,?,?,?,?,?,?,?,?)", (p["symbol"],pd.Timestamp(last.start_time).isoformat(),datetime.now(timezone.utc).isoformat(),current,float(last.high),float(last.low),pnl,result["current_score_10"],action,bars))
-            output.append({"symbol":p["symbol"],"entry":entry,"current":current,"pnl":pnl,"tp":tp,"stop":stop,"score":result["current_score_10"],"action":action,"bars":bars})
-        except Exception as exc:
-            output.append({"symbol":p["symbol"],"error":str(exc)})
-    return output
+        rows=conn.execute("""SELECT p.*,l.last_price,l.pnl_pct,l.tp_price,l.live_action,l.trend_action,
+        l.hold_score,l.bars_elapsed,l.updated_at_utc,l.latest_closed_start_utc
+        FROM positions p LEFT JOIN position_live l ON l.symbol=p.symbol WHERE p.status='OPEN'""").fetchall()
+    return [dict(r) for r in rows]
+
+
+def close_position(symbol: str, status: str) -> None:
+    with db() as conn:
+        conn.execute("UPDATE positions SET status=? WHERE symbol=?",(status,symbol))
 
 
 init_db(); require_password()
 st.title("📈 HJ Trader")
-st.caption("Bybit USDT 무기한 · 마감된 15분봉 기준 · 설정/신호/포지션 자동 저장")
+st.caption("마감봉 신호 + Bybit 실시간 현재가 · 진입 후 5초 추적")
 
 watchlist = get_setting("watchlist", DEFAULT_WATCHLIST)
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
 tp_pct = float(get_setting("tp_pct", 1.2))
-max_stop_pct = float(get_setting("max_stop_pct", 1.0))
+max_stop_pct = float(get_setting("max_stop_pct", 5.0))
 
 with st.expander("⚙️ 감시종목 및 기준", expanded=False):
     try: symbols = cached_symbols()
@@ -178,7 +173,7 @@ with st.expander("⚙️ 감시종목 및 기준", expanded=False):
     new_min = st.slider("표시할 최소점수(10점 만점)", 0.0, 10.0, min_score, 0.5)
     new_only = st.toggle("BUY 신호만 보기", value=show_only_buy)
     new_tp = st.number_input("TP (%)", 0.1, 10.0, tp_pct, 0.1)
-    new_stop = st.number_input("최대 허용 손절폭 (%)", 0.2, 5.0, max_stop_pct, 0.1)
+    new_stop = st.number_input("구조 손절폭 참고 상한 (%)", 0.5, 10.0, max_stop_pct, 0.1)
     if st.button("설정 영구 저장", use_container_width=True):
         set_setting("watchlist",selected); set_setting("min_score",new_min); set_setting("show_only_buy",new_only); set_setting("tp_pct",new_tp); set_setting("max_stop_pct",new_stop)
         st.success("저장했어요. 다시 로그인하거나 서버가 재시작돼도 유지됩니다."); st.rerun()
@@ -220,7 +215,15 @@ def auto_scan_panel():
         with st.container(border=True):
             st.markdown(f"### {icon} {r['symbol']} · {r['signal'] if r['signal']!='-' else '대기'}")
             a,b,c=st.columns(3); a.metric("현재점수",f"{r['current_score_10']:.1f}/10"); b.metric("눌림점수",f"{r['pullback_score_10']:.1f}/10"); c.metric("RSI",f"{r['rsi']:.1f}")
-            st.write(f"**상태:** {r['entry_status']}  \n**신호가:** {r['buy_price']:.10g}  \n**TP:** {r['tp_price']:.10g}  \n**STOP:** {r['stop_price']:.10g} (-{r['stop_pct']:.2f}%)  \n**마감봉:** {r['candle_time_utc'][:16].replace('T',' ')} UTC  \n**통과:** {r['reasons']}  \n**탈락/주의:** {r['fail_reasons']}")
+            try:
+                live_price=get_ticker(r['symbol']); diff=(live_price-float(r['buy_price']))/float(r['buy_price'])*100
+                if diff>0.6: live_entry='추격 대기'
+                elif diff<-1.5: live_entry='신호 약화 확인'
+                else: live_entry='실시간 진입 가능 범위'
+            except Exception:
+                live_price=float(r['buy_price']); diff=0.0; live_entry='현재가 조회 지연'
+            close_kst=(pd.Timestamp(r['candle_time_utc'])+pd.Timedelta(minutes=15)).tz_convert('Asia/Seoul')
+            st.write(f"**마감 신호:** {r['entry_status']} · **실시간:** {live_entry}  \n**신호가:** {r['buy_price']:.10g} · **현재가:** {live_price:.10g} ({diff:+.2f}%)  \n**TP:** {r['tp_price']:.10g} · **비상 STOP 참고:** {r['stop_price']:.10g} (-{r['stop_pct']:.2f}%)  \n**봉 마감(KST):** {close_kst.strftime('%m-%d %H:%M')}  \n**통과:** {r['reasons']}  \n**주의:** {r['fail_reasons']}")
             entered=st.checkbox("이 BUY에 실제 진입했어요",key=f"entered_{r['symbol']}_{r['candle_time_utc']}")
             if entered:
                 ep=st.number_input("내 평단가",min_value=0.0,value=float(r['buy_price']),format="%.10f",key=f"ep_{r['symbol']}")
@@ -231,13 +234,29 @@ def auto_scan_panel():
 
 auto_scan_panel()
 
-st.divider(); st.subheader("📌 진입 포지션 6봉 관리")
-for p in monitor_positions():
-    with st.container(border=True):
-        if "error" in p: st.error(f"{p['symbol']}: {p['error']}"); continue
-        st.markdown(f"### {p['symbol']} · {p['action']}")
-        a,b,c=st.columns(3); a.metric("손익률",f"{p['pnl']:+.2f}%"); b.metric("HOLD 점수",f"{p['score']:.1f}/10"); c.metric("경과",f"{p['bars']}/6봉")
-        st.write(f"평단 {p['entry']:.10g} · 현재 {p['current']:.10g}  \nTP {p['tp']:.10g} · STOP {p['stop']:.10g}")
+st.divider(); st.subheader("📌 실시간 포지션 관리")
+st.caption("tracker.py가 서버에서 5초마다 현재가를 기록합니다. TP/비상 STOP은 진입 이후 실시간 가격, 추세 판단은 마감봉 기준입니다.")
+@st.fragment(run_every=5)
+def live_positions_panel():
+    positions=monitor_positions()
+    if not positions:
+        st.info("관리 중인 포지션이 없습니다.")
+    for p in positions:
+        with st.container(border=True):
+            lp=p.get('last_price'); pnl=p.get('pnl_pct'); bars=p.get('bars_elapsed') or 0
+            live=p.get('live_action') or '실시간 추적 시작 대기'; trend=p.get('trend_action') or '마감봉 판단 대기'
+            st.markdown(f"### {p['symbol']} · {live}")
+            a,b,c=st.columns(3)
+            a.metric("실시간 손익", "조회 중" if pnl is None else f"{pnl:+.2f}%")
+            b.metric("마감봉 추세", trend)
+            c.metric("경과", f"{bars}/6봉")
+            st.write(f"평단 {p['entry_price']:.10g} · 현재 {'조회 중' if lp is None else format(lp,'.10g')}  \nTP {'조회 중' if p.get('tp_price') is None else format(p['tp_price'],'.10g')} · 비상 STOP {p['stop_price']:.10g}  \n업데이트 UTC {str(p.get('updated_at_utc') or 'tracker 대기')[:19].replace('T',' ')}")
+            x,y,z,w=st.columns(4)
+            if x.button("익절 완료",key=f"tpdone_{p['symbol']}"): close_position(p['symbol'],'TP_MANUAL'); st.rerun()
+            if y.button("손절 완료",key=f"stdone_{p['symbol']}"): close_position(p['symbol'],'STOP_MANUAL'); st.rerun()
+            if z.button("수동 종료",key=f"closed_{p['symbol']}"): close_position(p['symbol'],'CLOSED'); st.rerun()
+            if w.button("잘못 저장",key=f"cancel_{p['symbol']}"): close_position(p['symbol'],'CANCELLED'); st.rerun()
+live_positions_panel()
 
 with st.expander("📊 축적 데이터 요약"):
     with db() as conn:
@@ -248,4 +267,4 @@ with st.expander("📊 축적 데이터 요약"):
     st.write(f"저장된 스캔 {total}건 · BUY 후보 {buys}건 · 포지션 추적 {checks}봉")
     if not recent.empty: st.dataframe(recent,use_container_width=True,hide_index=True)
 
-st.caption("자동 주문은 하지 않습니다. HOLD/STOP은 데이터 축적용 보조 판단이며 실제 진입 전 검증이 필요합니다.")
+st.caption("자동 주문은 하지 않습니다. 거래소 보호주문은 별도로 설정하세요.")
