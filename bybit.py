@@ -8,13 +8,7 @@ import pandas as pd
 
 import requests
 
-BASE_URLS = [
-
-    "https://api.bybit.com",
-
-    "https://api.bytick.com",
-
-]
+BASE_URL = "https://fapi.binance.com"
 
 _SESSION = requests.Session()
 
@@ -22,13 +16,7 @@ _SESSION.headers.update(
 
     {
 
-        "User-Agent": (
-
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-
-            "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-
-        ),
+        "User-Agent": "Mozilla/5.0",
 
         "Accept": "application/json",
 
@@ -44,93 +32,51 @@ def _get(
 
     path: str,
 
-    params: dict[str, Any],
+    params: dict[str, Any] | None = None,
 
-    retries: int = 2,
+    retries: int = 3,
 
-) -> dict[str, Any]:
+) -> Any:
 
-    errors: list[str] = []
+    last_error: Exception | None = None
 
-    for base_url in BASE_URLS:
+    for attempt in range(retries):
 
-        for attempt in range(retries):
+        try:
 
-            try:
+            response = _SESSION.get(
 
-                response = _SESSION.get(
+                BASE_URL + path,
 
-                    base_url + path,
+                params=params or {},
 
-                    params=params,
+                timeout=15,
 
-                    timeout=15,
+            )
 
-                )
+            response.raise_for_status()
 
-                if response.status_code == 403:
+            return response.json()
 
-                    raise BybitError(
+        except (requests.RequestException, ValueError) as exc:
 
-                        f"{base_url}에서 403 차단됨"
+            last_error = exc
 
-                    )
+            if attempt < retries - 1:
 
-                response.raise_for_status()
-
-                payload = response.json()
-
-                if payload.get("retCode") != 0:
-
-                    raise BybitError(
-
-                        payload.get("retMsg", "Bybit API 오류")
-
-                    )
-
-                return payload
-
-            except (requests.RequestException, ValueError, BybitError) as exc:
-
-                errors.append(
-
-                    f"{base_url} "
-
-                    f"{attempt + 1}/{retries}회: {exc}"
-
-                )
-
-                if attempt < retries - 1:
-
-                    time.sleep(1.0 * (attempt + 1))
-
-    error_text = " | ".join(errors)
+                time.sleep(1.0 * (attempt + 1))
 
     raise BybitError(
 
-        "Bybit 공식 API 주소에 모두 접속하지 못했습니다. "
-
-        f"{error_text}"
+        f"Binance 선물 데이터를 가져오지 못했습니다: {last_error}"
 
     )
 
 def list_usdt_perpetual_symbols() -> list[str]:
 
-    payload = _get(
+    payload = _get("/fapi/v1/exchangeInfo")
 
-        "/v5/market/instruments-info",
-
-        {
-
-            "category": "linear",
-
-            "limit": 1000,
-
-        },
-
-    )
-
-    rows = payload["result"]["list"]
+    rows = payload["symbols"]
 
     return sorted(
 
@@ -138,11 +84,11 @@ def list_usdt_perpetual_symbols() -> list[str]:
 
         for row in rows
 
-        if row.get("quoteCoin") == "USDT"
+        if row.get("quoteAsset") == "USDT"
 
-        and row.get("contractType") == "LinearPerpetual"
+        and row.get("contractType") == "PERPETUAL"
 
-        and row.get("status") == "Trading"
+        and row.get("status") == "TRADING"
 
     )
 
@@ -156,25 +102,43 @@ def get_klines(
 
 ) -> pd.DataFrame:
 
-    payload = _get(
+    interval_map = {
 
-        "/v5/market/kline",
+        "1": "1m",
+
+        "3": "3m",
+
+        "5": "5m",
+
+        "15": "15m",
+
+        "30": "30m",
+
+        "60": "1h",
+
+        "240": "4h",
+
+        "D": "1d",
+
+    }
+
+    binance_interval = interval_map.get(interval, interval)
+
+    rows = _get(
+
+        "/fapi/v1/klines",
 
         {
 
-            "category": "linear",
-
             "symbol": symbol.upper(),
 
-            "interval": interval,
+            "interval": binance_interval,
 
             "limit": limit,
 
         },
 
     )
-
-    rows = payload["result"]["list"]
 
     if not rows:
 
@@ -194,7 +158,17 @@ def get_klines(
 
         "volume",
 
-        "turnover",
+        "close_time",
+
+        "quote_volume",
+
+        "trade_count",
+
+        "taker_buy_base",
+
+        "taker_buy_quote",
+
+        "ignore",
 
     ]
 
@@ -212,11 +186,13 @@ def get_klines(
 
         "volume",
 
-        "turnover",
+        "quote_volume",
 
     ]
 
     df[numeric_columns] = df[numeric_columns].astype(float)
+
+    df["turnover"] = df["quote_volume"]
 
     df["start_time"] = pd.to_datetime(
 
@@ -228,4 +204,24 @@ def get_klines(
 
     )
 
-    return df.sort_values("start_time").reset_index(drop=True)
+    return df[
+
+        [
+
+            "start_time",
+
+            "open",
+
+            "high",
+
+            "low",
+
+            "close",
+
+            "volume",
+
+            "turnover",
+
+        ]
+
+    ].sort_values("start_time").reset_index(drop=True)
