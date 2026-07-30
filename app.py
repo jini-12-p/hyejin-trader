@@ -16,7 +16,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+DEFAULT_WATCHLIST: list[str] = []
 
 
 def db() -> sqlite3.Connection:
@@ -110,6 +110,21 @@ def require_password() -> None:
 @st.cache_data(ttl=3600)
 def cached_symbols() -> list[str]:
     return list_usdt_perpetual_symbols()
+
+
+def open_position_symbols() -> set[str]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT symbol FROM positions WHERE status='OPEN'"
+        ).fetchall()
+    return {str(row["symbol"]) for row in rows}
+
+
+def all_scan_symbols() -> list[str]:
+    """전체 USDT 무기한 종목에서 현재 보유 중인 종목만 자동 제외."""
+    symbols = cached_symbols()
+    excluded = open_position_symbols()
+    return [symbol for symbol in symbols if symbol not in excluded]
 
 
 def scan_one(symbol: str, settings: StrategySettings) -> dict:
@@ -235,27 +250,33 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("마감봉 신호 + Bybit 실시간 현재가 · 진입 후 5초 추적")
+st.caption("v2.5.1 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
 
-watchlist = get_setting("watchlist", DEFAULT_WATCHLIST)
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
 tp_pct = float(get_setting("tp_pct", 1.2))
 max_stop_pct = float(get_setting("max_stop_pct", 5.0))
 
-with st.expander("⚙️ 감시종목 및 기준", expanded=False):
+with st.expander("⚙️ 전체 스캔 기준", expanded=False):
     try:
-        symbols = cached_symbols()
+        total_symbols = cached_symbols()
+        held_symbols = open_position_symbols()
+        scan_symbols = [
+            symbol for symbol in total_symbols
+            if symbol not in held_symbols
+        ]
+        st.info(
+            f"전체 USDT 무기한 {len(total_symbols)}개 · "
+            f"보유 중 자동 제외 {len(held_symbols)}개 · "
+            f"현재 스캔 대상 {len(scan_symbols)}개"
+        )
+        if held_symbols:
+            st.caption(
+                "자동 제외 중: " + ", ".join(sorted(held_symbols))
+            )
     except Exception as exc:
-        symbols = watchlist
-        st.warning(f"종목 목록 오류: {exc}")
+        st.warning(f"종목 목록 조회 오류: {exc}")
 
-    selected = st.multiselect(
-        "감시종목",
-        options=symbols,
-        default=[symbol for symbol in watchlist if symbol in symbols],
-        placeholder="예: AERGOUSDT",
-    )
     new_min = st.slider(
         "표시할 최소점수(10점 만점)",
         0.0,
@@ -274,12 +295,11 @@ with st.expander("⚙️ 감시종목 및 기준", expanded=False):
     )
 
     if st.button("설정 영구 저장", use_container_width=True):
-        set_setting("watchlist", selected)
         set_setting("min_score", new_min)
         set_setting("show_only_buy", new_only)
         set_setting("tp_pct", new_tp)
         set_setting("max_stop_pct", new_stop)
-        st.success("저장했어요. 다시 로그인하거나 서버가 재시작돼도 유지됩니다.")
+        st.success("전체 종목 스캔 기준을 저장했어요.")
         st.rerun()
 
 col_scan, col_logout = st.columns(2)
@@ -301,7 +321,7 @@ settings = StrategySettings(
 
 @st.fragment(run_every=5)
 def auto_scan_panel():
-    current_watchlist = get_setting("watchlist", DEFAULT_WATCHLIST)
+    current_watchlist = all_scan_symbols()
     now_utc = datetime.now(timezone.utc)
     last_bucket = now_utc.strftime("%Y-%m-%dT%H:%M")[:15]
     stored_bucket = get_setting("last_auto_bucket", "")
@@ -339,6 +359,7 @@ def auto_scan_panel():
     )
 
     st.subheader(f"스캔 결과 {len(filtered)}개")
+    st.caption(f"현재 전체 스캔 대상 {len(current_watchlist)}개")
     scan_time = st.session_state.get("last_scan", "")
     st.caption(
         f"마지막 검사 UTC {scan_time[:19].replace('T', ' ')} · "
@@ -469,7 +490,7 @@ st.divider()
 st.subheader("📌 실시간 포지션 관리")
 st.caption(
     "tracker.py가 서버에서 5초마다 현재가를 기록합니다. "
-    "TP/비상 STOP은 진입 이후 실시간 가격, 추세 판단은 마감봉 기준입니다."
+    "보유 중인 종목은 전체 스캔에서 자동 제외되며, 포지션 종료 후 다음 스캔부터 자동 재포함됩니다."
 )
 
 
