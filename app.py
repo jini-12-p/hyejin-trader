@@ -250,7 +250,7 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("v2.5.2 · 초록 진입 가능 우선 정렬 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
+st.caption("v2.5.3 · 모바일 안정화 · 초록 진입 우선 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -319,7 +319,7 @@ settings = StrategySettings(
 )
 
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=10)
 def auto_scan_panel():
     current_watchlist = all_scan_symbols()
     now_utc = datetime.now(timezone.utc)
@@ -372,13 +372,23 @@ def auto_scan_panel():
             "'BUY 신호만 보기'를 끄면 대기 종목과 탈락 사유를 볼 수 있어요."
         )
 
-    st.caption("LIVE ENTRY v2.5.2 · 초록 진입 가능 종목을 맨 위에 표시 · 5초마다 갱신")
+    st.caption(
+        "LIVE ENTRY v2.5.3 · 모바일 안정화 모드 · "
+        "상위 후보만 10초마다 확인"
+    )
+
+    # 모바일 WebSocket 과부하 방지를 위해 점수 상위 후보만 실시간 확인합니다.
+    live_limit = 12
+    live_source = filtered.head(live_limit).copy()
+    hidden_count = max(0, len(filtered) - len(live_source))
 
     live_rows = []
-    for _, row in filtered.iterrows():
+    for _, row in live_source.iterrows():
         row_data = row.to_dict()
         try:
-            live_df = get_klines(row["symbol"], "15", 3).sort_values("start_time")
+            live_df = get_klines(
+                row["symbol"], "15", 3
+            ).sort_values("start_time")
             live_candle = live_df.iloc[-1]
             live_price = float(live_candle["close"])
             live_open = float(live_candle["open"])
@@ -411,40 +421,41 @@ def auto_scan_panel():
         )
         live_rows.append(row_data)
 
-    live_rows.sort(
+    green_rows = sorted(
+        [item for item in live_rows if item["_can_enter"]],
         key=lambda item: (
-            not item["_can_enter"],
             -float(item["current_score_10"]),
             -float(item["pullback_score_10"]),
-        )
+        ),
+    )
+    wait_rows = sorted(
+        [item for item in live_rows if not item["_can_enter"]],
+        key=lambda item: (
+            -float(item["current_score_10"]),
+            -float(item["pullback_score_10"]),
+        ),
     )
 
-    green_count = sum(1 for item in live_rows if item["_can_enter"])
-    if green_count:
-        st.success(f"🟢 지금 진입 가능 {green_count}개 · 초록색 종목을 위에 표시 중")
+    if green_rows:
+        st.success(
+            f"🟢 지금 진입 가능 {len(green_rows)}개 · "
+            "초록색만 크게 표시합니다."
+        )
     else:
         st.info("현재 초록색 진입 가능 종목은 없습니다.")
 
-    for row in live_rows:
+    for row in green_rows:
         live_price = row["_live_price"]
         live_open = row["_live_open"]
         diff = row["_live_diff"]
-        can_enter = row["_can_enter"]
         candle_text = row["_candle_text"]
         live_status = row["_live_status"]
 
-        if not bool(row["signal_now"]):
-            icon = "⚪️"
-            header_status = "대기"
-        elif can_enter:
-            icon = "🟢"
-            header_status = f"{row['signal']} · 지금 진입 가능"
-        else:
-            icon = "🟡"
-            header_status = f"{row['signal']} 후보 · 진입 보류"
-
         with st.container(border=True):
-            st.markdown(f"### {icon} {row['symbol']} · {header_status}")
+            st.markdown(
+                f"### 🟢 {row['symbol']} · "
+                f"{row['signal']} · 지금 진입 가능"
+            )
 
             metric_score, metric_pullback, metric_rsi = st.columns(3)
             metric_score.metric(
@@ -463,51 +474,47 @@ def auto_scan_panel():
             ).tz_convert("Asia/Seoul")
 
             st.write(
-                f"**마감 신호:** "
-                f"{row['signal'] if row['signal_now'] else '대기'} · "
                 f"**최종 진입 판단:** {live_status}  \n"
-                f"**현재 진행봉:** {candle_text} · 시가 {live_open:.10g}  \n"
+                f"**현재 진행봉:** {candle_text} · "
+                f"시가 {live_open:.10g}  \n"
                 f"**신호가:** {row['buy_price']:.10g} · "
                 f"**현재가:** {live_price:.10g} ({diff:+.2f}%)  \n"
                 f"**TP:** {row['tp_price']:.10g} · "
-                f"**비상 STOP 참고:** {row['stop_price']:.10g} "
+                f"**비상 STOP:** {row['stop_price']:.10g} "
                 f"(-{row['stop_pct']:.2f}%)  \n"
-                f"**봉 마감(KST):** {close_kst.strftime('%m-%d %H:%M')}  \n"
-                f"**통과:** {row['reasons']}  \n"
-                f"**주의:** {row['fail_reasons']}"
+                f"**봉 마감(KST):** "
+                f"{close_kst.strftime('%m-%d %H:%M')}"
             )
 
-            if can_enter:
-                entered = st.checkbox(
-                    "이 BUY에 실제 진입했어요",
-                    key=f"entered_{row['symbol']}_{row['candle_time_utc']}",
+            entered = st.checkbox(
+                "이 BUY에 실제 진입했어요",
+                key=(
+                    f"entered_{row['symbol']}_"
+                    f"{row['candle_time_utc']}"
+                ),
+            )
+
+            if entered:
+                entry_price = st.number_input(
+                    "내 평단가",
+                    min_value=0.0,
+                    value=float(row["buy_price"]),
+                    format="%.10f",
+                    key=f"ep_{row['symbol']}",
                 )
 
-                if entered:
-                    entry_price = st.number_input(
-                        "내 평단가",
-                        min_value=0.0,
-                        value=float(row["buy_price"]),
-                        format="%.10f",
-                        key=f"ep_{row['symbol']}",
+                if st.button(
+                    "평단 저장 및 TP/STOP 관리 시작",
+                    key=f"save_{row['symbol']}",
+                    use_container_width=True,
+                ):
+                    save_position(
+                        row["symbol"],
+                        entry_price,
+                        float(row["stop_price"]),
+                        tp_pct,
                     )
-
-                    if st.button(
-                        "평단 저장 및 TP/STOP 관리 시작",
-                        key=f"save_{row['symbol']}",
-                        use_container_width=True,
-                    ):
-                        save_position(
-                            row["symbol"],
-                            entry_price,
-                            float(row["stop_price"]),
-                            tp_pct,
-                        )
-                        st.success("포지션 관리에 저장했어요.")
-            else:
-                st.caption(
-                    "진입 보류 상태에서는 진입 체크박스를 표시하지 않습니다."
-                )
+                    st.success("포지션 관리에 저장했어요.")
 
             st.link_button(
                 "Bybit 차트 열기",
@@ -515,6 +522,39 @@ def auto_scan_panel():
                 + row["symbol"].replace("USDT", "/USDT"),
                 use_container_width=True,
             )
+
+    if wait_rows:
+        wait_table = pd.DataFrame(
+            [
+                {
+                    "상태": "🟡 보류"
+                    if bool(row["signal_now"])
+                    else "⚪ 대기",
+                    "종목": row["symbol"],
+                    "점수": round(float(row["current_score_10"]), 1),
+                    "눌림": round(float(row["pullback_score_10"]), 1),
+                    "현재가": format(row["_live_price"], ".10g"),
+                    "판단": row["_live_status"],
+                }
+                for row in wait_rows
+            ]
+        )
+        with st.expander(
+            f"🟡 보류·대기 상위 {len(wait_rows)}개 보기",
+            expanded=False,
+        ):
+            st.dataframe(
+                wait_table,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if hidden_count:
+        st.caption(
+            f"모바일 안정화를 위해 나머지 {hidden_count}개는 "
+            "상세 실시간 표시에서 숨겼어요. "
+            "다음 15분 스캔 때 점수순으로 다시 선별됩니다."
+        )
 
     for error in st.session_state.get("last_errors", []):
         st.warning(error)
@@ -530,7 +570,7 @@ st.caption(
 )
 
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=10)
 def live_positions_panel():
     positions = monitor_positions()
 
