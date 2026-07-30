@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from bybit import get_klines, get_ticker, list_usdt_perpetual_symbols
-from strategy import StrategySettings, analyze_symbol
+from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
@@ -186,6 +186,7 @@ if c2.button("로그아웃", use_container_width=True):
 settings=StrategySettings(take_profit_pct=tp_pct,max_stop_pct=max_stop_pct)
 
 @st.fragment(run_every=60)
+@st.fragment(run_every=5)
 def auto_scan_panel():
     current_watchlist=get_setting("watchlist",DEFAULT_WATCHLIST)
     last_bucket=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")[:15]
@@ -210,54 +211,86 @@ def auto_scan_panel():
     st.caption(f"마지막 검사 UTC {scan_time[:19].replace('T',' ')} · 앱을 열어둔 동안 15분봉 마감 직후 자동 검사")
     if filtered.empty:
         st.info("BUY 조건 통과 종목은 없어요. 'BUY 신호만 보기'를 끄면 대기 종목과 탈락 사유를 볼 수 있어요.")
+    st.caption("LIVE ENTRY v2.4 · 현재 진행봉을 5초마다 다시 확인")
     for _,r in filtered.iterrows():
-        # 실제 진행 중인 15분봉의 시가/현재가를 다시 받아서
-        # 음봉인지, 신호가 아래로 눌리는 중인지 확인합니다.
         try:
-            live_df = get_klines(r['symbol'], "15", 2)
+            live_df = get_klines(r["symbol"], "15", 3).sort_values("start_time")
             live_candle = live_df.iloc[-1]
             live_price = float(live_candle["close"])
             live_open = float(live_candle["open"])
-            live_is_bullish = live_price > live_open
-            diff = (live_price-float(r['buy_price']))/float(r['buy_price'])*100
-
-            if diff > 0.6:
-                live_entry = "추격 금지"
-            elif live_price < float(r['buy_price']):
-                live_entry = "눌림 중 · 진입 보류"
-            elif not live_is_bullish:
-                live_entry = "진행봉 음봉 · 진입 보류"
-            else:
-                live_entry = "실시간 진입 가능"
-        except Exception:
-            live_price = float(r['buy_price'])
+            live_status, can_enter, diff = evaluate_live_entry(
+                signal_now=bool(r["signal_now"]),
+                signal_price=float(r["buy_price"]),
+                max_entry_price=float(r["max_entry_price"]),
+                live_open=live_open,
+                live_price=live_price,
+            )
+            candle_text = "양봉" if live_price > live_open else "음봉"
+        except Exception as exc:
+            live_price = float(r["buy_price"])
             live_open = live_price
-            live_is_bullish = False
             diff = 0.0
-            live_entry = "현재 봉 조회 지연"
+            can_enter = False
+            candle_text = "조회 지연"
+            live_status = "현재 봉 조회 지연"
 
-        if not r["signal_now"]:
+        if not bool(r["signal_now"]):
             icon = "⚪️"
             header_status = "대기"
-        elif live_entry == "실시간 진입 가능":
+        elif can_enter:
             icon = "🟢"
-            header_status = f"{r['signal']} · 진입 가능"
+            header_status = f"{r['signal']} · 지금 진입 가능"
         else:
             icon = "🟡"
             header_status = f"{r['signal']} 후보 · 진입 보류"
 
         with st.container(border=True):
             st.markdown(f"### {icon} {r['symbol']} · {header_status}")
-            a,b,c=st.columns(3); a.metric("현재점수",f"{r['current_score_10']:.1f}/10"); b.metric("눌림점수",f"{r['pullback_score_10']:.1f}/10"); c.metric("RSI",f"{r['rsi']:.1f}")
+            a,b,c=st.columns(3)
+            a.metric("현재점수",f"{r['current_score_10']:.1f}/10")
+            b.metric("눌림점수",f"{r['pullback_score_10']:.1f}/10")
+            c.metric("RSI",f"{r['rsi']:.1f}")
+
             close_kst=(pd.Timestamp(r['candle_time_utc'])+pd.Timedelta(minutes=15)).tz_convert('Asia/Seoul')
-            candle_text = "양봉" if live_is_bullish else "음봉"
-            st.write(f"**마감 신호:** {r['entry_status']} · **실시간:** {live_entry}  \n**현재 진행봉:** {candle_text} · 시가 {live_open:.10g}  \n**신호가:** {r['buy_price']:.10g} · **현재가:** {live_price:.10g} ({diff:+.2f}%)  \n**TP:** {r['tp_price']:.10g} · **비상 STOP 참고:** {r['stop_price']:.10g} (-{r['stop_pct']:.2f}%)  \n**봉 마감(KST):** {close_kst.strftime('%m-%d %H:%M')}  \n**통과:** {r['reasons']}  \n**주의:** {r['fail_reasons']}")
-            entered=st.checkbox("이 BUY에 실제 진입했어요",key=f"entered_{r['symbol']}_{r['candle_time_utc']}")
-            if entered:
-                ep=st.number_input("내 평단가",min_value=0.0,value=float(r['buy_price']),format="%.10f",key=f"ep_{r['symbol']}")
-                if st.button("평단 저장 및 TP/STOP 관리 시작",key=f"save_{r['symbol']}",use_container_width=True):
-                    save_position(r['symbol'],ep,float(r['stop_price']),tp_pct); st.success("포지션 관리에 저장했어요.")
-            st.link_button("Bybit 차트 열기","https://www.bybit.com/trade/usdt/"+r["symbol"].replace("USDT","/USDT"),use_container_width=True)
+            st.write(
+                f"**마감 신호:** {r['signal'] if r['signal_now'] else '대기'} · "
+                f"**최종 진입 판단:** {live_status}  \n"
+                f"**현재 진행봉:** {candle_text} · 시가 {live_open:.10g}  \n"
+                f"**신호가:** {r['buy_price']:.10g} · **현재가:** {live_price:.10g} ({diff:+.2f}%)  \n"
+                f"**TP:** {r['tp_price']:.10g} · **비상 STOP 참고:** {r['stop_price']:.10g} (-{r['stop_pct']:.2f}%)  \n"
+                f"**봉 마감(KST):** {close_kst.strftime('%m-%d %H:%M')}  \n"
+                f"**통과:** {r['reasons']}  \n"
+                f"**주의:** {r['fail_reasons']}"
+            )
+
+            if can_enter:
+                entered=st.checkbox(
+                    "이 BUY에 실제 진입했어요",
+                    key=f"entered_{r['symbol']}_{r['candle_time_utc']}",
+                )
+                if entered:
+                    ep=st.number_input(
+                        "내 평단가",
+                        min_value=0.0,
+                        value=float(r['buy_price']),
+                        format="%.10f",
+                        key=f"ep_{r['symbol']}",
+                    )
+                    if st.button(
+                        "평단 저장 및 TP/STOP 관리 시작",
+                        key=f"save_{r['symbol']}",
+                        use_container_width=True,
+                    ):
+                        save_position(r['symbol'],ep,float(r['stop_price']),tp_pct)
+                        st.success("포지션 관리에 저장했어요.")
+            else:
+                st.caption("진입 보류 상태에서는 진입 체크박스를 표시하지 않습니다.")
+
+            st.link_button(
+                "Bybit 차트 열기",
+                "https://www.bybit.com/trade/usdt/"+r["symbol"].replace("USDT","/USDT"),
+                use_container_width=True,
+            )
     for e in st.session_state.get("last_errors",[]): st.warning(e)
 
 auto_scan_panel()

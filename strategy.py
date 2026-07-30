@@ -102,6 +102,32 @@ def _closed_only(raw_df: pd.DataFrame) -> pd.DataFrame:
     return closed if len(closed) >= 70 else raw_df.iloc[:-1].copy()
 
 
+
+def evaluate_live_entry(
+    signal_now: bool,
+    signal_price: float,
+    max_entry_price: float,
+    live_open: float,
+    live_price: float,
+) -> tuple[str, bool, float]:
+    """마감 BUY 후보 이후 현재 진행봉이 실제 진입 가능한지 최종 판단합니다."""
+    if signal_price <= 0:
+        return "가격 확인 오류", False, 0.0
+
+    diff_pct = (live_price - signal_price) / signal_price * 100
+    live_is_bullish = live_price > live_open
+
+    if not signal_now:
+        return "대기", False, diff_pct
+    if live_price > max_entry_price:
+        return "추격 금지", False, diff_pct
+    if live_price < signal_price:
+        return "눌림 중 · 진입 보류", False, diff_pct
+    if not live_is_bullish:
+        return "진행봉 음봉 · 진입 보류", False, diff_pct
+    return "실시간 진입 가능", True, diff_pct
+
+
 def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings | None = None) -> ScanResult:
     s = settings or StrategySettings()
     df = add_indicators(_closed_only(raw_df), s)
@@ -157,7 +183,8 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
     max_entry = buy_price * (1 + s.entry_tolerance_pct / 100)
 
     # 신호는 마감봉으로 판단하지만, 실제 진입 상태는 최신 진행봉으로 확인합니다.
-    live_row = raw_df.iloc[-1] if not raw_df.empty else row
+    live_source = raw_df.sort_values("start_time") if not raw_df.empty else raw_df
+    live_row = live_source.iloc[-1] if not live_source.empty else row
     current_price = float(live_row["close"])
     live_open = float(live_row["open"])
     live_is_bullish = current_price > live_open
@@ -181,16 +208,13 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
     ]
     current_score_10 = round(sum(int(x) for x in hold_checks) / 5 * 10, 1)
 
-    if not signal_now:
-        entry_status = "대기"
-    elif current_price > max_entry:
-        entry_status = "추격 금지"
-    elif current_price < buy_price:
-        entry_status = "눌림 중 · 진입 보류"
-    elif not live_is_bullish:
-        entry_status = "진행봉 음봉 · 진입 보류"
-    else:
-        entry_status = "실시간 진입 가능 범위"
+    entry_status, _, _ = evaluate_live_entry(
+        signal_now=signal_now,
+        signal_price=buy_price,
+        max_entry_price=max_entry,
+        live_open=live_open,
+        live_price=current_price,
+    )
 
     labels = ["EMA20>EMA60", "EMA20 상승", "EMA·VWAP 위", "RSI 정상", "거래량 통과", "눌림 확인", "BTC 필터"]
     reasons = [name for name, ok in zip(labels, checks) if ok]
