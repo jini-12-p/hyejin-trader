@@ -13,6 +13,7 @@ import streamlit as st
 
 from bybit import get_klines, get_ticker, list_usdt_perpetual_symbols
 from strategy import StrategySettings, analyze_symbol
+from trade_records import complete_position, init_trade_tables, save_open_position
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
@@ -137,11 +138,6 @@ def do_scan(watchlist: list[str], settings: StrategySettings) -> tuple[list[dict
     return results, errors
 
 
-def save_position(symbol: str, entry_price: float, stop_price: float, tp_pct: float) -> None:
-    with db() as conn:
-        conn.execute("INSERT INTO positions(symbol,entry_price,entry_time_utc,tp_pct,stop_price,status) VALUES(?,?,?,?,?,'OPEN') ON CONFLICT(symbol) DO UPDATE SET entry_price=excluded.entry_price,entry_time_utc=excluded.entry_time_utc,tp_pct=excluded.tp_pct,stop_price=excluded.stop_price,status='OPEN'", (symbol,entry_price,datetime.now(timezone.utc).isoformat(),tp_pct,stop_price))
-
-
 def monitor_positions() -> list[dict]:
     with db() as conn:
         rows=conn.execute("""SELECT p.*,l.last_price,l.pnl_pct,l.tp_price,l.live_action,l.trend_action,
@@ -155,7 +151,7 @@ def close_position(symbol: str, status: str) -> None:
         conn.execute("UPDATE positions SET status=? WHERE symbol=?",(status,symbol))
 
 
-init_db(); require_password()
+init_db(); init_trade_tables(); require_password()
 st.title("📈 HJ Trader")
 st.caption("마감봉 신호 + Bybit 실시간 현재가 · 진입 후 5초 추적")
 
@@ -210,7 +206,7 @@ def auto_scan_panel():
     st.caption(f"마지막 검사 UTC {scan_time[:19].replace('T',' ')} · 앱을 열어둔 동안 15분봉 마감 직후 자동 검사")
     if filtered.empty:
         st.info("BUY 조건 통과 종목은 없어요. 'BUY 신호만 보기'를 끄면 대기 종목과 탈락 사유를 볼 수 있어요.")
-    for _,r in filtered.iterrows():
+    for rank, (_, r) in enumerate(filtered.iterrows(), start=1):
         icon="🟢" if r["signal_now"] else "⚪️"
         with st.container(border=True):
             st.markdown(f"### {icon} {r['symbol']} · {r['signal'] if r['signal']!='-' else '대기'}")
@@ -228,7 +224,19 @@ def auto_scan_panel():
             if entered:
                 ep=st.number_input("내 평단가",min_value=0.0,value=float(r['buy_price']),format="%.10f",key=f"ep_{r['symbol']}")
                 if st.button("평단 저장 및 TP/STOP 관리 시작",key=f"save_{r['symbol']}",use_container_width=True):
-                    save_position(r['symbol'],ep,float(r['stop_price']),tp_pct); st.success("포지션 관리에 저장했어요.")
+                    trade_id = save_open_position(
+                        symbol=r['symbol'],
+                        entry_price=ep,
+                        stop_price=float(r['stop_price']),
+                        tp_pct=tp_pct,
+                        recommendation_rank=rank,
+                        recommendation_score=float(r['current_score_10']),
+                        pullback_score=float(r['pullback_score_10']),
+                        rsi=float(r['rsi']),
+                        signal=str(r['signal']),
+                        signal_candle_time_utc=str(r['candle_time_utc']),
+                    )
+                    st.success(f"포지션 관리에 저장했어요. Trade ID: {trade_id}")
             st.link_button("Bybit 차트 열기","https://www.bybit.com/trade/usdt/"+r["symbol"].replace("USDT","/USDT"),use_container_width=True)
     for e in st.session_state.get("last_errors",[]): st.warning(e)
 
@@ -251,11 +259,31 @@ def live_positions_panel():
             b.metric("마감봉 추세", trend)
             c.metric("경과", f"{bars}/6봉")
             st.write(f"평단 {p['entry_price']:.10g} · 현재 {'조회 중' if lp is None else format(lp,'.10g')}  \nTP {'조회 중' if p.get('tp_price') is None else format(p['tp_price'],'.10g')} · 비상 STOP {p['stop_price']:.10g}  \n업데이트 UTC {str(p.get('updated_at_utc') or 'tracker 대기')[:19].replace('T',' ')}")
-            x,y,z,w=st.columns(4)
-            if x.button("익절 완료",key=f"tpdone_{p['symbol']}"): close_position(p['symbol'],'TP_MANUAL'); st.rerun()
-            if y.button("손절 완료",key=f"stdone_{p['symbol']}"): close_position(p['symbol'],'STOP_MANUAL'); st.rerun()
-            if z.button("수동 종료",key=f"closed_{p['symbol']}"): close_position(p['symbol'],'CLOSED'); st.rerun()
-            if w.button("잘못 저장",key=f"cancel_{p['symbol']}"): close_position(p['symbol'],'CANCELLED'); st.rerun()
+            with st.expander("거래 종료 기록", expanded=False):
+                default_exit = float(lp if lp is not None else p['entry_price'])
+                exit_type = st.selectbox(
+                    "종료 유형",
+                    ["TP", "1.2% STOP", "Emergency STOP", "Trend STOP", "Manual exit"],
+                    key=f"exit_type_{p['symbol']}",
+                )
+                exit_price = st.number_input(
+                    "실제 종료가", min_value=0.0, value=default_exit, format="%.10f",
+                    key=f"exit_price_{p['symbol']}",
+                )
+                memo = st.text_area("메모 (선택)", key=f"exit_memo_{p['symbol']}")
+                if st.button("거래 완료 저장", type="primary", key=f"complete_{p['symbol']}", use_container_width=True):
+                    try:
+                        record = complete_position(p['symbol'], exit_type, exit_price, memo)
+                        st.success(
+                            f"저장 완료 · {record['pnl_pct']:+.2f}% · "
+                            f"보유 {record['holding_minutes']:.0f}분 · 종료 후 추적 시작"
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"거래 완료 저장 실패: {exc}")
+                if st.button("잘못 저장한 포지션 삭제", key=f"cancel_{p['symbol']}", use_container_width=True):
+                    close_position(p['symbol'], 'CANCELLED')
+                    st.rerun()
 live_positions_panel()
 
 with st.expander("📊 축적 데이터 요약"):
@@ -264,7 +292,14 @@ with st.expander("📊 축적 데이터 요약"):
         buys=conn.execute("SELECT COUNT(*) c FROM signals WHERE signal_now=1").fetchone()["c"]
         checks=conn.execute("SELECT COUNT(*) c FROM position_checks").fetchone()["c"]
         recent=pd.read_sql_query("SELECT symbol,candle_time_utc,signal,current_score,pullback_score,rsi,entry_status FROM signals ORDER BY id DESC LIMIT 30",conn)
-    st.write(f"저장된 스캔 {total}건 · BUY 후보 {buys}건 · 포지션 추적 {checks}봉")
-    if not recent.empty: st.dataframe(recent,use_container_width=True,hide_index=True)
+        completed_count=conn.execute("SELECT COUNT(*) c FROM completed_trades").fetchone()["c"]
+        completed_recent=pd.read_sql_query("SELECT trade_id,symbol,exit_type,pnl_pct,holding_minutes,exit_time_utc FROM completed_trades ORDER BY exit_time_utc DESC LIMIT 20",conn)
+    st.write(f"저장된 스캔 {total}건 · BUY 후보 {buys}건 · 포지션 추적 {checks}봉 · 완료 거래 {completed_count}건")
+    if not completed_recent.empty:
+        st.markdown("**최근 완료 거래**")
+        st.dataframe(completed_recent,use_container_width=True,hide_index=True)
+    if not recent.empty:
+        st.markdown("**최근 스캔 기록**")
+        st.dataframe(recent,use_container_width=True,hide_index=True)
 
 st.caption("자동 주문은 하지 않습니다. 거래소 보호주문은 별도로 설정하세요.")
