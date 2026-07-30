@@ -250,7 +250,7 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("v2.5.1 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
+st.caption("v2.5.2 · 초록 진입 가능 우선 정렬 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -372,9 +372,11 @@ def auto_scan_panel():
             "'BUY 신호만 보기'를 끄면 대기 종목과 탈락 사유를 볼 수 있어요."
         )
 
-    st.caption("LIVE ENTRY v2.4 · 현재 진행봉을 5초마다 다시 확인")
+    st.caption("LIVE ENTRY v2.5.2 · 초록 진입 가능 종목을 맨 위에 표시 · 5초마다 갱신")
 
+    live_rows = []
     for _, row in filtered.iterrows():
+        row_data = row.to_dict()
         try:
             live_df = get_klines(row["symbol"], "15", 3).sort_values("start_time")
             live_candle = live_df.iloc[-1]
@@ -396,6 +398,40 @@ def auto_scan_panel():
             can_enter = False
             candle_text = "조회 지연"
             live_status = "현재 봉 조회 지연"
+
+        row_data.update(
+            {
+                "_live_price": live_price,
+                "_live_open": live_open,
+                "_live_diff": diff,
+                "_can_enter": bool(can_enter),
+                "_candle_text": candle_text,
+                "_live_status": live_status,
+            }
+        )
+        live_rows.append(row_data)
+
+    live_rows.sort(
+        key=lambda item: (
+            not item["_can_enter"],
+            -float(item["current_score_10"]),
+            -float(item["pullback_score_10"]),
+        )
+    )
+
+    green_count = sum(1 for item in live_rows if item["_can_enter"])
+    if green_count:
+        st.success(f"🟢 지금 진입 가능 {green_count}개 · 초록색 종목을 위에 표시 중")
+    else:
+        st.info("현재 초록색 진입 가능 종목은 없습니다.")
+
+    for row in live_rows:
+        live_price = row["_live_price"]
+        live_open = row["_live_open"]
+        diff = row["_live_diff"]
+        can_enter = row["_can_enter"]
+        candle_text = row["_candle_text"]
+        live_status = row["_live_status"]
 
         if not bool(row["signal_now"]):
             icon = "⚪️"
