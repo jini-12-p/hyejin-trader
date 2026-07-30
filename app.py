@@ -246,11 +246,24 @@ def close_position(symbol: str, status: str) -> None:
         )
 
 
+def latest_signal_for_symbol(symbol: str) -> dict | None:
+    with db() as conn:
+        row = conn.execute(
+            """SELECT *
+            FROM signals
+            WHERE symbol=?
+            ORDER BY id DESC
+            LIMIT 1""",
+            (symbol,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("v2.5.3 · 모바일 안정화 · 초록 진입 우선 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
+st.caption("v2.5.4 · 언제든 진입 등록 · 모바일 안정화 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -300,6 +313,86 @@ with st.expander("⚙️ 전체 스캔 기준", expanded=False):
         set_setting("tp_pct", new_tp)
         set_setting("max_stop_pct", new_stop)
         st.success("전체 종목 스캔 기준을 저장했어요.")
+        st.rerun()
+
+with st.expander("➕ 매수한 종목 직접 등록", expanded=True):
+    st.caption(
+        "초록에서 매수한 뒤 노란색으로 바뀌어도 여기서 언제든 등록할 수 있어요."
+    )
+
+    try:
+        manual_symbols = cached_symbols()
+    except Exception:
+        manual_symbols = []
+
+    manual_symbol = st.selectbox(
+        "매수한 종목",
+        options=[""] + manual_symbols,
+        index=0,
+        placeholder="종목 선택",
+        key="manual_position_symbol",
+    )
+
+    latest_signal = (
+        latest_signal_for_symbol(manual_symbol)
+        if manual_symbol
+        else None
+    )
+
+    default_entry = 0.0
+    default_stop = 0.0
+    signal_note = "종목을 선택하면 최근 신호의 비상 손절가를 불러옵니다."
+
+    if latest_signal:
+        default_entry = float(latest_signal.get("buy_price") or 0.0)
+        default_stop = float(latest_signal.get("stop_price") or 0.0)
+        signal_time = str(
+            latest_signal.get("candle_time_utc") or ""
+        )[:19].replace("T", " ")
+        signal_note = (
+            f"최근 신호 UTC {signal_time} · "
+            f"신호 {latest_signal.get('signal') or '대기'} · "
+            f"비상 STOP {default_stop:.10g}"
+        )
+
+    st.caption(signal_note)
+
+    manual_entry_price = st.number_input(
+        "실제 내 평단가",
+        min_value=0.0,
+        value=default_entry,
+        format="%.10f",
+        key=f"manual_entry_{manual_symbol}",
+    )
+
+    manual_stop_price = st.number_input(
+        "비상 손절가",
+        min_value=0.0,
+        value=default_stop,
+        format="%.10f",
+        key=f"manual_stop_{manual_symbol}",
+    )
+
+    if st.button(
+        "이 종목 포지션 관리에 등록",
+        type="primary",
+        use_container_width=True,
+        disabled=(
+            not manual_symbol
+            or manual_entry_price <= 0
+            or manual_stop_price <= 0
+        ),
+    ):
+        save_position(
+            manual_symbol,
+            float(manual_entry_price),
+            float(manual_stop_price),
+            tp_pct,
+        )
+        st.success(
+            f"{manual_symbol} 등록 완료 · "
+            "이제 전체 스캔에서 자동 제외되고 실시간 관리에 표시됩니다."
+        )
         st.rerun()
 
 col_scan, col_logout = st.columns(2)
