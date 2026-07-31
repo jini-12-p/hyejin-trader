@@ -17,7 +17,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v2.7.2"
+APP_VERSION = "v3.1.0"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -457,7 +457,7 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption(f"{APP_VERSION} · 상승률 TOP30 + 즐겨찾기 · 눌림형/추격형 분리 · 모바일 안정화")
+st.caption(f"{APP_VERSION} · 1분 실시간 움직임 TOP10 · 상승률 TOP30 + 즐겨찾기 · 모바일 안정화")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -673,242 +673,241 @@ def auto_scan_panel():
         )
 
     st.caption(
-        f"LIVE ENTRY {APP_VERSION} · 코인 상승률 TOP30과 즐겨찾기를 분석하고, "
-        "주식형은 별도 구역에만 표시합니다."
+        f"FAST ROTATION {APP_VERSION} · 초록색 완성 신호를 기다리지 않고, "
+        "코인 TOP30과 즐겨찾기 중 지금 회전 우선순위를 계속 보여줍니다."
     )
 
     crypto_ranked = ranked_all[ranked_all["symbol_type"] == "crypto"].copy()
-    overall_top = crypto_ranked.head(10).copy()
-    stock_top = ranked_all[ranked_all["symbol_type"] == "stock"].head(3).copy()
+    crypto_ranked = crypto_ranked.sort_values(
+        ["rotation_score", "chase_score", "current_score_10", "pullback_score_10"],
+        ascending=[False, False, False, False],
+    )
 
-    st.markdown("### 🏆 코인 회전 TOP10")
-    if overall_top.empty:
-        st.info("코인 회전 순위에 표시할 종목이 없습니다.")
-    else:
-        for rank, (_, row) in enumerate(overall_top.iterrows(), start=1):
-            badge = product_badge(str(row.get("symbol_type", "crypto")))
-            signal_mark = "🟢" if bool(row.get("signal_now", False)) else "⚪"
-            st.markdown(
-                f"**{rank}. {signal_mark} {row['symbol']} · {badge} · "
-                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점**  "
-                f"\n현재 {float(row['current_score_10']):.1f} · "
-                f"눌림 {float(row['pullback_score_10']):.1f} · "
-                f"RSI {float(row['rsi']):.1f}"
-            )
+    # 실시간 레이더: 코인 TOP30 + 즐겨찾기의 1분봉을 10초마다 다시 읽습니다.
+    # 15분봉 점수는 방향 필터로만 사용하고, TOP10 순위는 최근 1·3·5분 움직임과 거래량으로 결정합니다.
+    scanner_source = crypto_ranked.copy()
 
-    chase_top = crypto_ranked.sort_values(
-        ["chase_score", "rotation_score", "current_score_10"],
-        ascending=[False, False, False],
-    ).head(5).copy()
-
-    st.markdown("### 🚀 돌파·추격 후보 TOP5")
-    if chase_top.empty:
-        st.info("현재 추격 후보가 없습니다.")
-    else:
-        for rank, (_, row) in enumerate(chase_top.iterrows(), start=1):
-            favorite_mark = " ⭐" if bool(row.get("is_favorite", False)) else ""
-            rank_text = f"상승 {int(row.get('gainer_rank', 0))}위" if int(row.get("gainer_rank", 0)) > 0 else "즐겨찾기 감시"
-            st.markdown(
-                f"**{rank}. {row['symbol']}{favorite_mark} · 추격 {float(row.get('chase_score', 0.0)):.1f}점 · {rank_text}**  "
-                f"\n24h {float(row.get('change_24h_pct', 0.0)):+.2f}% · "
-                f"거래대금 가속 {float(row.get('turnover_accel', 0.0)):.2f}배 · "
-                f"1시간 {float(row.get('momentum_1h', 0.0)):+.2f}%"
-            )
-
-    st.markdown("### 📈 주식형 주목 TOP3")
-    if stock_top.empty:
-        st.info("현재 표시 기준을 통과한 주식형 종목이 없습니다.")
-    else:
-        overall_symbols = set(overall_top["symbol"].astype(str).tolist())
-        for rank, (_, row) in enumerate(stock_top.iterrows(), start=1):
-            included_note = ""
-            signal_mark = "🟢" if bool(row.get("signal_now", False)) else "⚪"
-            st.markdown(
-                f"**{rank}. {signal_mark} {row['symbol']} · 🟣 주식형 · "
-                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점{included_note}**  "
-                f"\n거래대금 추정 {float(row.get('turnover_24h_est', 0.0))/1_000_000:.2f}M USDT · "
-                f"가속 {float(row.get('turnover_accel', 0.0)):.2f}배 · "
-                f"1시간 모멘텀 {float(row.get('momentum_1h', 0.0)):+.2f}%"
-            )
-
-    # 코인 TOP10, 코인 추격 TOP5, 주식형 TOP3의 합집합만 실시간 확인합니다.
-    live_source = pd.concat([overall_top, chase_top, stock_top], ignore_index=True)
-    if not live_source.empty:
-        live_source = live_source.drop_duplicates(subset=["symbol"], keep="first")
-    hidden_count = max(0, len(ranked_all) - len(live_source))
-
-    live_rows = []
-    for _, row in live_source.iterrows():
-        row_data = row.to_dict()
+    def fetch_live_motion(row_dict: dict) -> dict:
+        symbol = str(row_dict["symbol"])
+        row_data = dict(row_dict)
         try:
-            live_df = get_klines(
-                row["symbol"], "15", 3
-            ).sort_values("start_time")
-            live_candle = live_df.iloc[-1]
-            live_price = float(live_candle["close"])
-            live_open = float(live_candle["open"])
+            minute_df = get_klines(symbol, "1", 32).sort_values("start_time").copy()
+            if len(minute_df) < 8:
+                raise ValueError("1분봉 부족")
 
-            live_status, can_enter, diff = evaluate_live_entry(
-                signal_now=bool(row["signal_now"]),
-                signal_price=float(row["buy_price"]),
-                max_entry_price=float(row["max_entry_price"]),
-                live_open=live_open,
-                live_price=live_price,
+            for col in ["open", "high", "low", "close", "turnover"]:
+                minute_df[col] = pd.to_numeric(minute_df[col], errors="coerce")
+            minute_df = minute_df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+            if len(minute_df) < 8:
+                raise ValueError("유효 1분봉 부족")
+
+            current = minute_df.iloc[-1]       # 진행 중 1분봉
+            closed = minute_df.iloc[:-1].copy()
+            live_price = float(current["close"])
+            one_open = float(current["open"])
+            move_1m = (live_price / one_open - 1) * 100 if one_open > 0 else 0.0
+
+            def pct_from_close(bars_back: int) -> float:
+                if len(closed) < bars_back or float(closed.iloc[-bars_back]["close"]) <= 0:
+                    return 0.0
+                return (live_price / float(closed.iloc[-bars_back]["close"]) - 1) * 100
+
+            move_3m = pct_from_close(3)
+            move_5m = pct_from_close(5)
+
+            current_turnover = float(current.get("turnover", 0.0) or 0.0)
+            elapsed_ms = max(
+                1.0,
+                datetime.now(timezone.utc).timestamp() * 1000 - float(current["start_time"]),
             )
-            candle_text = "양봉" if live_price > live_open else "음봉"
-        except Exception:
-            live_price = float(row["buy_price"])
-            live_open = live_price
-            diff = 0.0
-            can_enter = False
-            candle_text = "조회 지연"
-            live_status = "현재 봉 조회 지연"
+            elapsed_ratio = min(max(elapsed_ms / 60000.0, 0.05), 1.0)
+            projected_turnover = current_turnover / elapsed_ratio
+            baseline = float(pd.to_numeric(closed["turnover"], errors="coerce").tail(20).median() or 0.0)
+            volume_accel_1m = projected_turnover / baseline if baseline > 0 else 0.0
 
-        row_data.update(
-            {
+            recent_high = float(closed["high"].tail(5).max()) if len(closed) else live_price
+            breakout_pct = (live_price / recent_high - 1) * 100 if recent_high > 0 else 0.0
+            distance_to_high = (live_price / recent_high - 1) * 100 if recent_high > 0 else 0.0
+
+            prev3 = closed.tail(3)
+            green_count = int((prev3["close"] > prev3["open"]).sum())
+            rising_closes = int(closed["close"].tail(4).is_monotonic_increasing)
+
+            # 지나친 급등은 후보에는 남기되 추격 금지로 분리합니다.
+            overheated = move_1m >= 1.30 or move_3m >= 2.40 or float(row_data.get("rsi", 50.0)) >= 78
+            just_breakout = breakout_pct >= 0.03 and volume_accel_1m >= 1.20 and move_1m > 0
+            motion_start = move_1m >= 0.10 and move_3m >= 0.18 and volume_accel_1m >= 1.15
+            pullback_rebound = (
+                float(row_data.get("pullback_score_10", 0.0)) >= 5.0
+                and move_1m > 0.05
+                and move_3m > 0
+                and volume_accel_1m >= 0.90
+            )
+            volume_surge = volume_accel_1m >= 1.35 and move_1m > -0.10
+
+            if overheated:
+                state = "🔴 과열"
+                action = "추격 금지"
+                state_rank = 4
+            elif just_breakout:
+                state = "🚀 방금 돌파"
+                action = "즉시 차트 확인"
+                state_rank = 0
+            elif motion_start:
+                state = "⚡ 움직임 시작"
+                action = "우선 확인"
+                state_rank = 1
+            elif pullback_rebound:
+                state = "🌊 눌림 반등"
+                action = "진입 관찰"
+                state_rank = 2
+            elif volume_surge:
+                state = "🔥 거래량 급증"
+                action = "방향 확인"
+                state_rank = 3
+            else:
+                state = "⚪ 대기"
+                action = "관찰"
+                state_rank = 5
+
+            realtime_score = (
+                max(min(move_1m, 1.5), -0.8) * 22
+                + max(min(move_3m, 3.0), -1.5) * 11
+                + max(min(move_5m, 5.0), -2.0) * 5
+                + min(max(volume_accel_1m, 0.0), 4.0) * 9
+                + max(min(breakout_pct, 0.8), -1.0) * 15
+                + green_count * 2
+                + rising_closes * 4
+                + float(row_data.get("rotation_score", 0.0)) * 0.08
+            )
+            if state_rank == 0:
+                realtime_score += 18
+            elif state_rank == 1:
+                realtime_score += 12
+            elif state_rank == 2:
+                realtime_score += 7
+            elif state_rank == 4:
+                realtime_score -= 20
+
+            row_data.update({
+                "_live_ok": True,
                 "_live_price": live_price,
-                "_live_open": live_open,
-                "_live_diff": diff,
-                "_can_enter": bool(can_enter),
-                "_candle_text": candle_text,
-                "_live_status": live_status,
-            }
-        )
-        live_rows.append(row_data)
+                "_move_1m": move_1m,
+                "_move_3m": move_3m,
+                "_move_5m": move_5m,
+                "_volume_accel_1m": volume_accel_1m,
+                "_breakout_pct": breakout_pct,
+                "_distance_to_high": distance_to_high,
+                "_state": state,
+                "_action": action,
+                "_state_rank": state_rank,
+                "_realtime_score": round(realtime_score, 1),
+            })
+        except Exception as exc:
+            row_data.update({
+                "_live_ok": False,
+                "_live_price": float(row_data.get("buy_price", 0.0) or 0.0),
+                "_move_1m": 0.0,
+                "_move_3m": 0.0,
+                "_move_5m": 0.0,
+                "_volume_accel_1m": 0.0,
+                "_breakout_pct": 0.0,
+                "_distance_to_high": 0.0,
+                "_state": "⚪ 조회 지연",
+                "_action": "잠시 후 재확인",
+                "_state_rank": 6,
+                "_realtime_score": -999.0,
+                "_live_error": str(exc),
+            })
+        return row_data
 
-    green_rows = sorted(
-        [item for item in live_rows if item["_can_enter"]],
+    source_records = scanner_source.to_dict("records")
+    live_rows = []
+    if source_records:
+        with ThreadPoolExecutor(max_workers=min(10, len(source_records))) as pool:
+            futures = [pool.submit(fetch_live_motion, row) for row in source_records]
+            for future in as_completed(futures):
+                live_rows.append(future.result())
+
+    # 상태보다 실제 움직임 점수를 우선해 정렬하되, 과열·조회지연은 아래로 내립니다.
+    live_rows = sorted(
+        live_rows,
         key=lambda item: (
-            -float(item.get("rotation_score", 0.0)),
-            -float(item["current_score_10"]),
-            -float(item["pullback_score_10"]),
+            int(item["_state_rank"] >= 4),
+            -float(item["_realtime_score"]),
+            int(item["_state_rank"]),
         ),
     )
-    wait_rows = sorted(
-        [item for item in live_rows if not item["_can_enter"]],
-        key=lambda item: (
-            -float(item.get("rotation_score", 0.0)),
-            -float(item["current_score_10"]),
-            -float(item["pullback_score_10"]),
-        ),
+
+    previous_states = st.session_state.get("radar_previous_states", {})
+    current_states = {str(row["symbol"]): str(row["_state"]) for row in live_rows}
+    fresh_signals = [
+        row for row in live_rows
+        if int(row["_state_rank"]) <= 2
+        and previous_states.get(str(row["symbol"])) != str(row["_state"])
+    ]
+    st.session_state.radar_previous_states = current_states
+
+    radar_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    st.markdown("### 📡 실시간 움직임 TOP10")
+    st.caption(
+        f"UTC {radar_time} · 10초마다 갱신 · 최근 1·3·5분 가격과 1분 거래량 가속으로 순위가 바뀝니다. "
+        "15분봉 점수는 방향 참고용일 뿐 TOP10의 주 기준이 아닙니다."
     )
 
-    if green_rows:
-        st.success(
-            f"🟢 지금 진입 가능 {len(green_rows)}개 · "
-            "초록색만 크게 표시합니다."
-        )
-    else:
-        st.info("현재 초록색 진입 가능 종목은 없습니다.")
+    if fresh_signals:
+        names = " · ".join(f"{row['_state']} {row['symbol']}" for row in fresh_signals[:5])
+        st.success(f"방금 새 움직임 감지: {names}")
 
-    for row in green_rows:
-        live_price = row["_live_price"]
-        live_open = row["_live_open"]
-        diff = row["_live_diff"]
-        candle_text = row["_candle_text"]
-        live_status = row["_live_status"]
-
+    priority_rows = live_rows[:10]
+    for rank, row in enumerate(priority_rows, start=1):
+        favorite_mark = " ⭐" if bool(row.get("is_favorite", False)) else ""
+        low_liq = " · ⚠️ 저유동성" if bool(row.get("liquidity_warning", False)) else ""
         with st.container(border=True):
-            badge = product_badge(str(row.get("symbol_type", "crypto")))
-            liquidity_note = " · ⚠️ 저유동성" if bool(row.get("liquidity_warning", False)) else ""
-            st.markdown(
-                f"### 🟢 {row['symbol']}{' ⭐' if bool(row.get('is_favorite', False)) else ''} · {badge}{liquidity_note} · "
-                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점 · {row.get('entry_style', '눌림·반등형')}"
-            )
-            st.caption(f"{row['signal']} · 지금 진입 가능")
-
-            metric_rotation, metric_score, metric_rsi = st.columns(3)
-            metric_rotation.metric(
-                "회전순위점수",
-                f"{float(row.get('rotation_score', 0.0)):.1f}",
-            )
-            metric_score.metric(
-                "현재/눌림",
-                f"{row['current_score_10']:.1f}/{row['pullback_score_10']:.1f}",
-            )
-            metric_rsi.metric("RSI", f"{row['rsi']:.1f}")
-
-            close_kst = (
-                pd.Timestamp(row["candle_time_utc"])
-                + pd.Timedelta(minutes=15)
-            ).tz_convert("Asia/Seoul")
-
+            st.markdown(f"### {rank}. {row['_state']} {row['symbol']}{favorite_mark}{low_liq}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("1분", f"{float(row['_move_1m']):+.2f}%")
+            m2.metric("3분", f"{float(row['_move_3m']):+.2f}%")
+            m3.metric("1분 거래량", f"{float(row['_volume_accel_1m']):.2f}배")
             st.write(
-                f"**최종 진입 판단:** {live_status}  \n"
-                f"**현재 진행봉:** {candle_text} · "
-                f"시가 {live_open:.10g}  \n"
-                f"**신호가:** {row['buy_price']:.10g} · "
-                f"**현재가:** {live_price:.10g} ({diff:+.2f}%)  \n"
-                f"**TP:** {row['tp_price']:.10g} · "
-                f"**비상 STOP:** {row['stop_price']:.10g} "
-                f"(-{row['stop_pct']:.2f}%)  \n"
-                f"**봉 마감(KST):** "
-                f"{close_kst.strftime('%m-%d %H:%M')}"
+                f"**행동:** {row['_action']} · 실시간점수 {float(row['_realtime_score']):.1f}  \n"
+                f"현재가 {float(row['_live_price']):.10g} · 5분 {float(row['_move_5m']):+.2f}% · "
+                f"최근 5분 고점 대비 {float(row['_distance_to_high']):+.2f}%  \n"
+                f"15분 방향참고: 회전 {float(row.get('rotation_score', 0.0)):.1f} · "
+                f"눌림 {float(row.get('pullback_score_10', 0.0)):.1f} · RSI {float(row.get('rsi', 0.0)):.1f}"
             )
-
-            entered = st.checkbox(
-                "이 BUY에 실제 진입했어요",
-                key=(
-                    f"entered_{row['symbol']}_"
-                    f"{row['candle_time_utc']}"
-                ),
-            )
-
-            if entered:
-                entry_price = st.number_input(
-                    "내 평단가",
-                    min_value=0.0,
-                    value=float(row["buy_price"]),
-                    format="%.10f",
-                    key=f"ep_{row['symbol']}",
-                )
-
-                if st.button(
-                    "평단 저장 및 TP/STOP 관리 시작",
-                    key=f"save_{row['symbol']}",
-                    use_container_width=True,
-                ):
-                    save_position(
-                        row["symbol"],
-                        entry_price,
-                        float(row["stop_price"]),
-                        tp_pct,
-                    )
-                    st.success("포지션 관리에 저장했어요.")
-
             st.link_button(
                 "Bybit 차트 열기",
-                "https://www.bybit.com/trade/usdt/"
-                + row["symbol"].replace("USDT", "/USDT"),
+                "https://www.bybit.com/trade/usdt/" + row["symbol"].replace("USDT", "/USDT"),
                 use_container_width=True,
             )
 
-    if wait_rows:
-        with st.expander(
-            f"🟡 보류·대기 상위 {len(wait_rows)}개 보기",
-            expanded=False,
-        ):
-            for row in wait_rows:
-                state = "🟡 보류" if bool(row["signal_now"]) else "⚪ 대기"
-                badge = product_badge(str(row.get("symbol_type", "crypto")))
-                liquidity_note = " · ⚠️ 저유동성" if bool(row.get("liquidity_warning", False)) else ""
-                st.markdown(
-                    f"**{state} · {row['symbol']} · {badge}{liquidity_note}**  \n"
-                    f"회전 {float(row.get('rotation_score', 0.0)):.1f} · "
-                    f"현재 {float(row['current_score_10']):.1f} · "
-                    f"눌림 {float(row['pullback_score_10']):.1f} · "
-                    f"현재가 {format(row['_live_price'], '.10g')}  \n"
-                    f"거래대금(15분봉 추정 24h) {float(row.get('turnover_24h_est', 0.0))/1_000_000:.2f}M USDT · "
-                    f"{row['_live_status']}"
-                )
-                st.divider()
+    with st.expander(f"📋 전체 실시간 레이더 {len(live_rows)}개", expanded=False):
+        for rank, row in enumerate(live_rows, start=1):
+            st.markdown(
+                f"**{rank}. {row['_state']} {row['symbol']} · {row['_action']}**  \n"
+                f"1분 {float(row['_move_1m']):+.2f}% · 3분 {float(row['_move_3m']):+.2f}% · "
+                f"5분 {float(row['_move_5m']):+.2f}% · 거래량 {float(row['_volume_accel_1m']):.2f}배 · "
+                f"점수 {float(row['_realtime_score']):.1f}"
+            )
+            st.divider()
 
-    if hidden_count:
-        st.caption(
-            f"모바일 안정화를 위해 나머지 {hidden_count}개는 "
-            "상세 실시간 표시에서 숨겼어요. "
-            "다음 15분 스캔 때 코인 TOP10·코인 추격 TOP5·주식형 TOP3 기준으로 다시 선별됩니다."
-        )
+    st.markdown("### 📈 주식형 별도 관찰 TOP3")
+    stock_top = ranked_all[ranked_all["symbol_type"] == "stock"].head(3).copy()
+    if stock_top.empty:
+        st.info("현재 주식형 관찰 종목이 없습니다.")
+    else:
+        for rank, (_, row) in enumerate(stock_top.iterrows(), start=1):
+            st.markdown(
+                f"**{rank}. 🟣 {row['symbol']} · 회전 {float(row.get('rotation_score', 0.0)):.1f}**  \n"
+                f"거래가속 {float(row.get('turnover_accel', 0.0)):.2f}배 · "
+                f"1시간 {float(row.get('momentum_1h', 0.0)):+.2f}%"
+            )
+
+    st.caption(
+        "상태 기준: 🚀 방금 돌파 → ⚡ 움직임 시작 → 🌊 눌림 반등 → 🔥 거래량 급증 → ⚪ 대기 → 🔴 과열. "
+        "TOP10은 최근 1·3·5분 움직임 기준이며 자동 매수 신호가 아닙니다."
+    )
 
     for error in st.session_state.get("last_errors", []):
         st.warning(error)
