@@ -17,7 +17,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v2.7.1"
+APP_VERSION = "v2.7.2"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -639,20 +639,22 @@ def auto_scan_panel():
         return
 
     frame = pd.DataFrame(results)
-    filtered = frame[
-        frame["current_score_10"] >= get_setting("min_score", 5.0)
-    ].copy()
 
-    if get_setting("show_only_buy", False):
-        filtered = filtered[filtered["signal_now"]]
-
-    filtered = add_rotation_scores(filtered)
-    filtered = filtered.sort_values(
+    # 회전/추격 순위는 점수 기준을 통과하지 못한 종목도 포함해 전체 스캔 결과에서 계산합니다.
+    # 진입 가능 여부는 각 행의 signal_now와 점수로 별도 표시합니다.
+    ranked_all = add_rotation_scores(frame.copy())
+    ranked_all = ranked_all.sort_values(
         ["signal_now", "rotation_score", "current_score_10", "pullback_score_10"],
         ascending=[False, False, False, False],
     )
 
-    st.subheader(f"스캔 결과 {len(filtered)}개")
+    filtered = ranked_all[
+        ranked_all["current_score_10"] >= get_setting("min_score", 5.0)
+    ].copy()
+    if get_setting("show_only_buy", False):
+        filtered = filtered[filtered["signal_now"]]
+
+    st.subheader(f"스캔 결과 {len(filtered)}개 · 전체 분석 {len(ranked_all)}개")
     favorite_count = sum(1 for r in results if bool(r.get("is_favorite", False)))
     st.caption(
         f"현재 분석 대상 {len(current_watchlist)}개 · 코인 TOP30 + "
@@ -675,9 +677,9 @@ def auto_scan_panel():
         "주식형은 별도 구역에만 표시합니다."
     )
 
-    crypto_filtered = filtered[filtered["symbol_type"] == "crypto"].copy()
-    overall_top = crypto_filtered.head(10).copy()
-    stock_top = filtered[filtered["symbol_type"] == "stock"].head(3).copy()
+    crypto_ranked = ranked_all[ranked_all["symbol_type"] == "crypto"].copy()
+    overall_top = crypto_ranked.head(10).copy()
+    stock_top = ranked_all[ranked_all["symbol_type"] == "stock"].head(3).copy()
 
     st.markdown("### 🏆 코인 회전 TOP10")
     if overall_top.empty:
@@ -694,7 +696,7 @@ def auto_scan_panel():
                 f"RSI {float(row['rsi']):.1f}"
             )
 
-    chase_top = crypto_filtered.sort_values(
+    chase_top = crypto_ranked.sort_values(
         ["chase_score", "rotation_score", "current_score_10"],
         ascending=[False, False, False],
     ).head(5).copy()
@@ -733,7 +735,7 @@ def auto_scan_panel():
     live_source = pd.concat([overall_top, chase_top, stock_top], ignore_index=True)
     if not live_source.empty:
         live_source = live_source.drop_duplicates(subset=["symbol"], keep="first")
-    hidden_count = max(0, len(filtered) - len(live_source))
+    hidden_count = max(0, len(ranked_all) - len(live_source))
 
     live_rows = []
     for _, row in live_source.iterrows():
