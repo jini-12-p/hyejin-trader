@@ -17,7 +17,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v3.1.1"
+APP_VERSION = "v3.2.0"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -457,7 +457,7 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption(f"{APP_VERSION} · 1분 실시간 움직임 TOP10 · 상승률 TOP30 + 즐겨찾기 · 모바일 안정화")
+st.caption(f"{APP_VERSION} · BUY 선호순위 TOP10 · 상승률 TOP30 + 즐겨찾기 · 모바일 안정화")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -672,9 +672,72 @@ def auto_scan_panel():
             "'BUY 신호만 보기'를 끄면 대기 종목과 탈락 사유를 볼 수 있어요."
         )
 
+    # BUY가 발생한 종목만 선호 차트 점수 순으로 한 번에 표시합니다.
+    buy_ranked = ranked_all[ranked_all["signal_now"]].copy()
+    if not buy_ranked.empty:
+        for col, default in [
+            ("preference_score_9", 0),
+            ("volume_ratio", 0.0),
+            ("signal_diff_pct", 0.0),
+        ]:
+            if col not in buy_ranked:
+                buy_ranked[col] = default
+
+        buy_ranked["preference_score_9"] = pd.to_numeric(
+            buy_ranked["preference_score_9"], errors="coerce"
+        ).fillna(0)
+        buy_ranked["volume_ratio"] = pd.to_numeric(
+            buy_ranked["volume_ratio"], errors="coerce"
+        ).fillna(0.0)
+        buy_ranked["signal_diff_pct"] = pd.to_numeric(
+            buy_ranked["signal_diff_pct"], errors="coerce"
+        ).fillna(0.0)
+
+        buy_ranked = buy_ranked.sort_values(
+            ["preference_score_9", "volume_ratio", "candle_time_utc"],
+            ascending=[False, False, False],
+        )
+
+    st.markdown("### 🟢 BUY 선호순위 TOP10")
     st.caption(
-        f"FAST ROTATION {APP_VERSION} · 초록색 완성 신호를 기다리지 않고, "
-        "코인 TOP30과 즐겨찾기 중 지금 회전 우선순위를 계속 보여줍니다."
+        "BUY-P·BUY-R이 실제 발생한 종목만 표시합니다. "
+        "선호점수 → 거래량 강도 → 최신 신호 순으로 정렬됩니다."
+    )
+
+    if buy_ranked.empty:
+        st.info("현재 마감된 15분봉 기준 BUY 신호가 없습니다.")
+    else:
+        for rank, (_, row) in enumerate(buy_ranked.head(10).iterrows(), start=1):
+            diff = float(row.get("signal_diff_pct", 0.0) or 0.0)
+            if diff < -0.30:
+                price_state = "눌림"
+            elif diff <= 0.25:
+                price_state = "진입권"
+            elif diff <= 0.50:
+                price_state = "확인 필요"
+            else:
+                price_state = "추격주의"
+
+            favorite_mark = " ⭐" if bool(row.get("is_favorite", False)) else ""
+            signal_time = str(row.get("candle_time_utc") or "")[11:16]
+            with st.container(border=True):
+                st.markdown(
+                    f"### {rank}. {row['symbol']}{favorite_mark} · "
+                    f"{row['signal']} · 선호 {int(row.get('preference_score_9', 0))}/9"
+                )
+                c1, c2, c3 = st.columns(3)
+                c1.metric("현재가 차이", f"{diff:+.2f}%")
+                c2.metric("거래량", f"{float(row.get('volume_ratio', 0.0)):.2f}배")
+                c3.metric("상태", price_state)
+                st.write(
+                    f"신호가 {float(row.get('buy_price', 0.0)):.10g} · "
+                    f"현재가 {float(row.get('current_price', 0.0)):.10g} · "
+                    f"신호 UTC {signal_time}  \n"
+                    f"선호조건: {row.get('preference_reasons') or '-'}"
+                )
+
+    st.caption(
+        f"FAST ROTATION {APP_VERSION} · BUY TOP10 아래에는 별도로 실시간 움직임 레이더가 표시됩니다."
     )
 
     crypto_ranked = ranked_all[ranked_all["symbol_type"] == "crypto"].copy()
@@ -875,11 +938,6 @@ def auto_scan_panel():
                 f"최근 5분 고점 대비 {float(row['_distance_to_high']):+.2f}%  \n"
                 f"15분 방향참고: 회전 {float(row.get('rotation_score', 0.0)):.1f} · "
                 f"눌림 {float(row.get('pullback_score_10', 0.0)):.1f} · RSI {float(row.get('rsi', 0.0)):.1f}"
-            )
-            st.link_button(
-                "Bybit 차트 열기",
-                "https://www.bybit.com/trade/usdt/" + row["symbol"].replace("USDT", "/USDT"),
-                use_container_width=True,
             )
 
     with st.expander(f"📋 전체 실시간 레이더 {len(live_rows)}개", expanded=False):

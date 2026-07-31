@@ -51,6 +51,10 @@ class ScanResult:
     stop_price: float
     stop_pct: float
     tp_price: float
+    preference_score_9: int
+    preference_reasons: str
+    signal_diff_pct: float
+    volume_ratio: float
     reasons: str
     fail_reasons: str
 
@@ -208,13 +212,82 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
     ]
     current_score_10 = round(sum(int(x) for x in hold_checks) / 5 * 10, 1)
 
-    entry_status, _, _ = evaluate_live_entry(
+    entry_status, _, signal_diff_pct = evaluate_live_entry(
         signal_now=signal_now,
         signal_price=buy_price,
         max_entry_price=max_entry,
         live_open=live_open,
         live_price=current_price,
     )
+
+    # 혜진님 선호 차트 9개 기준: BUY 발생 후 순위용 점수
+    ema_fast_up = row.ema_fast > prev.ema_fast
+    ema_slow_up = row.ema_slow > prev.ema_slow
+    ema_ordered = row.ema_fast > row.ema_slow
+
+    prev_bearish = prev.close < prev.open
+    current_body = max(0.0, float(row.close - row.open))
+    prev_body = abs(float(prev.close - prev.open))
+    bearish_then_strong_bull = (
+        prev_bearish
+        and row.close > row.open
+        and current_body >= max(
+            prev_body,
+            float(row.avg_body) if pd.notna(row.avg_body) else 0.0,
+        )
+    )
+
+    previous_body_top = max(float(prev.open), float(prev.close))
+    body_or_high_break = row.close > previous_body_top or row.close > prev.high
+
+    candle_range = max(float(row.high - row.low), 1e-12)
+    close_near_high = (float(row.high - row.close) / candle_range) <= 0.25
+
+    volume_ratio = (
+        float(row.volume / row.vol_avg)
+        if pd.notna(row.vol_avg) and float(row.vol_avg) > 0
+        else 0.0
+    )
+    volume_expanding = volume_ratio >= 1.0 and row.volume > prev.volume
+
+    bb_width = max(float(row.bb_upper - row.bb_lower), 1e-12)
+    bb_room_ratio = float(row.bb_upper - row.close) / bb_width
+    room_below_bb_upper = row.close < row.bb_upper and bb_room_ratio >= 0.08
+
+    recent_4_low = float(df["low"].iloc[max(0, i - 3):i + 1].min())
+    recent_runup_pct = (
+        (float(row.close) / recent_4_low - 1) * 100
+        if recent_4_low > 0
+        else 0.0
+    )
+    not_short_term_overheated = recent_runup_pct <= 4.0 and row.rsi < 72.0
+
+    preference_checks = [
+        ema_fast_up,
+        ema_slow_up,
+        ema_ordered,
+        bearish_then_strong_bull,
+        body_or_high_break,
+        close_near_high,
+        volume_expanding,
+        room_below_bb_upper,
+        not_short_term_overheated,
+    ]
+    preference_labels = [
+        "EMA20 상승",
+        "EMA60 상승",
+        "EMA 정배열",
+        "음봉 뒤 강한 양봉",
+        "전봉 몸통·고점 돌파",
+        "종가가 고가 근처",
+        "거래량 증가",
+        "볼밴 상단 여유",
+        "단기 과급등 아님",
+    ]
+    preference_score_9 = sum(int(ok) for ok in preference_checks)
+    preference_reasons = ", ".join(
+        label for label, ok in zip(preference_labels, preference_checks) if ok
+    ) or "-"
 
     labels = ["EMA20>EMA60", "EMA20 상승", "EMA·VWAP 위", "RSI 정상", "거래량 통과", "눌림 확인", "BTC 필터"]
     reasons = [name for name, ok in zip(labels, checks) if ok]
@@ -245,6 +318,10 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
         stop_price=float(stop_price),
         stop_pct=float(stop_pct),
         tp_price=float(tp_price),
+        preference_score_9=int(preference_score_9),
+        preference_reasons=preference_reasons,
+        signal_diff_pct=float(signal_diff_pct),
+        volume_ratio=float(volume_ratio),
         reasons=", ".join(reasons) or "-",
         fail_reasons=", ".join(failed) or "-",
     )
