@@ -12,12 +12,21 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from bybit import get_klines, get_linear_tickers, get_ticker, list_usdt_perpetual_symbols
+from bybit import (
+    BybitError,
+    get_klines,
+    get_linear_tickers,
+    get_ticker,
+    list_usdt_perpetual_symbols,
+    private_api_configured,
+    get_unified_wallet_balance,
+    place_long_market_with_risk,
+)
 from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v3.2.0"
+APP_VERSION = "v3.3.0"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -457,12 +466,15 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption(f"{APP_VERSION} · BUY 선호순위 TOP10 · 상승률 TOP30 + 즐겨찾기 · 모바일 안정화")
+st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 주문 · 실제 평단 TP/SL")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
 tp_pct = float(get_setting("tp_pct", 1.2))
 max_stop_pct = float(get_setting("max_stop_pct", 5.0))
+default_margin_usdt = float(get_setting("order_margin_usdt", 10.0))
+default_leverage = int(get_setting("order_leverage", 5))
+hedge_mode = bool(get_setting("bybit_hedge_mode", True))
 
 with st.expander("⚙️ 감시종목 및 기준", expanded=False):
     try:
@@ -509,6 +521,37 @@ with st.expander("⚙️ 감시종목 및 기준", expanded=False):
         set_setting("max_stop_pct", new_stop)
         set_setting("favorite_symbols", selected_favorites)
         st.success("TOP30 스캔 기준과 즐겨찾기를 저장했어요.")
+        st.rerun()
+
+with st.expander("🔐 Bybit API 주문 설정", expanded=True):
+    if private_api_configured():
+        try:
+            api_balance = get_unified_wallet_balance()
+            st.success(f"Bybit API 연결됨 · USDT 지갑잔액 {api_balance:,.2f}")
+        except Exception as exc:
+            st.error(f"API 키는 있으나 연결 실패: {exc}")
+    else:
+        st.error(".env의 BYBIT_API_KEY / BYBIT_API_SECRET을 확인하세요.")
+
+    order_margin = st.number_input(
+        "1회 증거금 (USDT)", min_value=1.0, max_value=10000.0,
+        value=default_margin_usdt, step=1.0,
+        help="실제 주문 명목금액은 증거금 × 레버리지입니다.",
+    )
+    order_leverage = st.number_input(
+        "레버리지", min_value=1, max_value=50,
+        value=default_leverage, step=1,
+    )
+    order_hedge = st.toggle(
+        "헤지모드 사용 (LONG positionIdx=1)", value=hedge_mode,
+        help="같은 종목 LONG과 SHORT를 동시에 보유하는 계정이면 켜세요.",
+    )
+    st.caption(f"예상 명목금액: {float(order_margin) * int(order_leverage):,.2f} USDT")
+    if st.button("주문 설정 저장", use_container_width=True):
+        set_setting("order_margin_usdt", float(order_margin))
+        set_setting("order_leverage", int(order_leverage))
+        set_setting("bybit_hedge_mode", bool(order_hedge))
+        st.success("주문 설정을 저장했습니다.")
         st.rerun()
 
 with st.expander("➕ 매수한 종목 직접 등록", expanded=True):
@@ -607,6 +650,67 @@ settings = StrategySettings(
     max_stop_pct=max_stop_pct,
 )
 
+
+def render_pending_order_confirmation() -> None:
+    pending = st.session_state.get("pending_long_order")
+    if not pending:
+        return
+    symbol = str(pending["symbol"])
+    st.error("⚠️ 실제 Bybit 시장가 주문 최종 확인")
+    with st.container(border=True):
+        st.markdown(f"### {symbol} LONG")
+        st.write(
+            f"증거금 **{pending['margin_usdt']:.2f} USDT** · "
+            f"레버리지 **{pending['leverage']}x** · "
+            f"예상 명목금액 **{pending['margin_usdt'] * pending['leverage']:.2f} USDT**"
+        )
+        st.write(
+            f"구조 손절가 **{pending['stop_price']:.10g}** · "
+            f"실제 체결 평단 기준 TP **+{pending['tp_pct']:.2f}%**"
+        )
+        confirm_text = st.text_input(
+            "주문하려면 LONG 입력",
+            key=f"confirm_text_{symbol}",
+            placeholder="LONG",
+        )
+        c1, c2 = st.columns(2)
+        if c1.button("취소", use_container_width=True, key=f"cancel_{symbol}"):
+            st.session_state.pop("pending_long_order", None)
+            st.rerun()
+        if c2.button(
+            "실제 주문 실행",
+            type="primary",
+            use_container_width=True,
+            disabled=confirm_text.strip().upper() != "LONG",
+            key=f"execute_{symbol}",
+        ):
+            try:
+                with st.spinner(f"{symbol} 주문·체결·TP/SL 등록 중..."):
+                    result = place_long_market_with_risk(
+                        symbol=symbol,
+                        margin_usdt=float(pending["margin_usdt"]),
+                        leverage=int(pending["leverage"]),
+                        stop_price=float(pending["stop_price"]),
+                        tp_pct=float(pending["tp_pct"]),
+                        position_idx=1 if bool(pending["hedge_mode"]) else 0,
+                    )
+                    save_position(
+                        symbol,
+                        float(result["avg_price"]),
+                        float(result["stop_price"]),
+                        float(pending["tp_pct"]),
+                    )
+                st.session_state.pop("pending_long_order", None)
+                st.success(
+                    f"✅ {symbol} 진입완료 · 평단 {result['avg_price']:.10g} · "
+                    f"수량 {result['qty']:.10g} · TP {result['tp_price']:.10g} · "
+                    f"STOP {result['stop_price']:.10g}"
+                )
+            except Exception as exc:
+                st.error(f"주문 실패: {exc}")
+
+
+render_pending_order_confirmation()
 
 @st.fragment(run_every=10)
 def auto_scan_panel():
@@ -735,6 +839,37 @@ def auto_scan_panel():
                     f"신호 UTC {signal_time}  \n"
                     f"선호조건: {row.get('preference_reasons') or '-'}"
                 )
+                already_open = str(row["symbol"]) in open_position_symbols()
+                stop_pct_value = float(row.get("stop_pct", 0.0) or 0.0)
+                stop_price_value = float(row.get("stop_price", 0.0) or 0.0)
+                unsafe_stop = (
+                    stop_price_value <= 0
+                    or stop_pct_value <= 0
+                    or stop_pct_value > max_stop_pct
+                )
+                if already_open:
+                    st.success("✅ 진입 중 · 포지션 관리에서 확인")
+                else:
+                    if unsafe_stop:
+                        st.warning(
+                            f"주문 잠금: 구조 손절폭 {stop_pct_value:.2f}%가 "
+                            f"설정 상한 {max_stop_pct:.2f}%를 벗어났습니다."
+                        )
+                    if st.button(
+                        f"LONG 준비 · 증거금 {default_margin_usdt:.0f} USDT · {default_leverage}x",
+                        use_container_width=True,
+                        disabled=(not private_api_configured()) or unsafe_stop,
+                        key=f"prepare_long_{row['symbol']}_{row['candle_time_utc']}",
+                    ):
+                        st.session_state["pending_long_order"] = {
+                            "symbol": str(row["symbol"]),
+                            "margin_usdt": float(default_margin_usdt),
+                            "leverage": int(default_leverage),
+                            "stop_price": stop_price_value,
+                            "tp_pct": float(tp_pct),
+                            "hedge_mode": bool(hedge_mode),
+                        }
+                        st.rerun()
 
     st.caption(
         f"FAST ROTATION {APP_VERSION} · BUY TOP10 아래에는 별도로 실시간 움직임 레이더가 표시됩니다."
