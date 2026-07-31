@@ -263,7 +263,7 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("v2.5.4 · 언제든 진입 등록 · 모바일 안정화 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
+st.caption("v2.5.5-1 · Arrow 표 렌더링 제거 · 언제든 진입 등록 · 모바일 안정화 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -617,30 +617,20 @@ def auto_scan_panel():
             )
 
     if wait_rows:
-        wait_table = pd.DataFrame(
-            [
-                {
-                    "상태": "🟡 보류"
-                    if bool(row["signal_now"])
-                    else "⚪ 대기",
-                    "종목": row["symbol"],
-                    "점수": round(float(row["current_score_10"]), 1),
-                    "눌림": round(float(row["pullback_score_10"]), 1),
-                    "현재가": format(row["_live_price"], ".10g"),
-                    "판단": row["_live_status"],
-                }
-                for row in wait_rows
-            ]
-        )
         with st.expander(
             f"🟡 보류·대기 상위 {len(wait_rows)}개 보기",
             expanded=False,
         ):
-            st.dataframe(
-                wait_table,
-                use_container_width=True,
-                hide_index=True,
-            )
+            for row in wait_rows:
+                state = "🟡 보류" if bool(row["signal_now"]) else "⚪ 대기"
+                st.markdown(
+                    f"**{state} · {row['symbol']}**  \n"
+                    f"점수 {float(row['current_score_10']):.1f} · "
+                    f"눌림 {float(row['pullback_score_10']):.1f} · "
+                    f"현재가 {format(row['_live_price'], '.10g')}  \n"
+                    f"{row['_live_status']}"
+                )
+                st.divider()
 
     if hidden_count:
         st.caption(
@@ -762,7 +752,7 @@ with st.expander("📊 축적 데이터 요약"):
         checks = conn.execute(
             "SELECT COUNT(*) c FROM position_checks"
         ).fetchone()["c"]
-        recent = pd.read_sql_query(
+        recent = conn.execute(
             """SELECT
                 symbol,
                 candle_time_utc,
@@ -773,9 +763,8 @@ with st.expander("📊 축적 데이터 요약"):
                 entry_status
             FROM signals
             ORDER BY id DESC
-            LIMIT 30""",
-            conn,
-        )
+            LIMIT 30"""
+        ).fetchall()
 
     st.write(
         f"저장된 스캔 {total}건 · "
@@ -783,11 +772,22 @@ with st.expander("📊 축적 데이터 요약"):
         f"포지션 추적 {checks}봉"
     )
 
-    if not recent.empty:
-        st.dataframe(
-            recent,
-            use_container_width=True,
-            hide_index=True,
-        )
+    if recent:
+        for row in recent:
+            row = dict(row)
+            candle_time = str(row.get("candle_time_utc") or "")[:16].replace("T", " ")
+            score = row.get("current_score")
+            pullback = row.get("pullback_score")
+            rsi = row.get("rsi")
+            score_text = "-" if score is None else f"{float(score):.1f}"
+            pullback_text = "-" if pullback is None else f"{float(pullback):.1f}"
+            rsi_text = "-" if rsi is None else f"{float(rsi):.1f}"
+            st.markdown(
+                f"**{row.get('symbol', '-')} · {row.get('signal', '-')}**  \n"
+                f"{candle_time} UTC · 점수 {score_text} · "
+                f"눌림 {pullback_text} · RSI {rsi_text}  \n"
+                f"{row.get('entry_status') or '-'}"
+            )
+            st.divider()
 
 st.caption("자동 주문은 하지 않습니다. 거래소 보호주문은 별도로 설정하세요.")
