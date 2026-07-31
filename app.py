@@ -383,7 +383,7 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("v2.6.0 · 회전 우선순위 · 주식형/코인 유형별 유동성 보정 · Arrow 표 제거 유지 · 모바일 안정화")
+st.caption("v2.6.1 · 전체 회전 TOP10 + 주식형 주목 TOP3 · 유형별 유동성 보정 · 모바일 안정화")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -587,13 +587,48 @@ def auto_scan_panel():
         )
 
     st.caption(
-        "LIVE ENTRY v2.6.0 · 회전점수순 · 주식형은 주식형끼리, 코인은 코인끼리 "
-        "거래대금을 비교한 뒤 전체 순위를 합칩니다."
+        "LIVE ENTRY v2.6.1 · 전체 TOP10은 순수 회전점수순 · "
+        "주식형은 별도 TOP3로 한 번 더 보여줍니다."
     )
 
-    # 모바일 WebSocket 과부하 방지를 위해 점수 상위 후보만 실시간 확인합니다.
-    live_limit = 12
-    live_source = filtered.head(live_limit).copy()
+    overall_top = filtered.head(10).copy()
+    stock_top = filtered[filtered["symbol_type"] == "stock"].head(3).copy()
+
+    st.markdown("### 🏆 전체 회전 TOP10")
+    if overall_top.empty:
+        st.info("전체 회전 순위에 표시할 종목이 없습니다.")
+    else:
+        for rank, (_, row) in enumerate(overall_top.iterrows(), start=1):
+            badge = product_badge(str(row.get("symbol_type", "crypto")))
+            signal_mark = "🟢" if bool(row.get("signal_now", False)) else "⚪"
+            st.markdown(
+                f"**{rank}. {signal_mark} {row['symbol']} · {badge} · "
+                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점**  "
+                f"\n현재 {float(row['current_score_10']):.1f} · "
+                f"눌림 {float(row['pullback_score_10']):.1f} · "
+                f"RSI {float(row['rsi']):.1f}"
+            )
+
+    st.markdown("### 📈 주식형 주목 TOP3")
+    if stock_top.empty:
+        st.info("현재 표시 기준을 통과한 주식형 종목이 없습니다.")
+    else:
+        overall_symbols = set(overall_top["symbol"].astype(str).tolist())
+        for rank, (_, row) in enumerate(stock_top.iterrows(), start=1):
+            included_note = " · 전체 TOP10 포함" if str(row["symbol"]) in overall_symbols else ""
+            signal_mark = "🟢" if bool(row.get("signal_now", False)) else "⚪"
+            st.markdown(
+                f"**{rank}. {signal_mark} {row['symbol']} · 🟣 주식형 · "
+                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점{included_note}**  "
+                f"\n거래대금 추정 {float(row.get('turnover_24h_est', 0.0))/1_000_000:.2f}M USDT · "
+                f"가속 {float(row.get('turnover_accel', 0.0)):.2f}배 · "
+                f"1시간 모멘텀 {float(row.get('momentum_1h', 0.0)):+.2f}%"
+            )
+
+    # 전체 TOP10과 주식형 TOP3의 합집합만 실시간 확인합니다.
+    live_source = pd.concat([overall_top, stock_top], ignore_index=True)
+    if not live_source.empty:
+        live_source = live_source.drop_duplicates(subset=["symbol"], keep="first")
     hidden_count = max(0, len(filtered) - len(live_source))
 
     live_rows = []
@@ -766,7 +801,7 @@ def auto_scan_panel():
         st.caption(
             f"모바일 안정화를 위해 나머지 {hidden_count}개는 "
             "상세 실시간 표시에서 숨겼어요. "
-            "다음 15분 스캔 때 점수순으로 다시 선별됩니다."
+            "다음 15분 스캔 때 전체 TOP10과 주식형 TOP3 기준으로 다시 선별됩니다."
         )
 
     for error in st.session_state.get("last_errors", []):
