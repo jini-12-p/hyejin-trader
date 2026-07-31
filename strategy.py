@@ -325,3 +325,73 @@ def analyze_symbol(symbol: str, raw_df: pd.DataFrame, settings: StrategySettings
         reasons=", ".join(reasons) or "-",
         fail_reasons=", ".join(failed) or "-",
     )
+
+
+def analyze_position_health(
+    raw_df: pd.DataFrame,
+    side: str,
+    settings: StrategySettings | None = None,
+) -> dict:
+    """15분봉 마감 기준으로 실제 보유 포지션의 추세 건강도를 평가합니다.
+
+    주문을 변경하지 않으며 LONG/SHORT를 대칭 기준으로 판정합니다.
+    """
+    s = settings or StrategySettings()
+    df = add_indicators(_closed_only(raw_df), s)
+    if len(df) < max(s.slow_len, s.vol_len) + 3:
+        raise ValueError("포지션 분석에 필요한 마감 캔들이 부족합니다.")
+
+    row = df.iloc[-1]
+    prev = df.iloc[-2]
+    direction = 1 if str(side).upper() == "LONG" else -1
+    close = float(row.close)
+    ema20 = float(row.ema_fast)
+    ema60 = float(row.ema_slow)
+    ema20_prev = float(prev.ema_fast)
+    rsi = float(row.rsi)
+    vol_avg = float(row.vol_avg) if pd.notna(row.vol_avg) else 0.0
+    volume_ratio = float(row.volume / vol_avg) if vol_avg > 0 else 0.0
+
+    price_good = (close - ema20) * direction >= 0
+    ema_order_good = (ema20 - ema60) * direction >= 0
+    slope_good = (ema20 - ema20_prev) * direction >= 0
+    vwap_good = (close - float(row.vwap)) * direction >= 0
+    rsi_good = rsi >= 48 if direction == 1 else rsi <= 52
+
+    lookback = df.tail(8)
+    if direction == 1:
+        structure_level = float(lookback.iloc[:-1].low.min())
+        structure_good = close >= structure_level
+        adverse_volume = close < float(row.open) and volume_ratio >= 1.20
+    else:
+        structure_level = float(lookback.iloc[:-1].high.max())
+        structure_good = close <= structure_level
+        adverse_volume = close > float(row.open) and volume_ratio >= 1.20
+
+    checks = [price_good, ema_order_good, slope_good, vwap_good, rsi_good, structure_good, not adverse_volume]
+    health = int(round(sum(bool(x) for x in checks) / len(checks) * 100))
+
+    hard_break = (not price_good and not slope_good and not structure_good) or (not ema_order_good and adverse_volume)
+    warning = (not price_good and not slope_good) or (not structure_good) or sum(bool(x) for x in checks) <= 4
+    if hard_break or health <= 42:
+        status, icon, priority, recommendation = "추세 이탈", "🔴", 0, "정리 우선 검토"
+    elif warning or health <= 70:
+        status, icon, priority, recommendation = "주의", "🟡", 1, "반등·구조 회복 확인"
+    else:
+        status, icon, priority, recommendation = "추세 유지", "🟢", 2, "보유 가능"
+
+    reasons = [
+        f"EMA20 {'위' if price_good else '아래'}",
+        f"EMA20 기울기 {'유지' if slope_good else '역방향'}",
+        f"EMA20/60 배열 {'정상' if ema_order_good else '역배열'}",
+        f"최근 구조 {'유지' if structure_good else '붕괴'}",
+        f"거래량 {volume_ratio:.2f}배",
+        f"RSI {rsi:.1f}",
+    ]
+    return {
+        "health": health, "status": status, "icon": icon, "priority": priority,
+        "recommendation": recommendation, "reasons": reasons,
+        "ema20": ema20, "ema60": ema60, "rsi": rsi,
+        "volume_ratio": volume_ratio, "structure_level": structure_level,
+        "danger": status == "추세 이탈",
+    }

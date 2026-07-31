@@ -23,11 +23,11 @@ from bybit import (
     get_open_linear_positions,
     place_long_market_with_risk,
 )
-from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
+from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, analyze_position_health
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v3.4.0"
+APP_VERSION = "v3.5.0"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -1144,42 +1144,104 @@ def bybit_positions_panel():
         st.info("현재 Bybit에 열려 있는 USDT 선물 포지션이 없습니다.")
         return
 
-    st.success(f"Bybit 실제 포지션 {len(positions)}개 동기화됨")
-    for position in positions:
+    hidden = set(get_setting("hidden_bybit_positions", []))
+    favorites = set(get_setting("favorite_bybit_positions", []))
+
+    def pos_key(p: dict) -> str:
+        return f"{p['symbol']}|{p['side']}|{p.get('position_idx', 0)}"
+
+    def inspect(p: dict) -> dict:
+        out = dict(p)
+        try:
+            candles = get_klines(p["symbol"], interval="15", limit=120)
+            out["analysis"] = analyze_position_health(candles, p["side"])
+        except Exception as exc:
+            out["analysis"] = {
+                "health": 0, "status": "분석 대기", "icon": "⚪", "priority": 3,
+                "recommendation": "차트 데이터 재확인", "reasons": [str(exc)], "danger": False,
+            }
+        return out
+
+    analyzed = []
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(positions)))) as executor:
+        futures = [executor.submit(inspect, p) for p in positions]
+        for future in as_completed(futures):
+            analyzed.append(future.result())
+
+    analyzed.sort(key=lambda p: (
+        0 if pos_key(p) in favorites else 1,
+        p["analysis"].get("priority", 3),
+        p["unrealised_pnl"],
+    ))
+    visible = [p for p in analyzed if pos_key(p) not in hidden]
+    hidden_rows = [p for p in analyzed if pos_key(p) in hidden]
+    hidden_dangers = [p for p in hidden_rows if p["analysis"].get("danger")]
+
+    st.success(f"Bybit 실제 포지션 {len(positions)}개 동기화됨 · 관리 목록 {len(visible)}개")
+    if hidden_dangers:
+        st.error(f"⚠️ 숨김 종목 위험 신호 {len(hidden_dangers)}개: " + ", ".join(p["symbol"] for p in hidden_dangers))
+
+    urgent = [p for p in visible if p["analysis"].get("priority", 3) <= 1]
+    if urgent:
+        st.markdown("#### 🚨 관리 우선순위")
+        st.write(" · ".join(
+            f"{p['analysis']['icon']} {p['symbol']}({p['analysis']['status']})" for p in urgent[:6]
+        ))
+
+    def render_position(position: dict, is_hidden: bool = False) -> None:
+        key = pos_key(position)
+        a = position["analysis"]
         side_icon = "🟢" if position["side"] == "LONG" else "🔴"
+        fav_icon = "⭐" if key in favorites else "☆"
         with st.container(border=True):
-            st.markdown(f"### {side_icon} {position['symbol']} · {position['side']}")
+            st.markdown(
+                f"### {fav_icon} {side_icon} {position['symbol']} · {position['side']}  "
+                f"{a['icon']} {a['status']} · 건강도 {a['health']}점"
+            )
             c1, c2, c3 = st.columns(3)
             c1.metric("평단", format(position["avg_price"], ".10g"))
             c2.metric("현재가", format(position["mark_price"], ".10g"))
             c3.metric("가격변동", f"{position['price_pnl_pct']:+.2f}%")
-
             d1, d2, d3 = st.columns(3)
             d1.metric("미실현손익", f"{position['unrealised_pnl']:+.2f} USDT")
             d2.metric("증거금(추정)", f"{position['margin_estimate']:.2f} USDT")
             d3.metric("포지션", f"{position['position_value']:.2f} USDT")
 
-            tp_text = (
-                format(position["take_profit"], ".10g")
-                if position["take_profit"] > 0
-                else "미설정"
-            )
-            sl_text = (
-                format(position["stop_loss"], ".10g")
-                if position["stop_loss"] > 0
-                else "미설정"
-            )
-            liq_text = (
-                format(position["liq_price"], ".10g")
-                if position["liq_price"] > 0
-                else "-"
-            )
+            st.markdown(f"**추천: {a['recommendation']}**")
+            st.caption(" · ".join(a.get("reasons", [])))
+
+            tp_text = format(position["take_profit"], ".10g") if position["take_profit"] > 0 else "미설정"
+            sl_text = format(position["stop_loss"], ".10g") if position["stop_loss"] > 0 else "미설정"
+            liq_text = format(position["liq_price"], ".10g") if position["liq_price"] > 0 else "-"
             st.write(
                 f"수량 {position['size']:.10g} · 레버리지 {position['leverage']:.10g}배  \n"
                 f"Bybit TP {tp_text} · Bybit SL {sl_text} · 청산가 {liq_text}"
             )
+            b1, b2 = st.columns(2)
+            if b1.button("☆ 즐겨찾기 해제" if key in favorites else "⭐ 즐겨찾기", key=f"fav_{key}", use_container_width=True):
+                new_favorites = set(favorites)
+                new_favorites.discard(key) if key in new_favorites else new_favorites.add(key)
+                set_setting("favorite_bybit_positions", sorted(new_favorites))
+                st.rerun()
+            label = "↩️ 관리 목록으로 복원" if is_hidden else "👁 숨기기"
+            if b2.button(label, key=f"hide_{key}", use_container_width=True):
+                new_hidden = set(hidden)
+                new_hidden.discard(key) if is_hidden else new_hidden.add(key)
+                set_setting("hidden_bybit_positions", sorted(new_hidden))
+                st.rerun()
             if position["take_profit"] <= 0 or position["stop_loss"] <= 0:
                 st.caption("⚠️ 보호주문 미설정 항목이 있습니다. 프로그램은 임의로 등록하지 않습니다.")
+
+    if visible:
+        for position in visible:
+            render_position(position)
+    else:
+        st.info("관리 목록에 표시할 포지션이 없습니다.")
+
+    if hidden_rows:
+        with st.expander(f"🙈 숨김 포지션 ({len(hidden_rows)})", expanded=False):
+            for position in hidden_rows:
+                render_position(position, is_hidden=True)
 
 
 bybit_positions_panel()
