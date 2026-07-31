@@ -9,7 +9,6 @@ from pathlib import Path
 
 import extra_streamlit_components as stx
 import pandas as pd
-import requests
 import streamlit as st
 
 from bybit import get_klines, get_ticker, list_usdt_perpetual_symbols
@@ -17,7 +16,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-DEFAULT_WATCHLIST: list[str] = []
+DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 
 
 def db() -> sqlite3.Connection:
@@ -113,138 +112,8 @@ def cached_symbols() -> list[str]:
     return list_usdt_perpetual_symbols()
 
 
-@st.cache_data(ttl=3600)
-def cached_symbol_types() -> dict[str, str]:
-    """Bybit 상품 분류를 가져옵니다. 실패하면 안전하게 코인형으로 처리합니다."""
-    type_map: dict[str, str] = {}
-    cursor = ""
-    try:
-        while True:
-            params = {"category": "linear", "limit": 1000}
-            if cursor:
-                params["cursor"] = cursor
-            response = requests.get(
-                "https://api.bybit.com/v5/market/instruments-info",
-                params=params,
-                timeout=15,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if payload.get("retCode") != 0:
-                break
-            result = payload.get("result", {})
-            for row in result.get("list", []):
-                symbol = str(row.get("symbol", ""))
-                raw_type = str(row.get("symbolType", "")).lower()
-                if symbol:
-                    if raw_type == "stock":
-                        type_map[symbol] = "stock"
-                    elif raw_type == "forex":
-                        type_map[symbol] = "forex"
-                    else:
-                        type_map[symbol] = "crypto"
-            cursor = result.get("nextPageCursor", "")
-            if not cursor:
-                break
-    except Exception:
-        return {}
-    return type_map
-
-
-def enrich_rotation_metrics(result: dict, klines: pd.DataFrame, symbol_type: str) -> dict:
-    """이미 받은 15분봉으로 회전력 지표를 계산해 API 호출을 늘리지 않습니다."""
-    out = dict(result)
-    df = klines.sort_values("start_time").copy()
-    if len(df) > 1:
-        df = df.iloc[:-1].copy()  # 진행 중 봉 제외
-
-    turnover = pd.to_numeric(df.get("turnover"), errors="coerce").fillna(0.0)
-    close = pd.to_numeric(df.get("close"), errors="coerce")
-    high = pd.to_numeric(df.get("high"), errors="coerce")
-    low = pd.to_numeric(df.get("low"), errors="coerce")
-
-    recent4 = float(turnover.tail(4).mean()) if len(turnover) else 0.0
-    base20 = float(turnover.iloc[-24:-4].mean()) if len(turnover) >= 24 else float(turnover.mean() or 0.0)
-    accel = recent4 / base20 if base20 > 0 else 0.0
-    turnover_24h = float(turnover.tail(96).sum())
-
-    range_pct = ((high - low) / close.replace(0, pd.NA) * 100).dropna()
-    volatility = float(range_pct.tail(4).mean()) if len(range_pct) else 0.0
-
-    momentum = 0.0
-    if len(close.dropna()) >= 5 and float(close.dropna().iloc[-5]) > 0:
-        momentum = (float(close.dropna().iloc[-1]) / float(close.dropna().iloc[-5]) - 1) * 100
-
-    out.update({
-        "symbol_type": symbol_type if symbol_type in {"stock", "forex"} else "crypto",
-        "turnover_24h_est": turnover_24h,
-        "turnover_accel": max(0.0, accel),
-        "short_volatility": max(0.0, volatility),
-        "momentum_1h": momentum,
-    })
-    return out
-
-
-def add_rotation_scores(frame: pd.DataFrame) -> pd.DataFrame:
-    """유형 안에서 거래대금을 비교한 뒤 모든 유형을 하나의 회전 순위로 합칩니다."""
-    if frame.empty:
-        return frame
-    out = frame.copy()
-    for col in ["turnover_24h_est", "turnover_accel", "short_volatility", "momentum_1h"]:
-        if col not in out:
-            out[col] = 0.0
-        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
-    if "symbol_type" not in out:
-        out["symbol_type"] = "crypto"
-
-    group = out.groupby("symbol_type", dropna=False)
-    out["liquidity_pct"] = group["turnover_24h_est"].rank(pct=True, method="average") * 100
-    out["accel_pct"] = group["turnover_accel"].rank(pct=True, method="average") * 100
-    out["volatility_pct"] = group["short_volatility"].rank(pct=True, method="average") * 100
-    out["momentum_pct"] = group["momentum_1h"].rank(pct=True, method="average") * 100
-
-    out["rotation_score"] = (
-        out["accel_pct"] * 0.35
-        + out["volatility_pct"] * 0.30
-        + out["momentum_pct"] * 0.20
-        + out["liquidity_pct"] * 0.15
-    ).round(1)
-    out["liquidity_warning"] = out["turnover_24h_est"] < 1_000_000
-    return out
-
-
-def product_badge(symbol_type: str) -> str:
-    if symbol_type == "stock":
-        return "🟣 주식형"
-    if symbol_type == "forex":
-        return "🟠 외환형"
-    return "🔵 코인"
-
-
-def open_position_symbols() -> set[str]:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT symbol FROM positions WHERE status='OPEN'"
-        ).fetchall()
-    return {str(row["symbol"]) for row in rows}
-
-
-def all_scan_symbols() -> list[str]:
-    """전체 USDT 무기한 종목에서 현재 보유 중인 종목만 자동 제외."""
-    symbols = cached_symbols()
-    excluded = open_position_symbols()
-    return [symbol for symbol in symbols if symbol not in excluded]
-
-
-def scan_one(
-    symbol: str,
-    settings: StrategySettings,
-    symbol_types: dict[str, str],
-) -> dict:
-    klines = get_klines(symbol, "15", 240)
-    result = analyze_symbol(symbol, klines, settings).to_dict()
-    symbol_type = symbol_types.get(symbol, "crypto")
-    return enrich_rotation_metrics(result, klines, symbol_type)
+def scan_one(symbol: str, settings: StrategySettings) -> dict:
+    return analyze_symbol(symbol, get_klines(symbol, "15", 240), settings).to_dict()
 
 
 def save_signal(r: dict) -> None:
@@ -296,12 +165,8 @@ def do_scan(
     results, errors = [], []
     if not watchlist:
         return results, errors
-    symbol_types = cached_symbol_types()
     with ThreadPoolExecutor(max_workers=min(8, len(watchlist))) as pool:
-        futures = {
-            pool.submit(scan_one, s, settings, symbol_types): s
-            for s in watchlist
-        }
+        futures = {pool.submit(scan_one, s, settings): s for s in watchlist}
         for future in as_completed(futures):
             try:
                 result = future.result()
@@ -366,50 +231,31 @@ def close_position(symbol: str, status: str) -> None:
         )
 
 
-def latest_signal_for_symbol(symbol: str) -> dict | None:
-    with db() as conn:
-        row = conn.execute(
-            """SELECT *
-            FROM signals
-            WHERE symbol=?
-            ORDER BY id DESC
-            LIMIT 1""",
-            (symbol,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
 init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("v2.6.1 · 전체 회전 TOP10 + 주식형 주목 TOP3 · 유형별 유동성 보정 · 모바일 안정화")
+st.caption("마감봉 신호 + Bybit 실시간 현재가 · 진입 후 5초 추적")
 
+watchlist = get_setting("watchlist", DEFAULT_WATCHLIST)
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
 tp_pct = float(get_setting("tp_pct", 1.2))
 max_stop_pct = float(get_setting("max_stop_pct", 5.0))
 
-with st.expander("⚙️ 전체 스캔 기준", expanded=False):
+with st.expander("⚙️ 감시종목 및 기준", expanded=False):
     try:
-        total_symbols = cached_symbols()
-        held_symbols = open_position_symbols()
-        scan_symbols = [
-            symbol for symbol in total_symbols
-            if symbol not in held_symbols
-        ]
-        st.info(
-            f"전체 USDT 무기한 {len(total_symbols)}개 · "
-            f"보유 중 자동 제외 {len(held_symbols)}개 · "
-            f"현재 스캔 대상 {len(scan_symbols)}개"
-        )
-        if held_symbols:
-            st.caption(
-                "자동 제외 중: " + ", ".join(sorted(held_symbols))
-            )
+        symbols = cached_symbols()
     except Exception as exc:
-        st.warning(f"종목 목록 조회 오류: {exc}")
+        symbols = watchlist
+        st.warning(f"종목 목록 오류: {exc}")
 
+    selected = st.multiselect(
+        "감시종목",
+        options=symbols,
+        default=[symbol for symbol in watchlist if symbol in symbols],
+        placeholder="예: AERGOUSDT",
+    )
     new_min = st.slider(
         "표시할 최소점수(10점 만점)",
         0.0,
@@ -428,91 +274,12 @@ with st.expander("⚙️ 전체 스캔 기준", expanded=False):
     )
 
     if st.button("설정 영구 저장", use_container_width=True):
+        set_setting("watchlist", selected)
         set_setting("min_score", new_min)
         set_setting("show_only_buy", new_only)
         set_setting("tp_pct", new_tp)
         set_setting("max_stop_pct", new_stop)
-        st.success("전체 종목 스캔 기준을 저장했어요.")
-        st.rerun()
-
-with st.expander("➕ 매수한 종목 직접 등록", expanded=True):
-    st.caption(
-        "초록에서 매수한 뒤 노란색으로 바뀌어도 여기서 언제든 등록할 수 있어요."
-    )
-
-    try:
-        manual_symbols = cached_symbols()
-    except Exception:
-        manual_symbols = []
-
-    manual_symbol = st.selectbox(
-        "매수한 종목",
-        options=[""] + manual_symbols,
-        index=0,
-        placeholder="종목 선택",
-        key="manual_position_symbol",
-    )
-
-    latest_signal = (
-        latest_signal_for_symbol(manual_symbol)
-        if manual_symbol
-        else None
-    )
-
-    default_entry = 0.0
-    default_stop = 0.0
-    signal_note = "종목을 선택하면 최근 신호의 비상 손절가를 불러옵니다."
-
-    if latest_signal:
-        default_entry = float(latest_signal.get("buy_price") or 0.0)
-        default_stop = float(latest_signal.get("stop_price") or 0.0)
-        signal_time = str(
-            latest_signal.get("candle_time_utc") or ""
-        )[:19].replace("T", " ")
-        signal_note = (
-            f"최근 신호 UTC {signal_time} · "
-            f"신호 {latest_signal.get('signal') or '대기'} · "
-            f"비상 STOP {default_stop:.10g}"
-        )
-
-    st.caption(signal_note)
-
-    manual_entry_price = st.number_input(
-        "실제 내 평단가",
-        min_value=0.0,
-        value=default_entry,
-        format="%.10f",
-        key=f"manual_entry_{manual_symbol}",
-    )
-
-    manual_stop_price = st.number_input(
-        "비상 손절가",
-        min_value=0.0,
-        value=default_stop,
-        format="%.10f",
-        key=f"manual_stop_{manual_symbol}",
-    )
-
-    if st.button(
-        "이 종목 포지션 관리에 등록",
-        type="primary",
-        use_container_width=True,
-        disabled=(
-            not manual_symbol
-            or manual_entry_price <= 0
-            or manual_stop_price <= 0
-        ),
-    ):
-        save_position(
-            manual_symbol,
-            float(manual_entry_price),
-            float(manual_stop_price),
-            tp_pct,
-        )
-        st.success(
-            f"{manual_symbol} 등록 완료 · "
-            "이제 전체 스캔에서 자동 제외되고 실시간 관리에 표시됩니다."
-        )
+        st.success("저장했어요. 다시 로그인하거나 서버가 재시작돼도 유지됩니다.")
         st.rerun()
 
 col_scan, col_logout = st.columns(2)
@@ -532,9 +299,9 @@ settings = StrategySettings(
 )
 
 
-@st.fragment(run_every=10)
+@st.fragment(run_every=5)
 def auto_scan_panel():
-    current_watchlist = all_scan_symbols()
+    current_watchlist = get_setting("watchlist", DEFAULT_WATCHLIST)
     now_utc = datetime.now(timezone.utc)
     last_bucket = now_utc.strftime("%Y-%m-%dT%H:%M")[:15]
     stored_bucket = get_setting("last_auto_bucket", "")
@@ -566,14 +333,12 @@ def auto_scan_panel():
     if get_setting("show_only_buy", False):
         filtered = filtered[filtered["signal_now"]]
 
-    filtered = add_rotation_scores(filtered)
     filtered = filtered.sort_values(
-        ["signal_now", "rotation_score", "current_score_10", "pullback_score_10"],
-        ascending=[False, False, False, False],
+        ["signal_now", "current_score_10", "pullback_score_10"],
+        ascending=[False, False, False],
     )
 
     st.subheader(f"스캔 결과 {len(filtered)}개")
-    st.caption(f"현재 전체 스캔 대상 {len(current_watchlist)}개")
     scan_time = st.session_state.get("last_scan", "")
     st.caption(
         f"마지막 검사 UTC {scan_time[:19].replace('T', ' ')} · "
@@ -586,58 +351,11 @@ def auto_scan_panel():
             "'BUY 신호만 보기'를 끄면 대기 종목과 탈락 사유를 볼 수 있어요."
         )
 
-    st.caption(
-        "LIVE ENTRY v2.6.1 · 전체 TOP10은 순수 회전점수순 · "
-        "주식형은 별도 TOP3로 한 번 더 보여줍니다."
-    )
+    st.caption("LIVE ENTRY v2.4 · 현재 진행봉을 5초마다 다시 확인")
 
-    overall_top = filtered.head(10).copy()
-    stock_top = filtered[filtered["symbol_type"] == "stock"].head(3).copy()
-
-    st.markdown("### 🏆 전체 회전 TOP10")
-    if overall_top.empty:
-        st.info("전체 회전 순위에 표시할 종목이 없습니다.")
-    else:
-        for rank, (_, row) in enumerate(overall_top.iterrows(), start=1):
-            badge = product_badge(str(row.get("symbol_type", "crypto")))
-            signal_mark = "🟢" if bool(row.get("signal_now", False)) else "⚪"
-            st.markdown(
-                f"**{rank}. {signal_mark} {row['symbol']} · {badge} · "
-                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점**  "
-                f"\n현재 {float(row['current_score_10']):.1f} · "
-                f"눌림 {float(row['pullback_score_10']):.1f} · "
-                f"RSI {float(row['rsi']):.1f}"
-            )
-
-    st.markdown("### 📈 주식형 주목 TOP3")
-    if stock_top.empty:
-        st.info("현재 표시 기준을 통과한 주식형 종목이 없습니다.")
-    else:
-        overall_symbols = set(overall_top["symbol"].astype(str).tolist())
-        for rank, (_, row) in enumerate(stock_top.iterrows(), start=1):
-            included_note = " · 전체 TOP10 포함" if str(row["symbol"]) in overall_symbols else ""
-            signal_mark = "🟢" if bool(row.get("signal_now", False)) else "⚪"
-            st.markdown(
-                f"**{rank}. {signal_mark} {row['symbol']} · 🟣 주식형 · "
-                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점{included_note}**  "
-                f"\n거래대금 추정 {float(row.get('turnover_24h_est', 0.0))/1_000_000:.2f}M USDT · "
-                f"가속 {float(row.get('turnover_accel', 0.0)):.2f}배 · "
-                f"1시간 모멘텀 {float(row.get('momentum_1h', 0.0)):+.2f}%"
-            )
-
-    # 전체 TOP10과 주식형 TOP3의 합집합만 실시간 확인합니다.
-    live_source = pd.concat([overall_top, stock_top], ignore_index=True)
-    if not live_source.empty:
-        live_source = live_source.drop_duplicates(subset=["symbol"], keep="first")
-    hidden_count = max(0, len(filtered) - len(live_source))
-
-    live_rows = []
-    for _, row in live_source.iterrows():
-        row_data = row.to_dict()
+    for _, row in filtered.iterrows():
         try:
-            live_df = get_klines(
-                row["symbol"], "15", 3
-            ).sort_values("start_time")
+            live_df = get_klines(row["symbol"], "15", 3).sort_values("start_time")
             live_candle = live_df.iloc[-1]
             live_price = float(live_candle["close"])
             live_open = float(live_candle["open"])
@@ -658,67 +376,27 @@ def auto_scan_panel():
             candle_text = "조회 지연"
             live_status = "현재 봉 조회 지연"
 
-        row_data.update(
-            {
-                "_live_price": live_price,
-                "_live_open": live_open,
-                "_live_diff": diff,
-                "_can_enter": bool(can_enter),
-                "_candle_text": candle_text,
-                "_live_status": live_status,
-            }
-        )
-        live_rows.append(row_data)
-
-    green_rows = sorted(
-        [item for item in live_rows if item["_can_enter"]],
-        key=lambda item: (
-            -float(item.get("rotation_score", 0.0)),
-            -float(item["current_score_10"]),
-            -float(item["pullback_score_10"]),
-        ),
-    )
-    wait_rows = sorted(
-        [item for item in live_rows if not item["_can_enter"]],
-        key=lambda item: (
-            -float(item.get("rotation_score", 0.0)),
-            -float(item["current_score_10"]),
-            -float(item["pullback_score_10"]),
-        ),
-    )
-
-    if green_rows:
-        st.success(
-            f"🟢 지금 진입 가능 {len(green_rows)}개 · "
-            "초록색만 크게 표시합니다."
-        )
-    else:
-        st.info("현재 초록색 진입 가능 종목은 없습니다.")
-
-    for row in green_rows:
-        live_price = row["_live_price"]
-        live_open = row["_live_open"]
-        diff = row["_live_diff"]
-        candle_text = row["_candle_text"]
-        live_status = row["_live_status"]
+        if not bool(row["signal_now"]):
+            icon = "⚪️"
+            header_status = "대기"
+        elif can_enter:
+            icon = "🟢"
+            header_status = f"{row['signal']} · 지금 진입 가능"
+        else:
+            icon = "🟡"
+            header_status = f"{row['signal']} 후보 · 진입 보류"
 
         with st.container(border=True):
-            badge = product_badge(str(row.get("symbol_type", "crypto")))
-            liquidity_note = " · ⚠️ 저유동성" if bool(row.get("liquidity_warning", False)) else ""
-            st.markdown(
-                f"### 🟢 {row['symbol']} · {badge}{liquidity_note} · "
-                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점"
-            )
-            st.caption(f"{row['signal']} · 지금 진입 가능")
+            st.markdown(f"### {icon} {row['symbol']} · {header_status}")
 
-            metric_rotation, metric_score, metric_rsi = st.columns(3)
-            metric_rotation.metric(
-                "회전순위점수",
-                f"{float(row.get('rotation_score', 0.0)):.1f}",
-            )
+            metric_score, metric_pullback, metric_rsi = st.columns(3)
             metric_score.metric(
-                "현재/눌림",
-                f"{row['current_score_10']:.1f}/{row['pullback_score_10']:.1f}",
+                "현재점수",
+                f"{row['current_score_10']:.1f}/10",
+            )
+            metric_pullback.metric(
+                "눌림점수",
+                f"{row['pullback_score_10']:.1f}/10",
             )
             metric_rsi.metric("RSI", f"{row['rsi']:.1f}")
 
@@ -728,47 +406,51 @@ def auto_scan_panel():
             ).tz_convert("Asia/Seoul")
 
             st.write(
+                f"**마감 신호:** "
+                f"{row['signal'] if row['signal_now'] else '대기'} · "
                 f"**최종 진입 판단:** {live_status}  \n"
-                f"**현재 진행봉:** {candle_text} · "
-                f"시가 {live_open:.10g}  \n"
+                f"**현재 진행봉:** {candle_text} · 시가 {live_open:.10g}  \n"
                 f"**신호가:** {row['buy_price']:.10g} · "
                 f"**현재가:** {live_price:.10g} ({diff:+.2f}%)  \n"
                 f"**TP:** {row['tp_price']:.10g} · "
-                f"**비상 STOP:** {row['stop_price']:.10g} "
+                f"**비상 STOP 참고:** {row['stop_price']:.10g} "
                 f"(-{row['stop_pct']:.2f}%)  \n"
-                f"**봉 마감(KST):** "
-                f"{close_kst.strftime('%m-%d %H:%M')}"
+                f"**봉 마감(KST):** {close_kst.strftime('%m-%d %H:%M')}  \n"
+                f"**통과:** {row['reasons']}  \n"
+                f"**주의:** {row['fail_reasons']}"
             )
 
-            entered = st.checkbox(
-                "이 BUY에 실제 진입했어요",
-                key=(
-                    f"entered_{row['symbol']}_"
-                    f"{row['candle_time_utc']}"
-                ),
-            )
-
-            if entered:
-                entry_price = st.number_input(
-                    "내 평단가",
-                    min_value=0.0,
-                    value=float(row["buy_price"]),
-                    format="%.10f",
-                    key=f"ep_{row['symbol']}",
+            if can_enter:
+                entered = st.checkbox(
+                    "이 BUY에 실제 진입했어요",
+                    key=f"entered_{row['symbol']}_{row['candle_time_utc']}",
                 )
 
-                if st.button(
-                    "평단 저장 및 TP/STOP 관리 시작",
-                    key=f"save_{row['symbol']}",
-                    use_container_width=True,
-                ):
-                    save_position(
-                        row["symbol"],
-                        entry_price,
-                        float(row["stop_price"]),
-                        tp_pct,
+                if entered:
+                    entry_price = st.number_input(
+                        "내 평단가",
+                        min_value=0.0,
+                        value=float(row["buy_price"]),
+                        format="%.10f",
+                        key=f"ep_{row['symbol']}",
                     )
-                    st.success("포지션 관리에 저장했어요.")
+
+                    if st.button(
+                        "평단 저장 및 TP/STOP 관리 시작",
+                        key=f"save_{row['symbol']}",
+                        use_container_width=True,
+                    ):
+                        save_position(
+                            row["symbol"],
+                            entry_price,
+                            float(row["stop_price"]),
+                            tp_pct,
+                        )
+                        st.success("포지션 관리에 저장했어요.")
+            else:
+                st.caption(
+                    "진입 보류 상태에서는 진입 체크박스를 표시하지 않습니다."
+                )
 
             st.link_button(
                 "Bybit 차트 열기",
@@ -776,33 +458,6 @@ def auto_scan_panel():
                 + row["symbol"].replace("USDT", "/USDT"),
                 use_container_width=True,
             )
-
-    if wait_rows:
-        with st.expander(
-            f"🟡 보류·대기 상위 {len(wait_rows)}개 보기",
-            expanded=False,
-        ):
-            for row in wait_rows:
-                state = "🟡 보류" if bool(row["signal_now"]) else "⚪ 대기"
-                badge = product_badge(str(row.get("symbol_type", "crypto")))
-                liquidity_note = " · ⚠️ 저유동성" if bool(row.get("liquidity_warning", False)) else ""
-                st.markdown(
-                    f"**{state} · {row['symbol']} · {badge}{liquidity_note}**  \n"
-                    f"회전 {float(row.get('rotation_score', 0.0)):.1f} · "
-                    f"현재 {float(row['current_score_10']):.1f} · "
-                    f"눌림 {float(row['pullback_score_10']):.1f} · "
-                    f"현재가 {format(row['_live_price'], '.10g')}  \n"
-                    f"거래대금(15분봉 추정 24h) {float(row.get('turnover_24h_est', 0.0))/1_000_000:.2f}M USDT · "
-                    f"{row['_live_status']}"
-                )
-                st.divider()
-
-    if hidden_count:
-        st.caption(
-            f"모바일 안정화를 위해 나머지 {hidden_count}개는 "
-            "상세 실시간 표시에서 숨겼어요. "
-            "다음 15분 스캔 때 전체 TOP10과 주식형 TOP3 기준으로 다시 선별됩니다."
-        )
 
     for error in st.session_state.get("last_errors", []):
         st.warning(error)
@@ -814,11 +469,11 @@ st.divider()
 st.subheader("📌 실시간 포지션 관리")
 st.caption(
     "tracker.py가 서버에서 5초마다 현재가를 기록합니다. "
-    "보유 중인 종목은 전체 스캔에서 자동 제외되며, 포지션 종료 후 다음 스캔부터 자동 재포함됩니다."
+    "TP/비상 STOP은 진입 이후 실시간 가격, 추세 판단은 마감봉 기준입니다."
 )
 
 
-@st.fragment(run_every=10)
+@st.fragment(run_every=5)
 def live_positions_panel():
     positions = monitor_positions()
 
@@ -917,7 +572,7 @@ with st.expander("📊 축적 데이터 요약"):
         checks = conn.execute(
             "SELECT COUNT(*) c FROM position_checks"
         ).fetchone()["c"]
-        recent = conn.execute(
+        recent = pd.read_sql_query(
             """SELECT
                 symbol,
                 candle_time_utc,
@@ -928,8 +583,9 @@ with st.expander("📊 축적 데이터 요약"):
                 entry_status
             FROM signals
             ORDER BY id DESC
-            LIMIT 30"""
-        ).fetchall()
+            LIMIT 30""",
+            conn,
+        )
 
     st.write(
         f"저장된 스캔 {total}건 · "
@@ -937,22 +593,11 @@ with st.expander("📊 축적 데이터 요약"):
         f"포지션 추적 {checks}봉"
     )
 
-    if recent:
-        for row in recent:
-            row = dict(row)
-            candle_time = str(row.get("candle_time_utc") or "")[:16].replace("T", " ")
-            score = row.get("current_score")
-            pullback = row.get("pullback_score")
-            rsi = row.get("rsi")
-            score_text = "-" if score is None else f"{float(score):.1f}"
-            pullback_text = "-" if pullback is None else f"{float(pullback):.1f}"
-            rsi_text = "-" if rsi is None else f"{float(rsi):.1f}"
-            st.markdown(
-                f"**{row.get('symbol', '-')} · {row.get('signal', '-')}**  \n"
-                f"{candle_time} UTC · 점수 {score_text} · "
-                f"눌림 {pullback_text} · RSI {rsi_text}  \n"
-                f"{row.get('entry_status') or '-'}"
-            )
-            st.divider()
+    if not recent.empty:
+        st.dataframe(
+            recent,
+            use_container_width=True,
+            hide_index=True,
+        )
 
 st.caption("자동 주문은 하지 않습니다. 거래소 보호주문은 별도로 설정하세요.")
