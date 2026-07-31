@@ -204,6 +204,64 @@ def get_unified_wallet_balance() -> float:
     return 0.0
 
 
+
+def get_open_linear_positions() -> list[dict[str, Any]]:
+    """Unified 계정의 열려 있는 USDT 선물 포지션을 전부 반환합니다.
+
+    Bybit 앱/PC/이 프로그램 어디서 진입했는지는 구분하지 않고 실제 계정 상태를
+    원본으로 사용합니다. 이 함수는 조회만 하며 TP/SL을 생성하거나 변경하지 않습니다.
+    """
+    positions: list[dict[str, Any]] = []
+    cursor = ""
+    while True:
+        params: dict[str, Any] = {
+            "category": "linear",
+            "settleCoin": "USDT",
+            "limit": 200,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        payload = _private_request("GET", "/v5/position/list", params)
+        result = payload.get("result", {})
+        for row in result.get("list", []):
+            size = float(row.get("size") or 0.0)
+            side = str(row.get("side") or "")
+            if size <= 0 or side not in {"Buy", "Sell"}:
+                continue
+            avg_price = float(row.get("avgPrice") or 0.0)
+            mark_price = float(row.get("markPrice") or 0.0)
+            leverage = float(row.get("leverage") or 0.0)
+            position_value = float(row.get("positionValue") or 0.0)
+            if position_value <= 0 and mark_price > 0:
+                position_value = size * mark_price
+            margin_estimate = position_value / leverage if leverage > 0 else 0.0
+            if avg_price > 0:
+                direction = 1.0 if side == "Buy" else -1.0
+                price_pnl_pct = ((mark_price / avg_price) - 1.0) * 100.0 * direction
+            else:
+                price_pnl_pct = 0.0
+            positions.append({
+                "symbol": str(row.get("symbol") or ""),
+                "side": "LONG" if side == "Buy" else "SHORT",
+                "size": size,
+                "avg_price": avg_price,
+                "mark_price": mark_price,
+                "leverage": leverage,
+                "position_idx": int(row.get("positionIdx") or 0),
+                "position_value": position_value,
+                "margin_estimate": margin_estimate,
+                "unrealised_pnl": float(row.get("unrealisedPnl") or 0.0),
+                "price_pnl_pct": price_pnl_pct,
+                "take_profit": float(row.get("takeProfit") or 0.0),
+                "stop_loss": float(row.get("stopLoss") or 0.0),
+                "liq_price": float(row.get("liqPrice") or 0.0),
+                "updated_time": str(row.get("updatedTime") or ""),
+            })
+        cursor = str(result.get("nextPageCursor") or "")
+        if not cursor:
+            break
+    return sorted(positions, key=lambda item: (item["side"], item["symbol"]))
+
 def get_linear_position(symbol: str) -> dict[str, Any] | None:
     payload = _private_request("GET", "/v5/position/list", {"category": "linear", "symbol": symbol.upper()})
     rows = payload.get("result", {}).get("list", [])

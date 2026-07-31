@@ -20,13 +20,14 @@ from bybit import (
     list_usdt_perpetual_symbols,
     private_api_configured,
     get_unified_wallet_balance,
+    get_open_linear_positions,
     place_long_market_with_risk,
 )
 from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v3.3.0"
+APP_VERSION = "v3.4.0"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -248,11 +249,23 @@ def product_badge(symbol_type: str) -> str:
 
 
 def open_position_symbols() -> set[str]:
+    """로컬 관리목록과 Bybit 실제 보유종목을 합쳐 스캔 제외에 사용합니다."""
     with db() as conn:
         rows = conn.execute(
             "SELECT symbol FROM positions WHERE status='OPEN'"
         ).fetchall()
-    return {str(row["symbol"]) for row in rows}
+    symbols = {str(row["symbol"]) for row in rows}
+    if private_api_configured():
+        try:
+            symbols.update(
+                str(position["symbol"])
+                for position in get_open_linear_positions()
+                if position.get("symbol")
+            )
+        except Exception:
+            # 조회 오류가 스캔 전체를 막지 않도록 로컬 목록으로 계속 진행합니다.
+            pass
+    return symbols
 
 
 def favorite_symbols() -> list[str]:
@@ -466,13 +479,13 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 주문 · 실제 평단 TP/SL")
+st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 실제 포지션 자동 동기화")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
 tp_pct = float(get_setting("tp_pct", 1.2))
 max_stop_pct = float(get_setting("max_stop_pct", 5.0))
-default_margin_usdt = float(get_setting("order_margin_usdt", 10.0))
+default_margin_usdt = float(get_setting("order_margin_usdt", 12.0))
 default_leverage = int(get_setting("order_leverage", 5))
 hedge_mode = bool(get_setting("bybit_hedge_mode", True))
 
@@ -554,9 +567,9 @@ with st.expander("🔐 Bybit API 주문 설정", expanded=True):
         st.success("주문 설정을 저장했습니다.")
         st.rerun()
 
-with st.expander("➕ 매수한 종목 직접 등록", expanded=True):
+with st.expander("➕ 수동 등록(비상용)", expanded=False):
     st.caption(
-        "초록에서 매수한 뒤 노란색으로 바뀌어도 여기서 언제든 등록할 수 있어요."
+        "Bybit 자동 동기화가 실패했을 때만 사용하세요. 입력값은 로컬 관리용이며 실제 Bybit TP/SL을 변경하지 않습니다."
     )
 
     try:
@@ -1109,9 +1122,72 @@ def auto_scan_panel():
 auto_scan_panel()
 
 st.divider()
-st.subheader("📌 실시간 포지션 관리")
+st.subheader("🔄 Bybit 실제 보유 포지션")
 st.caption(
-    "tracker.py가 서버에서 5초마다 현재가를 기록합니다. "
+    "Bybit 앱·PC·이 프로그램 어디서 진입해도 실제 계정 포지션을 10초마다 자동 조회합니다. "
+    "조회만 하며, 외부에서 진입한 포지션에 TP·SL을 자동으로 걸지 않습니다."
+)
+
+
+@st.fragment(run_every=10)
+def bybit_positions_panel():
+    if not private_api_configured():
+        st.warning("Bybit API가 설정되지 않아 실제 포지션을 불러올 수 없습니다.")
+        return
+    try:
+        positions = get_open_linear_positions()
+    except Exception as exc:
+        st.error(f"Bybit 포지션 동기화 실패: {exc}")
+        return
+
+    if not positions:
+        st.info("현재 Bybit에 열려 있는 USDT 선물 포지션이 없습니다.")
+        return
+
+    st.success(f"Bybit 실제 포지션 {len(positions)}개 동기화됨")
+    for position in positions:
+        side_icon = "🟢" if position["side"] == "LONG" else "🔴"
+        with st.container(border=True):
+            st.markdown(f"### {side_icon} {position['symbol']} · {position['side']}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("평단", format(position["avg_price"], ".10g"))
+            c2.metric("현재가", format(position["mark_price"], ".10g"))
+            c3.metric("가격변동", f"{position['price_pnl_pct']:+.2f}%")
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric("미실현손익", f"{position['unrealised_pnl']:+.2f} USDT")
+            d2.metric("증거금(추정)", f"{position['margin_estimate']:.2f} USDT")
+            d3.metric("포지션", f"{position['position_value']:.2f} USDT")
+
+            tp_text = (
+                format(position["take_profit"], ".10g")
+                if position["take_profit"] > 0
+                else "미설정"
+            )
+            sl_text = (
+                format(position["stop_loss"], ".10g")
+                if position["stop_loss"] > 0
+                else "미설정"
+            )
+            liq_text = (
+                format(position["liq_price"], ".10g")
+                if position["liq_price"] > 0
+                else "-"
+            )
+            st.write(
+                f"수량 {position['size']:.10g} · 레버리지 {position['leverage']:.10g}배  \n"
+                f"Bybit TP {tp_text} · Bybit SL {sl_text} · 청산가 {liq_text}"
+            )
+            if position["take_profit"] <= 0 or position["stop_loss"] <= 0:
+                st.caption("⚠️ 보호주문 미설정 항목이 있습니다. 프로그램은 임의로 등록하지 않습니다.")
+
+
+bybit_positions_panel()
+
+st.divider()
+st.subheader("📌 프로그램 관리 포지션")
+st.caption(
+    "이 아래는 프로그램에서 주문했거나 수동 등록한 로컬 관리목록입니다. "
     "보유 중인 종목은 TOP30·즐겨찾기 스캔에서 자동 제외되며, 포지션 종료 후 다음 스캔부터 자동 재포함됩니다."
 )
 
@@ -1253,4 +1329,4 @@ with st.expander("📊 축적 데이터 요약"):
             )
             st.divider()
 
-st.caption("자동 주문은 하지 않습니다. 거래소 보호주문은 별도로 설정하세요.")
+st.caption("Bybit 실제 포지션이 원본입니다. 외부 진입 포지션에는 프로그램이 TP·SL을 임의 설정하지 않습니다.")
