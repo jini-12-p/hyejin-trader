@@ -17,8 +17,9 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v2.7.0"
+APP_VERSION = "v2.7.1"
 TOP_GAINER_LIMIT = 30
+STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
 
 
@@ -254,31 +255,47 @@ def favorite_symbols() -> list[str]:
 
 
 def build_scan_universe() -> tuple[list[str], dict[str, dict]]:
-    """24시간 상승률 TOP30과 즐겨찾기를 합쳐 스캔 대상을 만듭니다."""
+    """코인 상승률 TOP30, 주식형 TOP10, 즐겨찾기를 서로 분리해 스캔합니다."""
     tickers = get_linear_tickers()
     valid_symbols = set(cached_symbols())
+    symbol_types = cached_symbol_types()
     held = open_position_symbols()
 
-    top = tickers[tickers["symbol"].isin(valid_symbols)].head(TOP_GAINER_LIMIT).copy()
-    top_records = top.to_dict("records")
-    ticker_meta = {str(row["symbol"]): row for row in top_records}
+    eligible = tickers[tickers["symbol"].isin(valid_symbols)].copy()
+    eligible["symbol_type"] = eligible["symbol"].map(
+        lambda symbol: symbol_types.get(str(symbol), "crypto")
+    )
+
+    crypto_top = eligible[eligible["symbol_type"] == "crypto"].head(TOP_GAINER_LIMIT).copy()
+    crypto_top["gainer_rank"] = range(1, len(crypto_top) + 1)
+
+    stock_top = eligible[eligible["symbol_type"] == "stock"].head(STOCK_SCAN_LIMIT).copy()
+    stock_top["stock_rank"] = range(1, len(stock_top) + 1)
+
+    selected = pd.concat([crypto_top, stock_top], ignore_index=True)
+    selected_records = selected.to_dict("records")
+    ticker_meta = {str(row["symbol"]): row for row in selected_records}
 
     favorites = favorite_symbols()
-    requested = [str(row["symbol"]) for row in top_records] + favorites
-    universe = []
-    seen = set()
+    requested = [str(row["symbol"]) for row in selected_records] + favorites
+    universe: list[str] = []
+    seen: set[str] = set()
     for symbol in requested:
         if symbol in held or symbol in seen:
             continue
         seen.add(symbol)
         universe.append(symbol)
 
-    # 즐겨찾기가 TOP30 밖에 있어도 24시간 정보를 붙입니다.
+    # TOP 목록 밖의 즐겨찾기에도 24시간 정보와 상품 유형을 붙입니다.
     all_meta = tickers.set_index("symbol").to_dict("index") if not tickers.empty else {}
+    crypto_top_symbols = set(crypto_top["symbol"].astype(str))
+    stock_top_symbols = set(stock_top["symbol"].astype(str))
     for symbol in universe:
         meta = dict(all_meta.get(symbol, {}))
+        meta["symbol_type"] = symbol_types.get(symbol, "crypto")
         meta["is_favorite"] = symbol in favorites
-        meta["is_top30"] = symbol in ticker_meta
+        meta["is_top30"] = symbol in crypto_top_symbols
+        meta["is_stock_top"] = symbol in stock_top_symbols
         ticker_meta[symbol] = meta
     return universe, ticker_meta
 
@@ -637,7 +654,10 @@ def auto_scan_panel():
 
     st.subheader(f"스캔 결과 {len(filtered)}개")
     favorite_count = sum(1 for r in results if bool(r.get("is_favorite", False)))
-    st.caption(f"현재 분석 대상 {len(current_watchlist)}개 · TOP30 + 즐겨찾기 {favorite_count}개")
+    st.caption(
+        f"현재 분석 대상 {len(current_watchlist)}개 · 코인 TOP30 + "
+        f"주식형 TOP{STOCK_SCAN_LIMIT} + 즐겨찾기 {favorite_count}개"
+    )
     scan_time = st.session_state.get("last_scan", "")
     st.caption(
         f"마지막 검사 UTC {scan_time[:19].replace('T', ' ')} · "
@@ -651,16 +671,17 @@ def auto_scan_panel():
         )
 
     st.caption(
-        f"LIVE ENTRY {APP_VERSION} · 상승률 TOP30과 즐겨찾기 안에서 "
-        "회전형·추격형 후보를 함께 보여줍니다."
+        f"LIVE ENTRY {APP_VERSION} · 코인 상승률 TOP30과 즐겨찾기를 분석하고, "
+        "주식형은 별도 구역에만 표시합니다."
     )
 
-    overall_top = filtered.head(10).copy()
+    crypto_filtered = filtered[filtered["symbol_type"] == "crypto"].copy()
+    overall_top = crypto_filtered.head(10).copy()
     stock_top = filtered[filtered["symbol_type"] == "stock"].head(3).copy()
 
-    st.markdown("### 🏆 전체 회전 TOP10")
+    st.markdown("### 🏆 코인 회전 TOP10")
     if overall_top.empty:
-        st.info("전체 회전 순위에 표시할 종목이 없습니다.")
+        st.info("코인 회전 순위에 표시할 종목이 없습니다.")
     else:
         for rank, (_, row) in enumerate(overall_top.iterrows(), start=1):
             badge = product_badge(str(row.get("symbol_type", "crypto")))
@@ -673,7 +694,7 @@ def auto_scan_panel():
                 f"RSI {float(row['rsi']):.1f}"
             )
 
-    chase_top = filtered.sort_values(
+    chase_top = crypto_filtered.sort_values(
         ["chase_score", "rotation_score", "current_score_10"],
         ascending=[False, False, False],
     ).head(5).copy()
@@ -698,7 +719,7 @@ def auto_scan_panel():
     else:
         overall_symbols = set(overall_top["symbol"].astype(str).tolist())
         for rank, (_, row) in enumerate(stock_top.iterrows(), start=1):
-            included_note = " · 전체 TOP10 포함" if str(row["symbol"]) in overall_symbols else ""
+            included_note = ""
             signal_mark = "🟢" if bool(row.get("signal_now", False)) else "⚪"
             st.markdown(
                 f"**{rank}. {signal_mark} {row['symbol']} · 🟣 주식형 · "
@@ -708,7 +729,7 @@ def auto_scan_panel():
                 f"1시간 모멘텀 {float(row.get('momentum_1h', 0.0)):+.2f}%"
             )
 
-    # 전체 TOP10, 추격 TOP5, 주식형 TOP3의 합집합만 실시간 확인합니다.
+    # 코인 TOP10, 코인 추격 TOP5, 주식형 TOP3의 합집합만 실시간 확인합니다.
     live_source = pd.concat([overall_top, chase_top, stock_top], ignore_index=True)
     if not live_source.empty:
         live_source = live_source.drop_duplicates(subset=["symbol"], keep="first")
@@ -884,7 +905,7 @@ def auto_scan_panel():
         st.caption(
             f"모바일 안정화를 위해 나머지 {hidden_count}개는 "
             "상세 실시간 표시에서 숨겼어요. "
-            "다음 15분 스캔 때 전체 TOP10·추격 TOP5·주식형 TOP3 기준으로 다시 선별됩니다."
+            "다음 15분 스캔 때 코인 TOP10·코인 추격 TOP5·주식형 TOP3 기준으로 다시 선별됩니다."
         )
 
     for error in st.session_state.get("last_errors", []):
