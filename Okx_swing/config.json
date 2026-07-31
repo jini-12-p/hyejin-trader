@@ -1,0 +1,19 @@
+{
+  "symbols": ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
+  "mode": "paper",
+  "leverage": 2,
+  "margin_mode": "isolated",
+  "max_positions": 1,
+  "first_margin_usdt": 5.0,
+  "dca1_margin_usdt": 5.0,
+  "dca2_margin_usdt": 8.0,
+  "dca1_drop_pct": 2.0,
+  "dca2_drop_pct": 4.0,
+  "tp1_pct": 1.5,
+  "tp2_pct": 3.0,
+  "hard_stop_pct": 6.0,
+  "max_hold_hours": 72,
+  "min_balance_to_trade": 90.0,
+  "emergency_stop_balance": 85.0,
+  "scan_seconds": 60
+}
