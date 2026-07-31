@@ -27,7 +27,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v3.5.0"
+APP_VERSION = "v3.6.0"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -1390,5 +1390,59 @@ with st.expander("📊 축적 데이터 요약"):
                 f"{row.get('entry_status') or '-'}"
             )
             st.divider()
+
+
+
+st.divider()
+st.subheader("🤖 OKX 1~3일 스윙봇")
+st.caption("별도 실행형 봇입니다. 기본 설정은 PAPER 모드이며, Streamlit 화면은 상태만 보여줍니다.")
+OKX_BOT_DB = Path(__file__).with_name("Okx_swing") / "okx_swing_bot.db"
+OKX_BOT_CONFIG = Path(__file__).with_name("Okx_swing") / "config.json"
+if OKX_BOT_CONFIG.exists():
+    try:
+        bot_cfg = json.loads(OKX_BOT_CONFIG.read_text(encoding="utf-8"))
+        mode = str(bot_cfg.get("mode", "paper")).upper()
+        st.info(
+            f"모드 {mode} · 격리 {bot_cfg.get('leverage', 2)}배 · 동시 {bot_cfg.get('max_positions', 1)}종목 · "
+            f"진입/물타기 {bot_cfg.get('first_margin_usdt', 5)}/{bot_cfg.get('dca1_margin_usdt', 5)}/{bot_cfg.get('dca2_margin_usdt', 8)} USDT"
+        )
+        if mode == "LIVE":
+            st.error("⚠️ LIVE 모드입니다. API 출금 권한이 꺼져 있는지 반드시 확인하세요.")
+        elif mode == "PAPER":
+            st.success("현재는 모의기록만 하며 실제 주문은 발생하지 않습니다.")
+    except Exception as exc:
+        st.warning(f"스윙봇 설정 확인 실패: {exc}")
+
+if OKX_BOT_DB.exists():
+    try:
+        with sqlite3.connect(OKX_BOT_DB) as bot_conn:
+            bot_conn.row_factory = sqlite3.Row
+            bot_positions = bot_conn.execute(
+                "SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at"
+            ).fetchall()
+            bot_events = bot_conn.execute(
+                "SELECT * FROM bot_events ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+        if bot_positions:
+            for row in bot_positions:
+                with st.container(border=True):
+                    st.markdown(f"### {row['symbol']} · {row['note'] or '관리 중'}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("평단", format(float(row['avg_price']), '.10g'))
+                    c2.metric("현재가", '-' if row['last_price'] is None else format(float(row['last_price']), '.10g'))
+                    c3.metric("손익", '-' if row['unrealized_pct'] is None else f"{float(row['unrealized_pct']):+.2f}%")
+                    st.write(
+                        f"총 증거금 {float(row['total_margin']):.2f} USDT · 물타기 {int(row['dca_count'])}/2회 · "
+                        f"TP1 {'완료' if int(row['tp1_done']) else '대기'}"
+                    )
+        else:
+            st.info("현재 스윙봇 보유 포지션이 없습니다.")
+        with st.expander("최근 스윙봇 기록", expanded=False):
+            for e in bot_events:
+                st.write(f"{str(e['ts'])[:19]} · {e['symbol'] or '-'} · {e['event']} · {e['details'] or ''}")
+    except Exception as exc:
+        st.warning(f"스윙봇 상태 읽기 실패: {exc}")
+else:
+    st.info("스윙봇을 한 번 실행하면 상태 데이터가 여기에 표시됩니다.")
 
 st.caption("Bybit 실제 포지션이 원본입니다. 외부 진입 포지션에는 프로그램이 TP·SL을 임의 설정하지 않습니다.")
