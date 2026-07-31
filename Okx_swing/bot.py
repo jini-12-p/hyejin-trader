@@ -115,10 +115,14 @@ def entry_signal(client: OKXClient, symbol: str) -> tuple[bool, dict[str, Any]]:
     rsi_ok = 48 <= row.rsi <= 68
     volume_ok = pd.notna(row.vol_avg) and row.volume >= row.vol_avg * 0.9
     ok = all([trend4, trend1, pullback, bullish, rsi_ok, volume_ok])
-    return ok, {
-        "price": float(row.close), "trend4": trend4, "trend1": trend1,
-        "pullback": pullback, "bullish": bullish, "rsi": float(row.rsi),
-        "volume_ok": volume_ok,
+    return bool(ok), {
+        "price": float(row.close),
+        "trend4": bool(trend4),
+        "trend1": bool(trend1),
+        "pullback": bool(pullback),
+        "bullish": bool(bullish),
+        "rsi": float(row.rsi),
+        "volume_ok": bool(volume_ok),
     }
 
 
