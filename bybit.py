@@ -164,7 +164,7 @@ def _private_request(method: str, path: str, params: dict[str, Any] | None = Non
     recv_window = "5000"
     if method == "GET":
         from urllib.parse import urlencode
-        payload_text = urlencode(sorted((k, str(v)) for k, v in params.items()))
+        payload_text = urlencode([(k, str(v)) for k, v in params.items()])
     else:
         payload_text = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
 
