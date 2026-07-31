@@ -17,7 +17,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v3.1.0"
+APP_VERSION = "v3.1.1"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -718,7 +718,7 @@ def auto_scan_panel():
             current_turnover = float(current.get("turnover", 0.0) or 0.0)
             elapsed_ms = max(
                 1.0,
-                datetime.now(timezone.utc).timestamp() * 1000 - float(current["start_time"]),
+                datetime.now(timezone.utc).timestamp() * 1000 - pd.Timestamp(current["start_time"]).timestamp() * 1000,
             )
             elapsed_ratio = min(max(elapsed_ms / 60000.0, 0.05), 1.0)
             projected_turnover = current_turnover / elapsed_ratio
