@@ -9,6 +9,7 @@ from pathlib import Path
 
 import extra_streamlit_components as stx
 import pandas as pd
+import requests
 import streamlit as st
 
 from bybit import get_klines, get_ticker, list_usdt_perpetual_symbols
@@ -112,6 +113,114 @@ def cached_symbols() -> list[str]:
     return list_usdt_perpetual_symbols()
 
 
+@st.cache_data(ttl=3600)
+def cached_symbol_types() -> dict[str, str]:
+    """Bybit 상품 분류를 가져옵니다. 실패하면 안전하게 코인형으로 처리합니다."""
+    type_map: dict[str, str] = {}
+    cursor = ""
+    try:
+        while True:
+            params = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            response = requests.get(
+                "https://api.bybit.com/v5/market/instruments-info",
+                params=params,
+                timeout=15,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("retCode") != 0:
+                break
+            result = payload.get("result", {})
+            for row in result.get("list", []):
+                symbol = str(row.get("symbol", ""))
+                raw_type = str(row.get("symbolType", "")).lower()
+                if symbol:
+                    if raw_type == "stock":
+                        type_map[symbol] = "stock"
+                    elif raw_type == "forex":
+                        type_map[symbol] = "forex"
+                    else:
+                        type_map[symbol] = "crypto"
+            cursor = result.get("nextPageCursor", "")
+            if not cursor:
+                break
+    except Exception:
+        return {}
+    return type_map
+
+
+def enrich_rotation_metrics(result: dict, klines: pd.DataFrame, symbol_type: str) -> dict:
+    """이미 받은 15분봉으로 회전력 지표를 계산해 API 호출을 늘리지 않습니다."""
+    out = dict(result)
+    df = klines.sort_values("start_time").copy()
+    if len(df) > 1:
+        df = df.iloc[:-1].copy()  # 진행 중 봉 제외
+
+    turnover = pd.to_numeric(df.get("turnover"), errors="coerce").fillna(0.0)
+    close = pd.to_numeric(df.get("close"), errors="coerce")
+    high = pd.to_numeric(df.get("high"), errors="coerce")
+    low = pd.to_numeric(df.get("low"), errors="coerce")
+
+    recent4 = float(turnover.tail(4).mean()) if len(turnover) else 0.0
+    base20 = float(turnover.iloc[-24:-4].mean()) if len(turnover) >= 24 else float(turnover.mean() or 0.0)
+    accel = recent4 / base20 if base20 > 0 else 0.0
+    turnover_24h = float(turnover.tail(96).sum())
+
+    range_pct = ((high - low) / close.replace(0, pd.NA) * 100).dropna()
+    volatility = float(range_pct.tail(4).mean()) if len(range_pct) else 0.0
+
+    momentum = 0.0
+    if len(close.dropna()) >= 5 and float(close.dropna().iloc[-5]) > 0:
+        momentum = (float(close.dropna().iloc[-1]) / float(close.dropna().iloc[-5]) - 1) * 100
+
+    out.update({
+        "symbol_type": symbol_type if symbol_type in {"stock", "forex"} else "crypto",
+        "turnover_24h_est": turnover_24h,
+        "turnover_accel": max(0.0, accel),
+        "short_volatility": max(0.0, volatility),
+        "momentum_1h": momentum,
+    })
+    return out
+
+
+def add_rotation_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    """유형 안에서 거래대금을 비교한 뒤 모든 유형을 하나의 회전 순위로 합칩니다."""
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    for col in ["turnover_24h_est", "turnover_accel", "short_volatility", "momentum_1h"]:
+        if col not in out:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    if "symbol_type" not in out:
+        out["symbol_type"] = "crypto"
+
+    group = out.groupby("symbol_type", dropna=False)
+    out["liquidity_pct"] = group["turnover_24h_est"].rank(pct=True, method="average") * 100
+    out["accel_pct"] = group["turnover_accel"].rank(pct=True, method="average") * 100
+    out["volatility_pct"] = group["short_volatility"].rank(pct=True, method="average") * 100
+    out["momentum_pct"] = group["momentum_1h"].rank(pct=True, method="average") * 100
+
+    out["rotation_score"] = (
+        out["accel_pct"] * 0.35
+        + out["volatility_pct"] * 0.30
+        + out["momentum_pct"] * 0.20
+        + out["liquidity_pct"] * 0.15
+    ).round(1)
+    out["liquidity_warning"] = out["turnover_24h_est"] < 1_000_000
+    return out
+
+
+def product_badge(symbol_type: str) -> str:
+    if symbol_type == "stock":
+        return "🟣 주식형"
+    if symbol_type == "forex":
+        return "🟠 외환형"
+    return "🔵 코인"
+
+
 def open_position_symbols() -> set[str]:
     with db() as conn:
         rows = conn.execute(
@@ -127,8 +236,15 @@ def all_scan_symbols() -> list[str]:
     return [symbol for symbol in symbols if symbol not in excluded]
 
 
-def scan_one(symbol: str, settings: StrategySettings) -> dict:
-    return analyze_symbol(symbol, get_klines(symbol, "15", 240), settings).to_dict()
+def scan_one(
+    symbol: str,
+    settings: StrategySettings,
+    symbol_types: dict[str, str],
+) -> dict:
+    klines = get_klines(symbol, "15", 240)
+    result = analyze_symbol(symbol, klines, settings).to_dict()
+    symbol_type = symbol_types.get(symbol, "crypto")
+    return enrich_rotation_metrics(result, klines, symbol_type)
 
 
 def save_signal(r: dict) -> None:
@@ -180,8 +296,12 @@ def do_scan(
     results, errors = [], []
     if not watchlist:
         return results, errors
+    symbol_types = cached_symbol_types()
     with ThreadPoolExecutor(max_workers=min(8, len(watchlist))) as pool:
-        futures = {pool.submit(scan_one, s, settings): s for s in watchlist}
+        futures = {
+            pool.submit(scan_one, s, settings, symbol_types): s
+            for s in watchlist
+        }
         for future in as_completed(futures):
             try:
                 result = future.result()
@@ -263,7 +383,7 @@ init_db()
 require_password()
 
 st.title("📈 HJ Trader")
-st.caption("v2.5.5-1 · Arrow 표 렌더링 제거 · 언제든 진입 등록 · 모바일 안정화 · 전체 USDT 자동 스캔 · 보유 종목 자동 제외 · 진입 후 5초 추적")
+st.caption("v2.6.0 · 회전 우선순위 · 주식형/코인 유형별 유동성 보정 · Arrow 표 제거 유지 · 모바일 안정화")
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -446,9 +566,10 @@ def auto_scan_panel():
     if get_setting("show_only_buy", False):
         filtered = filtered[filtered["signal_now"]]
 
+    filtered = add_rotation_scores(filtered)
     filtered = filtered.sort_values(
-        ["signal_now", "current_score_10", "pullback_score_10"],
-        ascending=[False, False, False],
+        ["signal_now", "rotation_score", "current_score_10", "pullback_score_10"],
+        ascending=[False, False, False, False],
     )
 
     st.subheader(f"스캔 결과 {len(filtered)}개")
@@ -466,8 +587,8 @@ def auto_scan_panel():
         )
 
     st.caption(
-        "LIVE ENTRY v2.5.3 · 모바일 안정화 모드 · "
-        "상위 후보만 10초마다 확인"
+        "LIVE ENTRY v2.6.0 · 회전점수순 · 주식형은 주식형끼리, 코인은 코인끼리 "
+        "거래대금을 비교한 뒤 전체 순위를 합칩니다."
     )
 
     # 모바일 WebSocket 과부하 방지를 위해 점수 상위 후보만 실시간 확인합니다.
@@ -517,6 +638,7 @@ def auto_scan_panel():
     green_rows = sorted(
         [item for item in live_rows if item["_can_enter"]],
         key=lambda item: (
+            -float(item.get("rotation_score", 0.0)),
             -float(item["current_score_10"]),
             -float(item["pullback_score_10"]),
         ),
@@ -524,6 +646,7 @@ def auto_scan_panel():
     wait_rows = sorted(
         [item for item in live_rows if not item["_can_enter"]],
         key=lambda item: (
+            -float(item.get("rotation_score", 0.0)),
             -float(item["current_score_10"]),
             -float(item["pullback_score_10"]),
         ),
@@ -545,19 +668,22 @@ def auto_scan_panel():
         live_status = row["_live_status"]
 
         with st.container(border=True):
+            badge = product_badge(str(row.get("symbol_type", "crypto")))
+            liquidity_note = " · ⚠️ 저유동성" if bool(row.get("liquidity_warning", False)) else ""
             st.markdown(
-                f"### 🟢 {row['symbol']} · "
-                f"{row['signal']} · 지금 진입 가능"
+                f"### 🟢 {row['symbol']} · {badge}{liquidity_note} · "
+                f"회전 {float(row.get('rotation_score', 0.0)):.1f}점"
             )
+            st.caption(f"{row['signal']} · 지금 진입 가능")
 
-            metric_score, metric_pullback, metric_rsi = st.columns(3)
-            metric_score.metric(
-                "현재점수",
-                f"{row['current_score_10']:.1f}/10",
+            metric_rotation, metric_score, metric_rsi = st.columns(3)
+            metric_rotation.metric(
+                "회전순위점수",
+                f"{float(row.get('rotation_score', 0.0)):.1f}",
             )
-            metric_pullback.metric(
-                "눌림점수",
-                f"{row['pullback_score_10']:.1f}/10",
+            metric_score.metric(
+                "현재/눌림",
+                f"{row['current_score_10']:.1f}/{row['pullback_score_10']:.1f}",
             )
             metric_rsi.metric("RSI", f"{row['rsi']:.1f}")
 
@@ -623,11 +749,15 @@ def auto_scan_panel():
         ):
             for row in wait_rows:
                 state = "🟡 보류" if bool(row["signal_now"]) else "⚪ 대기"
+                badge = product_badge(str(row.get("symbol_type", "crypto")))
+                liquidity_note = " · ⚠️ 저유동성" if bool(row.get("liquidity_warning", False)) else ""
                 st.markdown(
-                    f"**{state} · {row['symbol']}**  \n"
-                    f"점수 {float(row['current_score_10']):.1f} · "
+                    f"**{state} · {row['symbol']} · {badge}{liquidity_note}**  \n"
+                    f"회전 {float(row.get('rotation_score', 0.0)):.1f} · "
+                    f"현재 {float(row['current_score_10']):.1f} · "
                     f"눌림 {float(row['pullback_score_10']):.1f} · "
                     f"현재가 {format(row['_live_price'], '.10g')}  \n"
+                    f"거래대금(15분봉 추정 24h) {float(row.get('turnover_24h_est', 0.0))/1_000_000:.2f}M USDT · "
                     f"{row['_live_status']}"
                 )
                 st.divider()
