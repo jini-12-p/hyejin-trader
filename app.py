@@ -1394,8 +1394,8 @@ with st.expander("📊 축적 데이터 요약"):
 
 
 st.divider()
-st.subheader("🤖 OKX 데일리 3회 PAPER 봇")
-st.caption("하루 최대 3회, 한 번에 1종목만 진입하는 2~3시간 단기 추세매매 테스트입니다. P/R 조건을 소폭 완화했으며 실제 주문은 발생하지 않습니다.")
+st.subheader("🤖 OKX 데일리 최대 6회 · 변동성 알트 순환 PAPER 봇")
+st.caption("24시간 거래대금뿐 아니라 최근 1~4시간 실제 움직임까지 확인해, 무거운 종목은 제외하고 데일리용 알트를 자동 선별합니다. 실제 주문은 발생하지 않습니다.")
 OKX_BOT_DB = Path(__file__).with_name("Okx_swing") / "okx_swing_bot.db"
 OKX_BOT_CONFIG = Path(__file__).with_name("Okx_swing") / "config.json"
 bot_cfg = {}
@@ -1412,7 +1412,23 @@ if OKX_BOT_CONFIG.exists():
             f"TP1 +{bot_cfg.get('tp1_pct', 1.5)}% 절반 · TP2 +{bot_cfg.get('tp2_pct', 3.0)}% 나머지 · "
             f"손절 -{bot_cfg.get('hard_stop_pct', 1.5)}% · 최대 보유 {bot_cfg.get('max_hold_hours', 3)}시간"
         )
-        st.caption("감시: " + ", ".join(str(x).replace("-USDT-SWAP", "") for x in symbols))
+        active_symbols = symbols
+        if bool(bot_cfg.get("dynamic_universe", False)) and OKX_BOT_DB.exists():
+            try:
+                with sqlite3.connect(OKX_BOT_DB) as active_conn:
+                    active_row = active_conn.execute("SELECT value FROM bot_state WHERE key='active_symbols'").fetchone()
+                if active_row and active_row[0]:
+                    active_symbols = json.loads(active_row[0])
+            except Exception:
+                active_symbols = symbols
+        if bool(bot_cfg.get("dynamic_universe", False)):
+            st.caption(
+                f"24시간+최근 4시간 기준 자동 선별 {len(active_symbols)}종목 · "
+                f"{bot_cfg.get('universe_refresh_minutes', 30)}분마다 갱신: "
+                + ", ".join(str(x).replace("-USDT-SWAP", "") for x in active_symbols)
+            )
+        else:
+            st.caption("감시: " + ", ".join(str(x).replace("-USDT-SWAP", "") for x in active_symbols))
         if mode == "LIVE":
             st.error("⚠️ LIVE 모드입니다. API 출금 권한이 꺼져 있는지 반드시 확인하세요.")
         elif mode == "PAPER":
@@ -1453,7 +1469,7 @@ if OKX_BOT_DB.exists():
                     c.metric("가격 변동", '-' if row['unrealized_pct'] is None else f"{float(row['unrealized_pct']):+.2f}%")
                     st.write(
                         f"증거금 {float(row['total_margin']):.2f} USDT · 레버리지 {bot_cfg.get('leverage', 5)}배 · "
-                        f"TP1 {'완료' if int(row['tp1_done']) else '대기'} · 물타기 없음"
+                        f"TP1 {'완료' if int(row['tp1_done']) else '대기'} · 순환추가 {'완료' if int(row['dca_count'] or 0) else '대기'}"
                     )
         else:
             st.info("현재 데일리봇 보유 포지션이 없습니다.")
