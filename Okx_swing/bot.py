@@ -72,7 +72,7 @@ class DailyConfig:
     leverage: int = 5
     margin_mode: str = "isolated"
     max_positions: int = 2
-    max_daily_entries: int = 6
+    max_daily_entries: int = 0  # 0이면 PAPER 데이터 수집 중 횟수 제한 없음
     position_margin_usdt: float = 54.0
     tp1_pct: float = 1.5
     tp2_pct: float = 3.0
@@ -123,8 +123,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def trading_day() -> str:
+    """한국시간 오전 9시(UTC 00:00)를 기준으로 거래일을 나눈다."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def today_kst() -> str:
-    return datetime.now(KST).date().isoformat()
+    # 이전 DB 컬럼명/호출과의 호환용 별칭
+    return trading_day()
 
 
 def db() -> sqlite3.Connection:
@@ -165,8 +171,10 @@ def init_db() -> None:
         _ensure_column(conn, "bot_positions", "lowest_price", "REAL")
         _ensure_column(conn, "bot_positions", "highest_price", "REAL")
         _ensure_column(conn, "bot_positions", "cycle_anchor_price", "REAL")
+        _ensure_column(conn, "bot_positions", "trade_id", "TEXT")
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
+        _ensure_column(conn, "bot_events", "trade_id", "TEXT")
 
 
 def state_get(key: str, default: str = "") -> str:
@@ -184,12 +192,18 @@ def state_set(key: str, value: str) -> None:
         )
 
 
+def state_flag(key: str, default: bool = False) -> bool:
+    value = state_get(key, "1" if default else "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: str = "",
-              details: str = "", strategy: str = "", realized_pnl: float = 0.0) -> None:
+              details: str = "", strategy: str = "", realized_pnl: float = 0.0,
+              trade_id: str = "") -> None:
     with db() as conn:
         conn.execute(
-            "INSERT INTO bot_events(ts,symbol,event,price,qty,mode,details,strategy,realized_pnl) VALUES(?,?,?,?,?,?,?,?,?)",
-            (utc_now(), symbol, event, float(price), float(qty), mode, details, strategy, float(realized_pnl)),
+            "INSERT INTO bot_events(ts,symbol,event,price,qty,mode,details,strategy,realized_pnl,trade_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (utc_now(), symbol, event, float(price), float(qty), mode, details, strategy, float(realized_pnl), trade_id),
         )
 
 
@@ -430,27 +444,27 @@ class DailyBot:
             return conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
 
     def daily_entries(self) -> int:
-        day = today_kst()
+        day = trading_day()
         with db() as conn:
             return int(conn.execute(
-                "SELECT COUNT(*) FROM bot_events WHERE event='ENTRY' AND substr(datetime(ts,'+9 hours'),1,10)=?", (day,)
+                "SELECT COUNT(*) FROM bot_events WHERE event='ENTRY' AND substr(ts,1,10)=?", (day,)
             ).fetchone()[0])
 
     def daily_realized(self) -> float:
-        day = today_kst()
+        day = trading_day()
         with db() as conn:
             value = conn.execute(
-                "SELECT COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(datetime(ts,'+9 hours'),1,10)=?", (day,)
+                "SELECT COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(ts,1,10)=?", (day,)
             ).fetchone()[0]
         return float(value or 0)
 
     def consecutive_losses(self) -> int:
         """오늘 종료된 거래를 최신순으로 보고 연속 손실 횟수를 센다."""
-        day = today_kst()
+        day = trading_day()
         with db() as conn:
             rows = conn.execute(
                 """SELECT realized_pnl FROM bot_positions
-                   WHERE status='CLOSED' AND substr(datetime(updated_at,'+9 hours'),1,10)=?
+                   WHERE status='CLOSED' AND substr(updated_at,1,10)=?
                    ORDER BY updated_at DESC""",
                 (day,),
             ).fetchall()
@@ -495,20 +509,24 @@ class DailyBot:
     def _open(self, symbol: str, price: float, strategy: str, score: float) -> None:
         qty = qty_from_margin(price, self.cfg.position_margin_usdt, self.cfg.leverage)
         self._execute(symbol, "buy", qty)
+        trade_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
         with db() as conn:
             conn.execute("DELETE FROM bot_positions WHERE symbol=?", (symbol,))
             conn.execute(
                 """INSERT INTO bot_positions(
                     symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,
                     last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
-                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, "OPEN", utc_now(), utc_now(), price, qty, self.cfg.position_margin_usdt, 0, 0,
-                 price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, today_kst(),
-                 price, qty, 0.0, 0.0, price, price, price),
+                 price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
+                 price, qty, 0.0, 0.0, price, price, price, trade_id),
             )
-        log_event(symbol, "ENTRY", price, qty, self.cfg.mode,
-                  f"score={score:.1f}; margin={self.cfg.position_margin_usdt}", strategy)
+        details = json.dumps({
+            "entry_price": price, "margin_usdt": self.cfg.position_margin_usdt,
+            "leverage": self.cfg.leverage, "qty": qty, "score": round(score, 2)
+        }, ensure_ascii=False)
+        log_event(symbol, "ENTRY", price, qty, self.cfg.mode, details, strategy, trade_id=trade_id)
 
     def _rebound_add(self, row: sqlite3.Row, price: float) -> None:
         add_qty = qty_from_margin(price, self.cfg.rebound_add_margin_usdt, self.cfg.leverage)
@@ -527,8 +545,11 @@ class DailyBot:
                  int(row["dca_count"] or 0) + 1, add_qty, price, utc_now(), price,
                  "반등 확인 후 순환 추가진입", row["symbol"]),
             )
+        details = json.dumps({"add_price": price, "add_margin_usdt": self.cfg.rebound_add_margin_usdt,
+                              "add_qty": add_qty, "previous_avg": old_avg, "new_avg": new_avg,
+                              "cycle_no": int(row["dca_count"] or 0) + 1}, ensure_ascii=False)
         log_event(row["symbol"], "REBOUND_ADD", price, add_qty, self.cfg.mode,
-                  details=f"blended_avg={new_avg:.8f}", strategy=row["strategy"] or "")
+                  details=details, strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
 
     def _cycle_reduce(self, row: sqlite3.Row, price: float) -> None:
         add_qty = float(row["add_qty"] or 0)
@@ -547,8 +568,13 @@ class DailyBot:
                  utc_now(), price, "순환 추가분 정리 · 최초 물량 유지", total_realized,
                  price, price, price, row["symbol"]),
             )
+        details = json.dumps({"add_entry_price": float(row["add_price"] or 0), "reduce_price": price,
+                              "reduced_qty": add_qty, "avg_before_reduce": float(row["avg_price"]),
+                              "restored_base_avg": base_price, "remaining_qty": remaining,
+                              "cycle_realized_pnl": pnl_usdt}, ensure_ascii=False)
         log_event(row["symbol"], "CYCLE_REDUCE", price, add_qty, self.cfg.mode,
-                  details="추가 수량만큼 정리", strategy=row["strategy"] or "", realized_pnl=pnl_usdt)
+                  details=details, strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
+                  trade_id=row["trade_id"] or "")
 
     def _close(self, row: sqlite3.Row, price: float, fraction: float, reason: str) -> None:
         current_qty = float(row["total_qty"])
@@ -568,7 +594,14 @@ class DailyBot:
                     "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
                     (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
                 )
-        log_event(row["symbol"], reason, price, qty, self.cfg.mode, strategy=row["strategy"] or "", realized_pnl=pnl_usdt)
+        details = json.dumps({"exit_price": price, "avg_at_exit": float(row["avg_price"]),
+                              "base_entry_price": float(row["base_entry_price"] or row["avg_price"]),
+                              "closed_qty": qty, "fraction": fraction, "remaining_qty": remaining,
+                              "step_realized_pnl": pnl_usdt, "trade_total_realized_pnl": total_realized,
+                              "reason": reason}, ensure_ascii=False)
+        log_event(row["symbol"], reason, price, qty, self.cfg.mode, details=details,
+                  strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
+                  trade_id=row["trade_id"] or "")
 
     def manage(self) -> None:
         for row in self.open_rows():
@@ -624,9 +657,11 @@ class DailyBot:
                 self._close(row, price, 1.0, "TP2")
 
     def scan_entries(self) -> None:
+        if state_flag("pause_new_entries", False):
+            return
         if len(self.open_rows()) >= self.cfg.max_positions:
             return
-        if self.daily_entries() >= self.cfg.max_daily_entries:
+        if self.cfg.max_daily_entries > 0 and self.daily_entries() >= self.cfg.max_daily_entries:
             return
         if self.daily_realized() <= -abs(self.cfg.daily_loss_limit_usdt):
             log_event("", "DAILY_STOP", mode=self.cfg.mode, details=f"pnl={self.daily_realized():.2f}")
@@ -662,7 +697,8 @@ class DailyBot:
         if candidates:
             open_symbols = {str(r["symbol"]) for r in self.open_rows()}
             slots = max(0, self.cfg.max_positions - len(open_symbols))
-            entries_left = max(0, self.cfg.max_daily_entries - self.daily_entries())
+            entries_left = (max(0, self.cfg.max_daily_entries - self.daily_entries())
+                            if self.cfg.max_daily_entries > 0 else slots)
             for score, symbol, strategy, details in sorted(candidates, reverse=True, key=lambda x: x[0]):
                 if slots <= 0 or entries_left <= 0:
                     break
@@ -678,10 +714,17 @@ class DailyBot:
         self.scan_entries()
 
     def run_forever(self) -> None:
+        state_set("bot_process_status", "RUNNING")
         log_event("", "BOT_START", mode=self.cfg.mode, details=json.dumps(asdict(self.cfg), ensure_ascii=False))
         while True:
             try:
-                self.run_once()
+                self.manage()
+                if state_flag("shutdown_when_flat", False) and not self.open_rows():
+                    state_set("bot_process_status", "STOPPED")
+                    state_set("shutdown_when_flat", "0")
+                    log_event("", "BOT_SAFE_STOP", mode=self.cfg.mode, details="포지션 0 확인 후 안전 종료")
+                    break
+                self.scan_entries()
             except Exception as exc:
                 log_event("", "ERROR", mode=self.cfg.mode, details=str(exc))
             time.sleep(max(30, self.cfg.scan_seconds))

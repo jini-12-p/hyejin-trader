@@ -17,7 +17,7 @@
   "leverage": 5,
   "margin_mode": "isolated",
   "max_positions": 2,
-  "max_daily_entries": 6,
+  "max_daily_entries": 0,
   "position_margin_usdt": 54.0,
   "tp1_pct": 1.5,
   "tp2_pct": 3.0,
