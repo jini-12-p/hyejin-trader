@@ -1394,24 +1394,31 @@ with st.expander("📊 축적 데이터 요약"):
 
 
 st.divider()
-st.subheader("🤖 OKX 1~3일 스윙봇")
-st.caption("별도 실행형 봇입니다. 기본 설정은 PAPER 모드이며, Streamlit 화면은 상태만 보여줍니다.")
+st.subheader("🤖 OKX 데일리 3회 PAPER 봇")
+st.caption("하루 최대 3회, 한 번에 1종목만 진입하는 2~3시간 단기 추세매매 테스트입니다. 실제 주문은 발생하지 않습니다.")
 OKX_BOT_DB = Path(__file__).with_name("Okx_swing") / "okx_swing_bot.db"
 OKX_BOT_CONFIG = Path(__file__).with_name("Okx_swing") / "config.json"
+bot_cfg = {}
 if OKX_BOT_CONFIG.exists():
     try:
         bot_cfg = json.loads(OKX_BOT_CONFIG.read_text(encoding="utf-8"))
         mode = str(bot_cfg.get("mode", "paper")).upper()
+        symbols = bot_cfg.get("symbols", [])
         st.info(
-            f"모드 {mode} · 격리 {bot_cfg.get('leverage', 2)}배 · 동시 {bot_cfg.get('max_positions', 1)}종목 · "
-            f"진입/물타기 {bot_cfg.get('first_margin_usdt', 5)}/{bot_cfg.get('dca1_margin_usdt', 5)}/{bot_cfg.get('dca2_margin_usdt', 8)} USDT"
+            f"모드 {mode} · 격리 {bot_cfg.get('leverage', 5)}배 · 하루 최대 {bot_cfg.get('max_daily_entries', 3)}회 · "
+            f"동시 {bot_cfg.get('max_positions', 1)}종목 · 1회 증거금 {bot_cfg.get('position_margin_usdt', 54)} USDT"
         )
+        st.write(
+            f"TP1 +{bot_cfg.get('tp1_pct', 1.5)}% 절반 · TP2 +{bot_cfg.get('tp2_pct', 3.0)}% 나머지 · "
+            f"손절 -{bot_cfg.get('hard_stop_pct', 1.5)}% · 최대 보유 {bot_cfg.get('max_hold_hours', 3)}시간"
+        )
+        st.caption("감시: " + ", ".join(str(x).replace("-USDT-SWAP", "") for x in symbols))
         if mode == "LIVE":
             st.error("⚠️ LIVE 모드입니다. API 출금 권한이 꺼져 있는지 반드시 확인하세요.")
         elif mode == "PAPER":
-            st.success("현재는 모의기록만 하며 실제 주문은 발생하지 않습니다.")
+            st.success("현재 PAPER 모드: 모의기록만 하며 실제 주문은 발생하지 않습니다.")
     except Exception as exc:
-        st.warning(f"스윙봇 설정 확인 실패: {exc}")
+        st.warning(f"데일리봇 설정 확인 실패: {exc}")
 
 if OKX_BOT_DB.exists():
     try:
@@ -1421,28 +1428,45 @@ if OKX_BOT_DB.exists():
                 "SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at"
             ).fetchall()
             bot_events = bot_conn.execute(
-                "SELECT * FROM bot_events ORDER BY id DESC LIMIT 10"
+                "SELECT * FROM bot_events ORDER BY id DESC LIMIT 20"
             ).fetchall()
+            today_stats = bot_conn.execute(
+                """SELECT
+                    SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END) AS entries,
+                    COALESCE(SUM(realized_pnl),0) AS pnl
+                    FROM bot_events
+                    WHERE substr(datetime(ts,'+9 hours'),1,10)=date('now','+9 hours')"""
+            ).fetchone()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("오늘 진입", f"{int(today_stats['entries'] or 0)} / {int(bot_cfg.get('max_daily_entries', 3))}")
+        c2.metric("오늘 확정손익", f"{float(today_stats['pnl'] or 0):+.2f} USDT")
+        c3.metric("현재 포지션", str(len(bot_positions)))
+
         if bot_positions:
             for row in bot_positions:
                 with st.container(border=True):
-                    st.markdown(f"### {row['symbol']} · {row['note'] or '관리 중'}")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("평단", format(float(row['avg_price']), '.10g'))
-                    c2.metric("현재가", '-' if row['last_price'] is None else format(float(row['last_price']), '.10g'))
-                    c3.metric("손익", '-' if row['unrealized_pct'] is None else f"{float(row['unrealized_pct']):+.2f}%")
+                    strategy = row['strategy'] if 'strategy' in row.keys() else '-'
+                    st.markdown(f"### {row['symbol']} · {strategy}형 · {row['note'] or '관리 중'}")
+                    a, b, c = st.columns(3)
+                    a.metric("평단", format(float(row['avg_price']), '.10g'))
+                    b.metric("현재가", '-' if row['last_price'] is None else format(float(row['last_price']), '.10g'))
+                    c.metric("가격 변동", '-' if row['unrealized_pct'] is None else f"{float(row['unrealized_pct']):+.2f}%")
                     st.write(
-                        f"총 증거금 {float(row['total_margin']):.2f} USDT · 물타기 {int(row['dca_count'])}/2회 · "
-                        f"TP1 {'완료' if int(row['tp1_done']) else '대기'}"
+                        f"증거금 {float(row['total_margin']):.2f} USDT · 레버리지 {bot_cfg.get('leverage', 5)}배 · "
+                        f"TP1 {'완료' if int(row['tp1_done']) else '대기'} · 물타기 없음"
                     )
         else:
-            st.info("현재 스윙봇 보유 포지션이 없습니다.")
-        with st.expander("최근 스윙봇 기록", expanded=False):
+            st.info("현재 데일리봇 보유 포지션이 없습니다.")
+
+        with st.expander("최근 데일리봇 기록", expanded=False):
             for e in bot_events:
-                st.write(f"{str(e['ts'])[:19]} · {e['symbol'] or '-'} · {e['event']} · {e['details'] or ''}")
+                strategy = e['strategy'] if 'strategy' in e.keys() and e['strategy'] else '-'
+                pnl = float(e['realized_pnl'] or 0) if 'realized_pnl' in e.keys() else 0.0
+                pnl_txt = f" · 확정 {pnl:+.2f} USDT" if abs(pnl) > 1e-12 else ""
+                st.write(f"{str(e['ts'])[:19]} · {e['symbol'] or '-'} · {strategy}형 · {e['event']}{pnl_txt} · {e['details'] or ''}")
     except Exception as exc:
-        st.warning(f"스윙봇 상태 읽기 실패: {exc}")
+        st.warning(f"데일리봇 상태 읽기 실패: {exc}")
 else:
-    st.info("스윙봇을 한 번 실행하면 상태 데이터가 여기에 표시됩니다.")
+    st.info("데일리봇을 한 번 실행하면 상태 데이터가 여기에 표시됩니다.")
 
 st.caption("Bybit 실제 포지션이 원본입니다. 외부 진입 포지션에는 프로그램이 TP·SL을 임의 설정하지 않습니다.")
