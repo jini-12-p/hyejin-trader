@@ -1394,8 +1394,8 @@ with st.expander("📊 축적 데이터 요약"):
 
 
 st.divider()
-st.subheader("🤖 OKX 데일리 최대 6회 · 상승상위 눌림 순환 PAPER 봇")
-st.caption("24시간 상승률 상위 종목 중 거래량이 충분한 알트를 고른 뒤, 고점 추격 없이 눌림 후 재반등에서 진입합니다. PAPER 전용이며 실제 주문은 발생하지 않습니다.")
+st.subheader("🤖 OKX 데일리 최대 6회 · 상승상위 눌림 순환 PAPER 봇 v3.8.8")
+st.caption("24시간 상승률 상위 알트 중 거래량과 최근 움직임을 확인하되, 후보가 너무 적지 않도록 완화했습니다. 급등봉 꼭대기는 피하고 눌림 후 재반등에서 진입합니다. PAPER 전용입니다.")
 OKX_BOT_DB = Path(__file__).with_name("Okx_swing") / "okx_swing_bot.db"
 OKX_BOT_CONFIG = Path(__file__).with_name("Okx_swing") / "config.json"
 bot_cfg = {}
