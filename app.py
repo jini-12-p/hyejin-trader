@@ -1395,7 +1395,7 @@ with st.expander("📊 축적 데이터 요약"):
 
 st.divider()
 st.subheader("🤖 OKX 데일리 3회 PAPER 봇")
-st.caption("하루 최대 3회, 한 번에 1종목만 진입하는 2~3시간 단기 추세매매 테스트입니다. 실제 주문은 발생하지 않습니다.")
+st.caption("하루 최대 3회, 한 번에 1종목만 진입하는 2~3시간 단기 추세매매 테스트입니다. P/R 조건을 소폭 완화했으며 실제 주문은 발생하지 않습니다.")
 OKX_BOT_DB = Path(__file__).with_name("Okx_swing") / "okx_swing_bot.db"
 OKX_BOT_CONFIG = Path(__file__).with_name("Okx_swing") / "config.json"
 bot_cfg = {}
