@@ -5,7 +5,7 @@ import math
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,30 +15,33 @@ from Okx_swing.okx_api import OKXClient, OKXError
 
 DB_PATH = Path(__file__).with_name("okx_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
+KST = timezone(timedelta(hours=9))
 
 
 @dataclass
-class SwingConfig:
-    symbols: tuple[str, ...] = ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP")
+class DailyConfig:
+    symbols: tuple[str, ...] = (
+        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
+        "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "ADA-USDT-SWAP", "LINK-USDT-SWAP",
+    )
     mode: str = "paper"  # paper | demo | live
-    leverage: int = 2
+    leverage: int = 5
     margin_mode: str = "isolated"
     max_positions: int = 1
-    first_margin_usdt: float = 5.0
-    dca1_margin_usdt: float = 5.0
-    dca2_margin_usdt: float = 8.0
-    dca1_drop_pct: float = 2.0
-    dca2_drop_pct: float = 4.0
+    max_daily_entries: int = 3
+    position_margin_usdt: float = 54.0
     tp1_pct: float = 1.5
     tp2_pct: float = 3.0
-    hard_stop_pct: float = 6.0
-    max_hold_hours: int = 72
+    hard_stop_pct: float = 1.5
+    breakeven_stop_pct: float = 0.1
+    max_hold_hours: int = 3
+    daily_loss_limit_usdt: float = 6.0
     min_balance_to_trade: float = 90.0
     emergency_stop_balance: float = 85.0
     scan_seconds: int = 60
 
     @classmethod
-    def load(cls) -> "SwingConfig":
+    def load(cls) -> "DailyConfig":
         if not CONFIG_PATH.exists():
             cfg = cls()
             CONFIG_PATH.write_text(json.dumps(asdict(cfg), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -46,17 +49,28 @@ class SwingConfig:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if "symbols" in raw:
             raw["symbols"] = tuple(raw["symbols"])
-        return cls(**raw)
+        allowed = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in raw.items() if k in allowed})
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def today_kst() -> str:
+    return datetime.now(KST).date().isoformat()
+
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
+    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def init_db() -> None:
@@ -75,18 +89,25 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        _ensure_column(conn, "bot_positions", "strategy", "TEXT DEFAULT 'P'")
+        _ensure_column(conn, "bot_positions", "realized_pnl", "REAL DEFAULT 0")
+        _ensure_column(conn, "bot_positions", "entry_date_kst", "TEXT")
+        _ensure_column(conn, "bot_events", "strategy", "TEXT")
+        _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
 
 
-def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: str = "", details: str = "") -> None:
+def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: str = "",
+              details: str = "", strategy: str = "", realized_pnl: float = 0.0) -> None:
     with db() as conn:
         conn.execute(
-            "INSERT INTO bot_events(ts,symbol,event,price,qty,mode,details) VALUES(?,?,?,?,?,?,?)",
-            (utc_now(), symbol, event, price, qty, mode, details),
+            "INSERT INTO bot_events(ts,symbol,event,price,qty,mode,details,strategy,realized_pnl) VALUES(?,?,?,?,?,?,?,?,?)",
+            (utc_now(), symbol, event, float(price), float(qty), mode, details, strategy, float(realized_pnl)),
         )
 
 
 def indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    out["ema9"] = out["close"].ewm(span=9, adjust=False).mean()
     out["ema20"] = out["close"].ewm(span=20, adjust=False).mean()
     out["ema60"] = out["close"].ewm(span=60, adjust=False).mean()
     delta = out["close"].diff()
@@ -97,60 +118,88 @@ def indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def entry_signal(client: OKXClient, symbol: str) -> tuple[bool, dict[str, Any]]:
-    h1 = indicators(client.candles(symbol, "1H", 180))
-    h4 = indicators(client.candles(symbol, "4H", 120))
-    if len(h1) < 70 or len(h4) < 70:
-        return False, {"reason": "캔들 부족"}
-    # last candle can still be open; use last confirmed candle when confirm is available.
-    c1 = h1[h1.get("confirm", "1").astype(str) == "1"] if "confirm" in h1 else h1.iloc[:-1]
-    c4 = h4[h4.get("confirm", "1").astype(str) == "1"] if "confirm" in h4 else h4.iloc[:-1]
-    if len(c1) < 2 or len(c4) < 2:
-        return False, {"reason": "마감봉 부족"}
-    row, prev, row4 = c1.iloc[-1], c1.iloc[-2], c4.iloc[-1]
-    trend4 = row4.ema20 > row4.ema60 and row4.ema20 >= c4.iloc[-2].ema20
-    trend1 = row.ema20 > row.ema60 and row.ema20 >= prev.ema20
-    pullback = c1.tail(8).low.min() <= row.ema20 * 1.01
-    bullish = row.close > row.open and row.close > prev.high
-    rsi_ok = 48 <= row.rsi <= 68
-    volume_ok = pd.notna(row.vol_avg) and row.volume >= row.vol_avg * 0.9
-    ok = all([trend4, trend1, pullback, bullish, rsi_ok, volume_ok])
-    return bool(ok), {
-        "price": float(row.close),
-        "trend4": bool(trend4),
-        "trend1": bool(trend1),
-        "pullback": bool(pullback),
-        "bullish": bool(bullish),
-        "rsi": float(row.rsi),
-        "volume_ok": bool(volume_ok),
+def confirmed(df: pd.DataFrame) -> pd.DataFrame:
+    if "confirm" in df:
+        c = df[df["confirm"].astype(str) == "1"]
+        return c if len(c) >= 3 else df.iloc[:-1]
+    return df.iloc[:-1]
+
+
+def candidate_signal(client: OKXClient, symbol: str) -> tuple[str | None, float, dict[str, Any]]:
+    m15 = confirmed(indicators(client.candles(symbol, "15m", 220)))
+    h1 = confirmed(indicators(client.candles(symbol, "1H", 140)))
+    if len(m15) < 70 or len(h1) < 70:
+        return None, 0.0, {"reason": "캔들 부족"}
+
+    row, prev = m15.iloc[-1], m15.iloc[-2]
+    hrow, hprev = h1.iloc[-1], h1.iloc[-2]
+    price = float(row.close)
+    volume_ratio = float(row.volume / row.vol_avg) if pd.notna(row.vol_avg) and row.vol_avg > 0 else 0.0
+
+    # P형: 1시간 상승 흐름 안의 15분 눌림 후 재돌파
+    trend_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20)
+    pullback = bool(m15.tail(10).low.min() <= row.ema20 * 1.006)
+    rebound = bool(row.close > row.open and row.close > prev.high and row.close >= row.ema9)
+    p_rsi = bool(43 <= row.rsi <= 67)
+    p_ok = trend_up and pullback and rebound and p_rsi and volume_ratio >= 0.75
+    p_score = (35 if trend_up else 0) + (20 if pullback else 0) + (25 if rebound else 0) + \
+              (10 if p_rsi else 0) + min(10, volume_ratio * 7)
+
+    # R형: 과매도 뒤 하락 둔화와 15분 반등. 1시간 급락 지속 구간은 제외.
+    recent_rsi_min = float(m15.tail(12).rsi.min())
+    oversold = bool(recent_rsi_min <= 32 or row.rsi <= 36)
+    reversal = bool(row.close > row.open and row.close > prev.high and row.rsi > prev.rsi)
+    not_crashing = bool(hrow.close >= hrow.ema60 * 0.965 and hrow.rsi >= 28)
+    low_hold = bool(row.low >= m15.tail(8).low.min() * 0.998)
+    r_ok = oversold and reversal and not_crashing and low_hold and volume_ratio >= 0.65
+    r_score = (35 if oversold else 0) + (30 if reversal else 0) + (20 if not_crashing else 0) + \
+              (5 if low_hold else 0) + min(10, volume_ratio * 7)
+
+    strategy: str | None = None
+    score = 0.0
+    if p_ok and p_score >= r_score:
+        strategy, score = "P", p_score
+    elif r_ok:
+        strategy, score = "R", r_score
+
+    details = {
+        "price": price, "strategy": strategy, "score": round(float(score), 2),
+        "p_ok": bool(p_ok), "r_ok": bool(r_ok), "trend_up": trend_up,
+        "pullback": pullback, "rebound": rebound, "rsi": round(float(row.rsi), 2),
+        "recent_rsi_min": round(recent_rsi_min, 2), "volume_ratio": round(volume_ratio, 2),
+        "not_crashing": not_crashing,
     }
-
-
-def structure_alive(client: OKXClient, symbol: str) -> tuple[bool, dict[str, Any]]:
-    h1 = indicators(client.candles(symbol, "1H", 120))
-    h4 = indicators(client.candles(symbol, "4H", 100))
-    if len(h1) < 65 or len(h4) < 65:
-        return False, {"reason": "캔들 부족"}
-    r1, r4 = h1.iloc[-2], h4.iloc[-2]
-    recent_low = float(h1.iloc[-14:-2].low.min())
-    alive = bool(r4.close >= r4.ema60 and r1.close >= recent_low and r1.ema20 >= r1.ema60)
-    return alive, {"recent_low": recent_low, "h1_close": float(r1.close), "h4_ema60": float(r4.ema60)}
+    return strategy, float(score), details
 
 
 def qty_from_margin(price: float, margin_usdt: float, leverage: int) -> float:
     return max(0.0, margin_usdt * leverage / price)
 
 
-class SwingBot:
-    def __init__(self, config: SwingConfig | None = None):
-        self.cfg = config or SwingConfig.load()
-        # paper does not need credentials; demo/live do.
+class DailyBot:
+    def __init__(self, config: DailyConfig | None = None):
+        self.cfg = config or DailyConfig.load()
         self.client = OKXClient(demo=self.cfg.mode != "live")
         init_db()
 
     def open_rows(self) -> list[sqlite3.Row]:
         with db() as conn:
             return conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
+
+    def daily_entries(self) -> int:
+        day = today_kst()
+        with db() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM bot_events WHERE event='ENTRY' AND substr(datetime(ts,'+9 hours'),1,10)=?", (day,)
+            ).fetchone()[0])
+
+    def daily_realized(self) -> float:
+        day = today_kst()
+        with db() as conn:
+            value = conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(datetime(ts,'+9 hours'),1,10)=?", (day,)
+            ).fetchone()[0]
+        return float(value or 0)
 
     def _execute(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> None:
         if self.cfg.mode == "paper":
@@ -163,74 +212,73 @@ class SwingBot:
             client_order_id=f"HJ{int(time.time())}{symbol[:4]}"
         )
 
-    def _add_position(self, symbol: str, price: float, margin: float, dca: bool = False) -> None:
-        qty = qty_from_margin(price, margin, self.cfg.leverage)
+    def _open(self, symbol: str, price: float, strategy: str, score: float) -> None:
+        qty = qty_from_margin(price, self.cfg.position_margin_usdt, self.cfg.leverage)
         self._execute(symbol, "buy", qty)
         with db() as conn:
-            row = conn.execute("SELECT * FROM bot_positions WHERE symbol=?", (symbol,)).fetchone()
-            if row:
-                old_qty, old_avg = float(row["total_qty"]), float(row["avg_price"])
-                total_qty = old_qty + qty
-                avg = (old_avg * old_qty + price * qty) / total_qty
-                conn.execute(
-                    "UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=total_margin+?,dca_count=dca_count+1,updated_at=?,note=? WHERE symbol=?",
-                    (avg, total_qty, margin, utc_now(), "조건부 물타기", symbol),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO bot_positions(symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,last_price,unrealized_pct,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (symbol, "OPEN", utc_now(), utc_now(), price, qty, margin, 0, 0, price, 0.0, "BUY-P 스윙 진입"),
-                )
-        log_event(symbol, "DCA" if dca else "ENTRY", price, qty, self.cfg.mode, f"margin={margin}")
+            conn.execute("DELETE FROM bot_positions WHERE symbol=?", (symbol,))
+            conn.execute(
+                """INSERT INTO bot_positions(
+                    symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,
+                    last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (symbol, "OPEN", utc_now(), utc_now(), price, qty, self.cfg.position_margin_usdt, 0, 0,
+                 price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, today_kst()),
+            )
+        log_event(symbol, "ENTRY", price, qty, self.cfg.mode,
+                  f"score={score:.1f}; margin={self.cfg.position_margin_usdt}", strategy)
 
-    def _close_qty(self, row: sqlite3.Row, price: float, fraction: float, reason: str) -> None:
-        qty = float(row["total_qty"]) * fraction
+    def _close(self, row: sqlite3.Row, price: float, fraction: float, reason: str) -> None:
+        current_qty = float(row["total_qty"])
+        qty = current_qty * fraction
         self._execute(row["symbol"], "sell", qty, reduce_only=True)
-        remaining = max(0.0, float(row["total_qty"]) - qty)
+        pnl_usdt = (price - float(row["avg_price"])) * qty
+        remaining = max(0.0, current_qty - qty)
+        total_realized = float(row["realized_pnl"] or 0) + pnl_usdt
         with db() as conn:
             if remaining <= 1e-12:
-                conn.execute("UPDATE bot_positions SET status='CLOSED',total_qty=0,updated_at=?,last_price=?,note=? WHERE symbol=?",
-                             (utc_now(), price, reason, row["symbol"]))
+                conn.execute(
+                    "UPDATE bot_positions SET status='CLOSED',total_qty=0,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
+                    (utc_now(), price, reason, total_realized, row["symbol"]),
+                )
             else:
-                conn.execute("UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=? WHERE symbol=?",
-                             (remaining, utc_now(), price, reason, row["symbol"]))
-        log_event(row["symbol"], reason, price, qty, self.cfg.mode)
+                conn.execute(
+                    "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
+                    (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
+                )
+        log_event(row["symbol"], reason, price, qty, self.cfg.mode, strategy=row["strategy"] or "", realized_pnl=pnl_usdt)
 
     def manage(self) -> None:
         for row in self.open_rows():
-            symbol = row["symbol"]
-            ticker = self.client.ticker(symbol)
-            price = float(ticker.get("last") or 0)
+            price = float(self.client.ticker(row["symbol"]).get("last") or 0)
             if price <= 0:
                 continue
             avg = float(row["avg_price"])
-            pnl = (price / avg - 1) * 100
+            pnl_pct = (price / avg - 1) * 100
             age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(row["opened_at"])).total_seconds() / 3600
-            alive, details = structure_alive(self.client, symbol)
             with db() as conn:
                 conn.execute("UPDATE bot_positions SET last_price=?,unrealized_pct=?,updated_at=? WHERE symbol=?",
-                             (price, pnl, utc_now(), symbol))
+                             (price, pnl_pct, utc_now(), row["symbol"]))
 
-            if pnl <= -self.cfg.hard_stop_pct or not alive or age_h >= self.cfg.max_hold_hours:
-                reason = "HARD_STOP" if pnl <= -self.cfg.hard_stop_pct else "STRUCTURE_EXIT" if not alive else "TIME_EXIT"
-                self._close_qty(row, price, 1.0, reason)
-                continue
-            if int(row["tp1_done"]) == 0 and pnl >= self.cfg.tp1_pct:
-                self._close_qty(row, price, 0.5, "TP1")
-                continue
-            if int(row["tp1_done"]) == 1 and pnl >= self.cfg.tp2_pct:
-                self._close_qty(row, price, 1.0, "TP2")
-                continue
-
-            dca_count = int(row["dca_count"])
-            if alive and dca_count == 0 and pnl <= -self.cfg.dca1_drop_pct:
-                self._add_position(symbol, price, self.cfg.dca1_margin_usdt, dca=True)
-            elif alive and dca_count == 1 and pnl <= -self.cfg.dca2_drop_pct:
-                self._add_position(symbol, price, self.cfg.dca2_margin_usdt, dca=True)
+            # TP1 후에는 본전 아래로 다시 밀리면 잔량 정리.
+            if int(row["tp1_done"]) == 1 and pnl_pct <= -self.cfg.breakeven_stop_pct:
+                self._close(row, price, 1.0, "BE_EXIT")
+            elif pnl_pct <= -self.cfg.hard_stop_pct:
+                self._close(row, price, 1.0, "STOP")
+            elif age_h >= self.cfg.max_hold_hours:
+                self._close(row, price, 1.0, "TIME_EXIT")
+            elif int(row["tp1_done"]) == 0 and pnl_pct >= self.cfg.tp1_pct:
+                self._close(row, price, 0.5, "TP1")
+            elif int(row["tp1_done"]) == 1 and pnl_pct >= self.cfg.tp2_pct:
+                self._close(row, price, 1.0, "TP2")
 
     def scan_entries(self) -> None:
-        open_symbols = {r["symbol"] for r in self.open_rows()}
-        if len(open_symbols) >= self.cfg.max_positions:
+        if len(self.open_rows()) >= self.cfg.max_positions:
+            return
+        if self.daily_entries() >= self.cfg.max_daily_entries:
+            return
+        if self.daily_realized() <= -abs(self.cfg.daily_loss_limit_usdt):
+            log_event("", "DAILY_STOP", mode=self.cfg.mode, details=f"pnl={self.daily_realized():.2f}")
             return
         if self.cfg.mode != "paper":
             balance = self.client.balance("USDT")
@@ -239,15 +287,18 @@ class SwingBot:
                 return
             if balance < self.cfg.min_balance_to_trade:
                 return
+
+        candidates: list[tuple[float, str, str, dict[str, Any]]] = []
         for symbol in self.cfg.symbols:
-            if symbol in open_symbols:
-                continue
-            ok, details = entry_signal(self.client, symbol)
-            log_event(symbol, "SCAN_OK" if ok else "SCAN_WAIT", float(details.get("price", 0)), mode=self.cfg.mode,
-                      details=json.dumps(details, ensure_ascii=False))
-            if ok:
-                self._add_position(symbol, float(details["price"]), self.cfg.first_margin_usdt)
-                break
+            strategy, score, details = candidate_signal(self.client, symbol)
+            log_event(symbol, "SCAN_OK" if strategy else "SCAN_WAIT", float(details.get("price", 0)),
+                      mode=self.cfg.mode, details=json.dumps(details, ensure_ascii=False), strategy=strategy or "")
+            if strategy:
+                candidates.append((score, symbol, strategy, details))
+
+        if candidates:
+            score, symbol, strategy, details = max(candidates, key=lambda x: x[0])
+            self._open(symbol, float(details["price"]), strategy, score)
 
     def run_once(self) -> None:
         self.manage()
@@ -261,3 +312,8 @@ class SwingBot:
             except Exception as exc:
                 log_event("", "ERROR", mode=self.cfg.mode, details=str(exc))
             time.sleep(max(30, self.cfg.scan_seconds))
+
+
+# 기존 실행 파일(run_okx_swing_bot.py)과 호환
+SwingBot = DailyBot
+SwingConfig = DailyConfig
