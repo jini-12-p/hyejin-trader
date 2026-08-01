@@ -20,26 +20,64 @@ KST = timezone(timedelta(hours=9))
 
 @dataclass
 class DailyConfig:
+    # API 선별 실패 때 사용할 안전한 기본 감시 목록
     symbols: tuple[str, ...] = (
-        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP",
-        "DOGE-USDT-SWAP", "SUI-USDT-SWAP", "AVAX-USDT-SWAP", "LINK-USDT-SWAP",
-        "PEPE-USDT-SWAP", "WIF-USDT-SWAP", "BONK-USDT-SWAP", "APT-USDT-SWAP",
+        "SOL-USDT-SWAP", "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "SUI-USDT-SWAP",
+        "AVAX-USDT-SWAP", "LINK-USDT-SWAP", "PEPE-USDT-SWAP", "WIF-USDT-SWAP",
+        "BONK-USDT-SWAP", "APT-USDT-SWAP", "NEAR-USDT-SWAP", "ARB-USDT-SWAP",
+    )
+    # 24시간 거래대금·변동성으로 실제 감시 종목을 자동 선별
+    dynamic_universe: bool = True
+    universe_size: int = 12
+    universe_refresh_minutes: int = 30
+    min_quote_volume_24h_usdt: float = 10000000.0
+    min_range_24h_pct: float = 2.5
+    max_range_24h_pct: float = 20.0
+    max_abs_change_24h_pct: float = 18.0
+    max_spread_pct: float = 0.18
+    # 데일리 3시간 전략에 맞게 최근 1~4시간 실제 움직임도 검사한다.
+    recent_volatility_prefilter_size: int = 24
+    min_recent_4h_range_pct: float = 1.8
+    min_avg_hourly_range_pct: float = 0.55
+    max_recent_1h_move_pct: float = 6.0
+    # 장기 스윙에 더 어울리는 느린 종목은 데일리 후보에서 제외한다.
+    slow_symbol_exclusions: tuple[str, ...] = (
+        "XRP-USDT-SWAP", "AVAX-USDT-SWAP", "LINK-USDT-SWAP", "LTC-USDT-SWAP",
+        "BCH-USDT-SWAP", "DOT-USDT-SWAP", "ETC-USDT-SWAP", "ATOM-USDT-SWAP",
+        "TRX-USDT-SWAP", "TON-USDT-SWAP", "FIL-USDT-SWAP", "AAVE-USDT-SWAP",
+    )
+    candidate_pool: tuple[str, ...] = (
+        "SOL-USDT-SWAP", "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "SUI-USDT-SWAP",
+        "AVAX-USDT-SWAP", "LINK-USDT-SWAP", "PEPE-USDT-SWAP", "WIF-USDT-SWAP",
+        "BONK-USDT-SWAP", "APT-USDT-SWAP", "NEAR-USDT-SWAP", "ARB-USDT-SWAP",
+        "OP-USDT-SWAP", "SEI-USDT-SWAP", "INJ-USDT-SWAP", "TIA-USDT-SWAP",
+        "FIL-USDT-SWAP", "LTC-USDT-SWAP", "BCH-USDT-SWAP", "DOT-USDT-SWAP",
+        "UNI-USDT-SWAP", "AAVE-USDT-SWAP", "ETC-USDT-SWAP", "ATOM-USDT-SWAP",
+        "TRX-USDT-SWAP", "TON-USDT-SWAP", "SHIB-USDT-SWAP", "ORDI-USDT-SWAP",
+        "JUP-USDT-SWAP", "PYTH-USDT-SWAP", "ENA-USDT-SWAP", "ONDO-USDT-SWAP",
+        "RENDER-USDT-SWAP", "FET-USDT-SWAP", "WLD-USDT-SWAP", "GALA-USDT-SWAP",
     )
     mode: str = "paper"  # paper | demo | live
     leverage: int = 5
     margin_mode: str = "isolated"
     max_positions: int = 1
-    max_daily_entries: int = 3
+    max_daily_entries: int = 6
     position_margin_usdt: float = 54.0
     tp1_pct: float = 1.5
     tp2_pct: float = 3.0
     hard_stop_pct: float = 1.5
     breakeven_stop_pct: float = 0.1
     max_hold_hours: int = 3
-    daily_loss_limit_usdt: float = 6.0
+    daily_loss_limit_usdt: float = 12.0
+    max_consecutive_losses: int = 3
+    same_symbol_cooldown_minutes: int = 30
     min_balance_to_trade: float = 90.0
     emergency_stop_balance: float = 85.0
     scan_seconds: int = 60
+    rebound_add_enabled: bool = True
+    rebound_arm_drawdown_pct: float = 0.6
+    rebound_add_margin_usdt: float = 27.0
+    rebound_exit_buffer_pct: float = 0.10
 
     @classmethod
     def load(cls) -> "DailyConfig":
@@ -50,6 +88,10 @@ class DailyConfig:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if "symbols" in raw:
             raw["symbols"] = tuple(raw["symbols"])
+        if "candidate_pool" in raw:
+            raw["candidate_pool"] = tuple(raw["candidate_pool"])
+        if "slow_symbol_exclusions" in raw:
+            raw["slow_symbol_exclusions"] = tuple(raw["slow_symbol_exclusions"])
         allowed = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in raw.items() if k in allowed})
 
@@ -93,8 +135,28 @@ def init_db() -> None:
         _ensure_column(conn, "bot_positions", "strategy", "TEXT DEFAULT 'P'")
         _ensure_column(conn, "bot_positions", "realized_pnl", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_positions", "entry_date_kst", "TEXT")
+        _ensure_column(conn, "bot_positions", "base_entry_price", "REAL")
+        _ensure_column(conn, "bot_positions", "base_qty", "REAL")
+        _ensure_column(conn, "bot_positions", "add_qty", "REAL DEFAULT 0")
+        _ensure_column(conn, "bot_positions", "add_price", "REAL DEFAULT 0")
+        _ensure_column(conn, "bot_positions", "lowest_price", "REAL")
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
+
+
+def state_get(key: str, default: str = "") -> str:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+    return str(row[0]) if row else default
+
+
+def state_set(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO bot_state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
 
 
 def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: str = "",
@@ -182,6 +244,26 @@ def candidate_signal(client: OKXClient, symbol: str) -> tuple[str | None, float,
     return strategy, float(score), details
 
 
+def rebound_add_signal(client: OKXClient, symbol: str) -> tuple[bool, dict[str, Any]]:
+    """하락 뒤 실제 반등이 확인될 때만 순환 추가진입한다."""
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 120)))
+    if len(m5) < 40:
+        return False, {"reason": "5m 캔들 부족"}
+    row, prev = m5.iloc[-1], m5.iloc[-2]
+    recent_low = float(m5.tail(8).low.min())
+    bullish = bool(row.close > row.open)
+    break_prev = bool(row.close > prev.high)
+    rsi_turn = bool(row.rsi > prev.rsi and row.rsi >= 32)
+    ema_recover = bool(row.close >= row.ema9)
+    low_hold = bool(row.low >= recent_low * 0.998)
+    ok = bool(bullish and break_prev and rsi_turn and ema_recover and low_hold)
+    return ok, {
+        "price": float(row.close), "bullish": bullish, "break_prev": break_prev,
+        "rsi_turn": rsi_turn, "ema_recover": ema_recover, "low_hold": low_hold,
+        "rsi": round(float(row.rsi), 2),
+    }
+
+
 def qty_from_margin(price: float, margin_usdt: float, leverage: int) -> float:
     return max(0.0, margin_usdt * leverage / price)
 
@@ -191,6 +273,114 @@ class DailyBot:
         self.cfg = config or DailyConfig.load()
         self.client = OKXClient(demo=self.cfg.mode != "live")
         init_db()
+
+    def _saved_active_symbols(self) -> list[str]:
+        try:
+            value = json.loads(state_get("active_symbols", "[]"))
+            return [str(x) for x in value if str(x)]
+        except Exception:
+            return []
+
+    def active_symbols(self) -> list[str]:
+        """유동성 + 24시간 변동성 + 최근 1~4시간 움직임으로 데일리 알트를 선별한다."""
+        if not self.cfg.dynamic_universe:
+            return list(self.cfg.symbols)
+
+        now_ts = time.time()
+        try:
+            refreshed = float(state_get("universe_refreshed_at", "0") or 0)
+        except Exception:
+            refreshed = 0.0
+        saved = self._saved_active_symbols()
+        if saved and now_ts - refreshed < max(300, self.cfg.universe_refresh_minutes * 60):
+            return saved
+
+        pool = set(self.cfg.candidate_pool)
+        excluded = set(self.cfg.slow_symbol_exclusions)
+        ticker_ranked: list[tuple[float, str, dict[str, float]]] = []
+        for ticker in self.client.tickers("SWAP"):
+            symbol = str(ticker.get("instId") or "")
+            if symbol not in pool or symbol in excluded or not symbol.endswith("-USDT-SWAP"):
+                continue
+            try:
+                last = float(ticker.get("last") or 0)
+                open24 = float(ticker.get("open24h") or 0)
+                high = float(ticker.get("high24h") or 0)
+                low = float(ticker.get("low24h") or 0)
+                bid = float(ticker.get("bidPx") or 0)
+                ask = float(ticker.get("askPx") or 0)
+                base_vol = float(ticker.get("volCcy24h") or 0)
+                if min(last, open24, high, low) <= 0:
+                    continue
+                quote_vol = base_vol * last
+                range_pct = (high / low - 1) * 100
+                change_pct = (last / open24 - 1) * 100
+                spread_pct = ((ask - bid) / last * 100) if bid > 0 and ask >= bid else 99.0
+                if quote_vol < self.cfg.min_quote_volume_24h_usdt:
+                    continue
+                if not (self.cfg.min_range_24h_pct <= range_pct <= self.cfg.max_range_24h_pct):
+                    continue
+                if abs(change_pct) > self.cfg.max_abs_change_24h_pct:
+                    continue
+                if spread_pct > self.cfg.max_spread_pct:
+                    continue
+                liquidity_score = math.log10(max(quote_vol, 1.0)) * 7
+                movement_score = min(range_pct, 14.0) * 5
+                spread_penalty = spread_pct * 90
+                ticker_score = liquidity_score + movement_score - spread_penalty
+                ticker_ranked.append((ticker_score, symbol, {
+                    "quote_volume": quote_vol, "range_pct": range_pct,
+                    "change_pct": change_pct, "spread_pct": spread_pct,
+                }))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+
+        ticker_ranked.sort(reverse=True, key=lambda x: x[0])
+        prefiltered = ticker_ranked[: max(self.cfg.universe_size, self.cfg.recent_volatility_prefilter_size)]
+        ranked: list[tuple[float, str, dict[str, float]]] = []
+        for ticker_score, symbol, details in prefiltered:
+            try:
+                m15 = confirmed(self.client.candles(symbol, "15m", 24))
+                if len(m15) < 16:
+                    continue
+                recent16 = m15.tail(16)
+                recent4h_range = (float(recent16.high.max()) / float(recent16.low.min()) - 1) * 100
+                hourly_ranges: list[float] = []
+                for idx in range(0, 16, 4):
+                    block = recent16.iloc[idx:idx + 4]
+                    if len(block) == 4 and float(block.low.min()) > 0:
+                        hourly_ranges.append((float(block.high.max()) / float(block.low.min()) - 1) * 100)
+                avg_hourly_range = sum(hourly_ranges) / len(hourly_ranges) if hourly_ranges else 0.0
+                recent1h_move = abs(float(recent16.iloc[-1].close / recent16.iloc[-5].close - 1)) * 100
+                if recent4h_range < self.cfg.min_recent_4h_range_pct:
+                    continue
+                if avg_hourly_range < self.cfg.min_avg_hourly_range_pct:
+                    continue
+                if recent1h_move > self.cfg.max_recent_1h_move_pct:
+                    continue
+                intraday_score = min(recent4h_range, 8.0) * 10 + min(avg_hourly_range, 3.0) * 12
+                final_score = ticker_score + intraday_score
+                ranked.append((final_score, symbol, {
+                    **details,
+                    "recent_4h_range_pct": recent4h_range,
+                    "avg_hourly_range_pct": avg_hourly_range,
+                    "recent_1h_move_pct": recent1h_move,
+                }))
+            except Exception as exc:
+                log_event(symbol, "UNIVERSE_VOL_ERROR", mode=self.cfg.mode, details=str(exc))
+
+        ranked.sort(reverse=True, key=lambda x: x[0])
+        selected = [symbol for _, symbol, _ in ranked[: max(1, self.cfg.universe_size)]]
+        if not selected:
+            selected = list(self.cfg.symbols)
+        state_set("active_symbols", json.dumps(selected, ensure_ascii=False))
+        state_set("universe_refreshed_at", str(now_ts))
+        state_set("universe_details", json.dumps(
+            [{"symbol": symbol, "score": round(score, 2), **details} for score, symbol, details in ranked[: self.cfg.universe_size]],
+            ensure_ascii=False,
+        ))
+        log_event("", "UNIVERSE_REFRESH", mode=self.cfg.mode, details=json.dumps(selected, ensure_ascii=False))
+        return selected
 
     def open_rows(self) -> list[sqlite3.Row]:
         with db() as conn:
@@ -211,6 +401,43 @@ class DailyBot:
             ).fetchone()[0]
         return float(value or 0)
 
+    def consecutive_losses(self) -> int:
+        """오늘 종료된 거래를 최신순으로 보고 연속 손실 횟수를 센다."""
+        day = today_kst()
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT realized_pnl FROM bot_positions
+                   WHERE status='CLOSED' AND substr(datetime(updated_at,'+9 hours'),1,10)=?
+                   ORDER BY updated_at DESC""",
+                (day,),
+            ).fetchall()
+        count = 0
+        for row in rows:
+            if float(row["realized_pnl"] or 0) < 0:
+                count += 1
+            else:
+                break
+        return count
+
+    def symbol_in_cooldown(self, symbol: str) -> bool:
+        """같은 종목을 종료한 뒤 설정 시간 동안 재진입하지 않는다."""
+        minutes = max(0, int(self.cfg.same_symbol_cooldown_minutes))
+        if minutes <= 0:
+            return False
+        with db() as conn:
+            row = conn.execute(
+                """SELECT updated_at FROM bot_positions
+                   WHERE symbol=? AND status='CLOSED'""",
+                (symbol,),
+            ).fetchone()
+        if not row or not row["updated_at"]:
+            return False
+        try:
+            closed_at = datetime.fromisoformat(row["updated_at"])
+            return datetime.now(timezone.utc) - closed_at < timedelta(minutes=minutes)
+        except (TypeError, ValueError):
+            return False
+
     def _execute(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> None:
         if self.cfg.mode == "paper":
             return
@@ -230,13 +457,53 @@ class DailyBot:
             conn.execute(
                 """INSERT INTO bot_positions(
                     symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,
-                    last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
+                    base_entry_price,base_qty,add_qty,add_price,lowest_price
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, "OPEN", utc_now(), utc_now(), price, qty, self.cfg.position_margin_usdt, 0, 0,
-                 price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, today_kst()),
+                 price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, today_kst(),
+                 price, qty, 0.0, 0.0, price),
             )
         log_event(symbol, "ENTRY", price, qty, self.cfg.mode,
                   f"score={score:.1f}; margin={self.cfg.position_margin_usdt}", strategy)
+
+    def _rebound_add(self, row: sqlite3.Row, price: float) -> None:
+        add_qty = qty_from_margin(price, self.cfg.rebound_add_margin_usdt, self.cfg.leverage)
+        if add_qty <= 0:
+            return
+        self._execute(row["symbol"], "buy", add_qty)
+        old_qty = float(row["total_qty"])
+        old_avg = float(row["avg_price"])
+        new_qty = old_qty + add_qty
+        new_avg = (old_avg * old_qty + price * add_qty) / new_qty
+        with db() as conn:
+            conn.execute(
+                """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,dca_count=1,
+                   add_qty=?,add_price=?,updated_at=?,last_price=?,note=? WHERE symbol=?""",
+                (new_avg, new_qty, float(row["total_margin"]) + self.cfg.rebound_add_margin_usdt,
+                 add_qty, price, utc_now(), price, "반등 확인 후 순환 추가진입", row["symbol"]),
+            )
+        log_event(row["symbol"], "REBOUND_ADD", price, add_qty, self.cfg.mode,
+                  details=f"blended_avg={new_avg:.8f}", strategy=row["strategy"] or "")
+
+    def _cycle_reduce(self, row: sqlite3.Row, price: float) -> None:
+        add_qty = float(row["add_qty"] or 0)
+        if add_qty <= 0:
+            return
+        self._execute(row["symbol"], "sell", add_qty, reduce_only=True)
+        pnl_usdt = (price - float(row["avg_price"])) * add_qty
+        remaining = max(0.0, float(row["total_qty"]) - add_qty)
+        base_price = float(row["base_entry_price"] or row["avg_price"])
+        total_realized = float(row["realized_pnl"] or 0) + pnl_usdt
+        with db() as conn:
+            conn.execute(
+                """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,add_qty=0,add_price=0,
+                   updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?""",
+                (base_price, remaining, max(0.0, float(row["total_margin"]) - self.cfg.rebound_add_margin_usdt),
+                 utc_now(), price, "순환 추가분 정리 · 최초 물량 유지", total_realized, row["symbol"]),
+            )
+        log_event(row["symbol"], "CYCLE_REDUCE", price, add_qty, self.cfg.mode,
+                  details="추가 수량만큼 정리", strategy=row["strategy"] or "", realized_pnl=pnl_usdt)
 
     def _close(self, row: sqlite3.Row, price: float, fraction: float, reason: str) -> None:
         current_qty = float(row["total_qty"])
@@ -264,22 +531,45 @@ class DailyBot:
             if price <= 0:
                 continue
             avg = float(row["avg_price"])
+            base_price = float(row["base_entry_price"] or avg)
             pnl_pct = (price / avg - 1) * 100
+            base_pnl_pct = (price / base_price - 1) * 100
             age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(row["opened_at"])).total_seconds() / 3600
+            lowest = min(float(row["lowest_price"] or price), price)
             with db() as conn:
-                conn.execute("UPDATE bot_positions SET last_price=?,unrealized_pct=?,updated_at=? WHERE symbol=?",
-                             (price, pnl_pct, utc_now(), row["symbol"]))
+                conn.execute("UPDATE bot_positions SET last_price=?,unrealized_pct=?,lowest_price=?,updated_at=? WHERE symbol=?",
+                             (price, base_pnl_pct, lowest, utc_now(), row["symbol"]))
 
-            # TP1 후에는 본전 아래로 다시 밀리면 잔량 정리.
-            if int(row["tp1_done"]) == 1 and pnl_pct <= -self.cfg.breakeven_stop_pct:
+            # 추가분을 보유 중이면, 혼합평단 + 소폭 버퍼 회복 시 추가 수량만큼 우선 정리한다.
+            if int(row["dca_count"] or 0) == 1 and float(row["add_qty"] or 0) > 0:
+                cycle_target = avg * (1 + self.cfg.rebound_exit_buffer_pct / 100)
+                if price >= cycle_target:
+                    self._cycle_reduce(row, price)
+                    continue
+
+            # 하락 자체가 아니라, 일정 하락을 겪은 뒤 5분봉 반등이 확인될 때만 1회 추가한다.
+            if (self.cfg.rebound_add_enabled and int(row["dca_count"] or 0) == 0
+                    and int(row["tp1_done"] or 0) == 0):
+                drawdown_pct = (lowest / base_price - 1) * 100
+                if drawdown_pct <= -abs(self.cfg.rebound_arm_drawdown_pct):
+                    try:
+                        ok, details = rebound_add_signal(self.client, row["symbol"])
+                        if ok:
+                            self._rebound_add(row, float(details.get("price") or price))
+                            continue
+                    except Exception as exc:
+                        log_event(row["symbol"], "REBOUND_CHECK_ERROR", mode=self.cfg.mode, details=str(exc))
+
+            # 손절과 목표가는 최초 진입가 기준으로 관리한다.
+            if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
                 self._close(row, price, 1.0, "BE_EXIT")
-            elif pnl_pct <= -self.cfg.hard_stop_pct:
+            elif base_pnl_pct <= -self.cfg.hard_stop_pct:
                 self._close(row, price, 1.0, "STOP")
             elif age_h >= self.cfg.max_hold_hours:
                 self._close(row, price, 1.0, "TIME_EXIT")
-            elif int(row["tp1_done"]) == 0 and pnl_pct >= self.cfg.tp1_pct:
+            elif int(row["tp1_done"]) == 0 and base_pnl_pct >= self.cfg.tp1_pct:
                 self._close(row, price, 0.5, "TP1")
-            elif int(row["tp1_done"]) == 1 and pnl_pct >= self.cfg.tp2_pct:
+            elif int(row["tp1_done"]) == 1 and base_pnl_pct >= self.cfg.tp2_pct:
                 self._close(row, price, 1.0, "TP2")
 
     def scan_entries(self) -> None:
@@ -290,6 +580,10 @@ class DailyBot:
         if self.daily_realized() <= -abs(self.cfg.daily_loss_limit_usdt):
             log_event("", "DAILY_STOP", mode=self.cfg.mode, details=f"pnl={self.daily_realized():.2f}")
             return
+        if self.consecutive_losses() >= self.cfg.max_consecutive_losses:
+            log_event("", "CONSECUTIVE_LOSS_STOP", mode=self.cfg.mode,
+                      details=f"losses={self.consecutive_losses()}")
+            return
         if self.cfg.mode != "paper":
             balance = self.client.balance("USDT")
             if balance <= self.cfg.emergency_stop_balance:
@@ -299,7 +593,11 @@ class DailyBot:
                 return
 
         candidates: list[tuple[float, str, str, dict[str, Any]]] = []
-        for symbol in self.cfg.symbols:
+        for symbol in self.active_symbols():
+            if self.symbol_in_cooldown(symbol):
+                log_event(symbol, "COOLDOWN_WAIT", mode=self.cfg.mode,
+                          details=f"{self.cfg.same_symbol_cooldown_minutes}분 재진입 대기")
+                continue
             try:
                 strategy, score, details = candidate_signal(self.client, symbol)
                 log_event(symbol, "SCAN_OK" if strategy else "SCAN_WAIT", float(details.get("price", 0)),

@@ -95,6 +95,14 @@ class OKXClient:
         rows = self._request("GET", "/api/v5/market/ticker", {"instId": inst_id})
         return rows[0] if rows else {}
 
+    def tickers(self, inst_type: str = "SWAP") -> list[dict[str, Any]]:
+        """Return all public tickers for an instrument type."""
+        return self._request("GET", "/api/v5/market/tickers", {"instType": inst_type})
+
+    def instruments(self, inst_type: str = "SWAP") -> list[dict[str, Any]]:
+        """Return currently listed public instruments."""
+        return self._request("GET", "/api/v5/public/instruments", {"instType": inst_type})
+
     def balance(self, ccy: str = "USDT") -> float:
         rows = self._request("GET", "/api/v5/account/balance", {"ccy": ccy}, private=True)
         if not rows:
