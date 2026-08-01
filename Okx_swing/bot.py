@@ -28,25 +28,34 @@ class DailyConfig:
     )
     # 24시간 거래대금·변동성으로 실제 감시 종목을 자동 선별
     dynamic_universe: bool = True
-    universe_size: int = 12
+    universe_size: int = 15
     universe_refresh_minutes: int = 15
-    top_gainers_pool_size: int = 20
-    min_change_24h_pct: float = 1.0
-    min_quote_volume_24h_usdt: float = 10000000.0
-    min_range_24h_pct: float = 2.5
-    max_range_24h_pct: float = 20.0
-    max_abs_change_24h_pct: float = 18.0
-    max_spread_pct: float = 0.18
+    top_gainers_pool_size: int = 50
+    min_change_24h_pct: float = 2.0
+    min_quote_volume_24h_usdt: float = 1500000.0
+    min_range_24h_pct: float = 3.0
+    max_range_24h_pct: float = 80.0
+    max_abs_change_24h_pct: float = 70.0
+    max_spread_pct: float = 0.22
     # 데일리 3시간 전략에 맞게 최근 1~4시간 실제 움직임도 검사한다.
-    recent_volatility_prefilter_size: int = 24
-    min_recent_4h_range_pct: float = 1.8
-    min_avg_hourly_range_pct: float = 0.55
-    max_recent_1h_move_pct: float = 6.0
+    recent_volatility_prefilter_size: int = 40
+    min_recent_4h_range_pct: float = 1.2
+    min_avg_hourly_range_pct: float = 0.35
+    max_recent_1h_move_pct: float = 10.0
     # 장기 스윙에 더 어울리는 느린 종목은 데일리 후보에서 제외한다.
     slow_symbol_exclusions: tuple[str, ...] = (
         "XRP-USDT-SWAP", "AVAX-USDT-SWAP", "LINK-USDT-SWAP", "LTC-USDT-SWAP",
         "BCH-USDT-SWAP", "DOT-USDT-SWAP", "ETC-USDT-SWAP", "ATOM-USDT-SWAP",
         "TRX-USDT-SWAP", "TON-USDT-SWAP", "FIL-USDT-SWAP", "AAVE-USDT-SWAP",
+    )
+    non_crypto_base_exclusions: tuple[str, ...] = (
+        "AAPL", "ABBV", "ABT", "AMAT", "AMD", "AMZN", "ASML", "AVGO",
+        "BA", "BABA", "BAC", "BRK", "CAT", "COIN", "COST", "CRM", "CVX",
+        "DIS", "GOOG", "GOOGL", "GS", "HD", "IBM", "INTC", "JNJ", "JPM",
+        "KO", "LLY", "MA", "META", "MMM", "MRK", "MSFT", "MSTR", "MU",
+        "NFLX", "NKE", "NVDA", "ORCL", "PEP", "PFE", "PLTR", "PYPL",
+        "QCOM", "SBUX", "SKHYNIX", "SNDK", "SOXL", "SPY", "TSLA", "TSM",
+        "UNH", "V", "WMT", "XAU", "XAG",
     )
     candidate_pool: tuple[str, ...] = (
         "SOL-USDT-SWAP", "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "SUI-USDT-SWAP",
@@ -81,15 +90,15 @@ class DailyConfig:
     rebound_add_margin_usdt: float = 27.0
     rebound_exit_buffer_pct: float = 0.10
     max_cycle_adds: int = 2
-    flat_exit_minutes: int = 75
+    flat_exit_minutes: int = 60
     flat_min_favorable_pct: float = 0.40
-    min_pullback_from_high_pct: float = 0.50
-    max_pullback_from_high_pct: float = 2.50
-    max_entry_candle_gain_pct: float = 1.20
-    max_near_high_pct: float = 0.25
-    min_rebound_from_low_pct: float = 0.40
-    rebound_min_volume_ratio: float = 1.0
-    rebound_min_rsi: float = 45.0
+    min_pullback_from_high_pct: float = 0.30
+    max_pullback_from_high_pct: float = 6.00
+    max_entry_candle_gain_pct: float = 1.40
+    max_near_high_pct: float = 0.15
+    min_rebound_from_low_pct: float = 0.25
+    rebound_min_volume_ratio: float = 0.9
+    rebound_min_rsi: float = 44.0
 
     @classmethod
     def load(cls) -> "DailyConfig":
@@ -104,6 +113,8 @@ class DailyConfig:
             raw["candidate_pool"] = tuple(raw["candidate_pool"])
         if "slow_symbol_exclusions" in raw:
             raw["slow_symbol_exclusions"] = tuple(raw["slow_symbol_exclusions"])
+        if "non_crypto_base_exclusions" in raw:
+            raw["non_crypto_base_exclusions"] = tuple(raw["non_crypto_base_exclusions"])
         allowed = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in raw.items() if k in allowed})
 
@@ -227,9 +238,9 @@ def candidate_signal(client: OKXClient, symbol: str, cfg: DailyConfig) -> tuple[
     h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20)
     pullback_ok = bool(cfg.min_pullback_from_high_pct <= pullback_from_high <= cfg.max_pullback_from_high_pct)
     not_chasing = bool(entry_candle_gain <= cfg.max_entry_candle_gain_pct and distance_to_high >= cfg.max_near_high_pct)
-    rebound = bool(row.close > row.open and row.close > prev.high and row.close >= row.ema9)
-    momentum_ok = bool(row.rsi >= 42 and row.rsi <= 72 and row.rsi > prev.rsi)
-    volume_ok = bool(volume_ratio >= 1.0)
+    rebound = bool(row.close > row.open and row.close > prev.close and row.close >= row.ema9)
+    momentum_ok = bool(row.rsi >= 40 and row.rsi <= 75 and row.rsi >= prev.rsi)
+    volume_ok = bool(volume_ratio >= 0.75)
     not_extreme = bool(one_hour_move <= cfg.max_recent_1h_move_pct and candle_range <= 4.0)
 
     score = (
@@ -240,7 +251,7 @@ def candidate_signal(client: OKXClient, symbol: str, cfg: DailyConfig) -> tuple[
         + min(10, volume_ratio * 7)
         + min(5, rebound_from_low * 4)
     )
-    ok = bool(h1_up and pullback_ok and not_chasing and rebound and momentum_ok and volume_ok and not_extreme and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 74)
+    ok = bool(h1_up and pullback_ok and not_chasing and rebound and momentum_ok and volume_ok and not_extreme and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 65)
     strategy = "P" if ok else None
     details = {
         "price": price, "strategy": strategy, "score": round(float(score), 2),
@@ -326,7 +337,12 @@ class DailyBot:
         ticker_ranked: list[tuple[float, str, dict[str, float]]] = []
         for ticker in self.client.tickers("SWAP"):
             symbol = str(ticker.get("instId") or "")
-            if symbol in excluded or not symbol.endswith("-USDT-SWAP"):
+            base = symbol.split("-", 1)[0].upper() if symbol else ""
+            if (
+                symbol in excluded
+                or base in set(self.cfg.non_crypto_base_exclusions)
+                or not symbol.endswith("-USDT-SWAP")
+            ):
                 continue
             try:
                 last = float(ticker.get("last") or 0)
