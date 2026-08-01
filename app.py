@@ -1394,8 +1394,8 @@ with st.expander("📊 축적 데이터 요약"):
 
 
 st.divider()
-st.subheader("🤖 OKX 데일리 최대 6회 · 변동성 알트 순환 PAPER 봇")
-st.caption("24시간 거래대금뿐 아니라 최근 1~4시간 실제 움직임까지 확인해, 무거운 종목은 제외하고 데일리용 알트를 자동 선별합니다. 실제 주문은 발생하지 않습니다.")
+st.subheader("🤖 OKX 데일리 최대 6회 · 상승상위 눌림 순환 PAPER 봇")
+st.caption("24시간 상승률 상위 종목 중 거래량이 충분한 알트를 고른 뒤, 고점 추격 없이 눌림 후 재반등에서 진입합니다. PAPER 전용이며 실제 주문은 발생하지 않습니다.")
 OKX_BOT_DB = Path(__file__).with_name("Okx_swing") / "okx_swing_bot.db"
 OKX_BOT_CONFIG = Path(__file__).with_name("Okx_swing") / "config.json"
 bot_cfg = {}
@@ -1423,7 +1423,7 @@ if OKX_BOT_CONFIG.exists():
                 active_symbols = symbols
         if bool(bot_cfg.get("dynamic_universe", False)):
             st.caption(
-                f"24시간+최근 4시간 기준 자동 선별 {len(active_symbols)}종목 · "
+                f"24시간 상승상위+눌림 기준 자동 선별 {len(active_symbols)}종목 · "
                 f"{bot_cfg.get('universe_refresh_minutes', 30)}분마다 갱신: "
                 + ", ".join(str(x).replace("-USDT-SWAP", "") for x in active_symbols)
             )
@@ -1469,7 +1469,7 @@ if OKX_BOT_DB.exists():
                     c.metric("가격 변동", '-' if row['unrealized_pct'] is None else f"{float(row['unrealized_pct']):+.2f}%")
                     st.write(
                         f"증거금 {float(row['total_margin']):.2f} USDT · 레버리지 {bot_cfg.get('leverage', 5)}배 · "
-                        f"TP1 {'완료' if int(row['tp1_done']) else '대기'} · 순환추가 {'완료' if int(row['dca_count'] or 0) else '대기'}"
+                        f"TP1 {'완료' if int(row['tp1_done']) else '대기'} · 순환 {int(row['dca_count'] or 0)}/{int(bot_cfg.get('max_cycle_adds', 2))}회"
                     )
         else:
             st.info("현재 데일리봇 보유 포지션이 없습니다.")
