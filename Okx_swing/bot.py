@@ -29,7 +29,9 @@ class DailyConfig:
     # 24시간 거래대금·변동성으로 실제 감시 종목을 자동 선별
     dynamic_universe: bool = True
     universe_size: int = 12
-    universe_refresh_minutes: int = 30
+    universe_refresh_minutes: int = 15
+    top_gainers_pool_size: int = 20
+    min_change_24h_pct: float = 1.0
     min_quote_volume_24h_usdt: float = 10000000.0
     min_range_24h_pct: float = 2.5
     max_range_24h_pct: float = 20.0
@@ -60,7 +62,7 @@ class DailyConfig:
     mode: str = "paper"  # paper | demo | live
     leverage: int = 5
     margin_mode: str = "isolated"
-    max_positions: int = 1
+    max_positions: int = 2
     max_daily_entries: int = 6
     position_margin_usdt: float = 54.0
     tp1_pct: float = 1.5
@@ -78,6 +80,16 @@ class DailyConfig:
     rebound_arm_drawdown_pct: float = 0.6
     rebound_add_margin_usdt: float = 27.0
     rebound_exit_buffer_pct: float = 0.10
+    max_cycle_adds: int = 2
+    flat_exit_minutes: int = 75
+    flat_min_favorable_pct: float = 0.40
+    min_pullback_from_high_pct: float = 0.50
+    max_pullback_from_high_pct: float = 2.50
+    max_entry_candle_gain_pct: float = 1.20
+    max_near_high_pct: float = 0.25
+    min_rebound_from_low_pct: float = 0.40
+    rebound_min_volume_ratio: float = 1.0
+    rebound_min_rsi: float = 45.0
 
     @classmethod
     def load(cls) -> "DailyConfig":
@@ -140,6 +152,8 @@ def init_db() -> None:
         _ensure_column(conn, "bot_positions", "add_qty", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_positions", "add_price", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_positions", "lowest_price", "REAL")
+        _ensure_column(conn, "bot_positions", "highest_price", "REAL")
+        _ensure_column(conn, "bot_positions", "cycle_anchor_price", "REAL")
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
 
@@ -188,7 +202,8 @@ def confirmed(df: pd.DataFrame) -> pd.DataFrame:
     return df.iloc[:-1]
 
 
-def candidate_signal(client: OKXClient, symbol: str) -> tuple[str | None, float, dict[str, Any]]:
+def candidate_signal(client: OKXClient, symbol: str, cfg: DailyConfig) -> tuple[str | None, float, dict[str, Any]]:
+    """24시간 상승 종목이 충분히 눌린 뒤 재반등할 때만 진입한다."""
     m15 = confirmed(indicators(client.candles(symbol, "15m", 220)))
     h1 = confirmed(indicators(client.candles(symbol, "1H", 140)))
     if len(m15) < 70 or len(h1) < 70:
@@ -199,73 +214,84 @@ def candidate_signal(client: OKXClient, symbol: str) -> tuple[str | None, float,
     price = float(row.close)
     volume_ratio = float(row.volume / row.vol_avg) if pd.notna(row.vol_avg) and row.vol_avg > 0 else 0.0
 
-    # 급등·급락 직후 추격 진입 방지. 변동성 알트는 허용하되 1시간 6% 이상 급변은 제외한다.
+    recent = m15.tail(16)
+    recent_high = float(recent.iloc[:-1].high.max())
+    recent_low = float(recent.low.min())
+    pullback_from_high = (recent_high / price - 1) * 100 if price > 0 else 99.0
+    rebound_from_low = (price / recent_low - 1) * 100 if recent_low > 0 else 0.0
+    entry_candle_gain = (float(row.close) / float(row.open) - 1) * 100 if float(row.open) > 0 else 99.0
+    distance_to_high = (recent_high / price - 1) * 100 if price > 0 else 0.0
     one_hour_move = abs(float(row.close / m15.iloc[-5].close - 1)) * 100
     candle_range = abs(float(row.high / row.low - 1)) * 100 if float(row.low) > 0 else 99.0
-    not_extreme = bool(one_hour_move <= 6.0 and candle_range <= 4.0)
 
-    # P형(완화): 1시간 추세가 상승이거나 최소 횡보이고, 15분 흐름이 회복되는 눌림 반등.
     h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20)
-    h1_flat = bool(hrow.ema20 >= hrow.ema60 * 0.995 and hrow.ema20 >= hprev.ema20 * 0.998)
-    m15_recovering = bool(row.ema9 >= row.ema20 or row.close >= row.ema20)
-    trend_ok = bool(h1_up or (h1_flat and m15_recovering))
-    pullback = bool(m15.tail(10).low.min() <= row.ema20 * 1.008)
+    pullback_ok = bool(cfg.min_pullback_from_high_pct <= pullback_from_high <= cfg.max_pullback_from_high_pct)
+    not_chasing = bool(entry_candle_gain <= cfg.max_entry_candle_gain_pct and distance_to_high >= cfg.max_near_high_pct)
     rebound = bool(row.close > row.open and row.close > prev.high and row.close >= row.ema9)
-    p_rsi = bool(40 <= row.rsi <= 70)
-    p_score = (30 if trend_ok else 0) + (20 if pullback else 0) + (25 if rebound else 0) + \
-              (15 if p_rsi else 0) + min(10, volume_ratio * 7)
-    p_ok = bool(trend_ok and pullback and rebound and p_rsi and not_extreme and p_score >= 70)
+    momentum_ok = bool(row.rsi >= 42 and row.rsi <= 72 and row.rsi > prev.rsi)
+    volume_ok = bool(volume_ratio >= 1.0)
+    not_extreme = bool(one_hour_move <= cfg.max_recent_1h_move_pct and candle_range <= 4.0)
 
-    # R형(완화): RSI 35 전후 과매도 후 저점 방어와 반등 확인. 거래량은 필수가 아닌 점수 항목이다.
-    recent_rsi_min = float(m15.tail(12).rsi.min())
-    oversold = bool(recent_rsi_min <= 35 or row.rsi <= 38)
-    reversal = bool(row.close > row.open and row.close > prev.high and row.rsi > prev.rsi)
-    not_crashing = bool(hrow.close >= hrow.ema60 * 0.955 and hrow.rsi >= 26)
-    low_hold = bool(row.low >= m15.tail(8).low.min() * 0.997)
-    r_score = (30 if oversold else 0) + (30 if reversal else 0) + (20 if not_crashing else 0) + \
-              (10 if low_hold else 0) + min(10, volume_ratio * 7)
-    r_ok = bool(oversold and reversal and not_crashing and low_hold and not_extreme and r_score >= 70)
-
-    strategy: str | None = None
-    score = 0.0
-    if p_ok and p_score >= r_score:
-        strategy, score = "P", p_score
-    elif r_ok:
-        strategy, score = "R", r_score
-
+    score = (
+        (25 if h1_up else 0)
+        + (25 if pullback_ok else 0)
+        + (25 if rebound else 0)
+        + (10 if momentum_ok else 0)
+        + min(10, volume_ratio * 7)
+        + min(5, rebound_from_low * 4)
+    )
+    ok = bool(h1_up and pullback_ok and not_chasing and rebound and momentum_ok and volume_ok and not_extreme and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 74)
+    strategy = "P" if ok else None
     details = {
         "price": price, "strategy": strategy, "score": round(float(score), 2),
-        "p_ok": bool(p_ok), "r_ok": bool(r_ok), "trend_ok": trend_ok,
-        "h1_up": h1_up, "h1_flat": h1_flat, "pullback": pullback, "rebound": rebound,
-        "rsi": round(float(row.rsi), 2), "recent_rsi_min": round(recent_rsi_min, 2),
-        "volume_ratio": round(volume_ratio, 2), "not_crashing": not_crashing,
-        "not_extreme": not_extreme, "one_hour_move_pct": round(one_hour_move, 2),
+        "h1_up": h1_up, "pullback_ok": pullback_ok, "rebound": rebound,
+        "not_chasing": not_chasing, "volume_ok": volume_ok,
+        "rsi": round(float(row.rsi), 2), "volume_ratio": round(volume_ratio, 2),
+        "pullback_from_high_pct": round(pullback_from_high, 2),
+        "rebound_from_low_pct": round(rebound_from_low, 2),
+        "entry_candle_gain_pct": round(entry_candle_gain, 2),
+        "distance_to_recent_high_pct": round(distance_to_high, 2),
+        "one_hour_move_pct": round(one_hour_move, 2),
     }
     return strategy, float(score), details
 
 
-def rebound_add_signal(client: OKXClient, symbol: str) -> tuple[bool, dict[str, Any]]:
-    """하락 뒤 실제 반등이 확인될 때만 순환 추가진입한다."""
-    m5 = confirmed(indicators(client.candles(symbol, "5m", 120)))
-    if len(m5) < 40:
-        return False, {"reason": "5m 캔들 부족"}
-    row, prev = m5.iloc[-1], m5.iloc[-2]
-    recent_low = float(m5.tail(8).low.min())
-    bullish = bool(row.close > row.open)
-    break_prev = bool(row.close > prev.high)
-    rsi_turn = bool(row.rsi > prev.rsi and row.rsi >= 32)
-    ema_recover = bool(row.close >= row.ema9)
-    low_hold = bool(row.low >= recent_low * 0.998)
-    ok = bool(bullish and break_prev and rsi_turn and ema_recover and low_hold)
+def rebound_add_signal(client: OKXClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
+    """횡보성 작은 반등은 제외하고, 15분 구조와 거래량이 함께 회복될 때만 순환 추가한다."""
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 140)))
+    m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
+    if len(m5) < 50 or len(m15) < 30:
+        return False, {"reason": "반등 캔들 부족"}
+    row5, prev5 = m5.iloc[-1], m5.iloc[-2]
+    row15, prev15 = m15.iloc[-1], m15.iloc[-2]
+    recent_low = float(m5.tail(12).low.min())
+    rebound_pct = (float(row5.close) / recent_low - 1) * 100 if recent_low > 0 else 0.0
+    vol_ratio = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
+    prior_15m_high = float(m15.iloc[-4:-1].high.max())
+
+    bullish = bool(row5.close > row5.open and row15.close > row15.open)
+    break_structure = bool(row15.close > prior_15m_high and row5.close > prev5.high)
+    rsi_ok = bool(row15.rsi >= cfg.rebound_min_rsi and row15.rsi > prev15.rsi)
+    ema_ok = bool(row15.close >= row15.ema9 and row15.ema9 >= row15.ema20)
+    volume_ok = bool(vol_ratio >= cfg.rebound_min_volume_ratio)
+    rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
+    ok = bool(bullish and break_structure and rsi_ok and ema_ok and volume_ok and rebound_ok)
     return ok, {
-        "price": float(row.close), "bullish": bullish, "break_prev": break_prev,
-        "rsi_turn": rsi_turn, "ema_recover": ema_recover, "low_hold": low_hold,
-        "rsi": round(float(row.rsi), 2),
+        "price": float(row5.close), "bullish": bullish, "break_structure": break_structure,
+        "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
+        "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
+        "volume_ratio": round(vol_ratio, 2), "rebound_pct": round(rebound_pct, 2),
     }
 
 
 def qty_from_margin(price: float, margin_usdt: float, leverage: int) -> float:
     return max(0.0, margin_usdt * leverage / price)
+
+
+MEME_SYMBOLS = {"PEPE-USDT-SWAP", "WIF-USDT-SWAP", "BONK-USDT-SWAP", "SHIB-USDT-SWAP", "DOGE-USDT-SWAP"}
+
+def same_risk_group(symbol: str, open_symbols: set[str]) -> bool:
+    return symbol in MEME_SYMBOLS and any(s in MEME_SYMBOLS for s in open_symbols)
 
 
 class DailyBot:
@@ -282,7 +308,7 @@ class DailyBot:
             return []
 
     def active_symbols(self) -> list[str]:
-        """유동성 + 24시간 변동성 + 최근 1~4시간 움직임으로 데일리 알트를 선별한다."""
+        """24시간 상승률 상위 종목에서 유동성과 최근 움직임을 확인해 선별한다."""
         if not self.cfg.dynamic_universe:
             return list(self.cfg.symbols)
 
@@ -300,7 +326,7 @@ class DailyBot:
         ticker_ranked: list[tuple[float, str, dict[str, float]]] = []
         for ticker in self.client.tickers("SWAP"):
             symbol = str(ticker.get("instId") or "")
-            if symbol not in pool or symbol in excluded or not symbol.endswith("-USDT-SWAP"):
+            if symbol in excluded or not symbol.endswith("-USDT-SWAP"):
                 continue
             try:
                 last = float(ticker.get("last") or 0)
@@ -320,14 +346,15 @@ class DailyBot:
                     continue
                 if not (self.cfg.min_range_24h_pct <= range_pct <= self.cfg.max_range_24h_pct):
                     continue
-                if abs(change_pct) > self.cfg.max_abs_change_24h_pct:
+                if change_pct < self.cfg.min_change_24h_pct or change_pct > self.cfg.max_abs_change_24h_pct:
                     continue
                 if spread_pct > self.cfg.max_spread_pct:
                     continue
-                liquidity_score = math.log10(max(quote_vol, 1.0)) * 7
-                movement_score = min(range_pct, 14.0) * 5
+                liquidity_score = math.log10(max(quote_vol, 1.0)) * 4
+                gainer_score = min(change_pct, 35.0) * 8
+                movement_score = min(range_pct, 14.0) * 3
                 spread_penalty = spread_pct * 90
-                ticker_score = liquidity_score + movement_score - spread_penalty
+                ticker_score = liquidity_score + gainer_score + movement_score - spread_penalty
                 ticker_ranked.append((ticker_score, symbol, {
                     "quote_volume": quote_vol, "range_pct": range_pct,
                     "change_pct": change_pct, "spread_pct": spread_pct,
@@ -336,7 +363,7 @@ class DailyBot:
                 continue
 
         ticker_ranked.sort(reverse=True, key=lambda x: x[0])
-        prefiltered = ticker_ranked[: max(self.cfg.universe_size, self.cfg.recent_volatility_prefilter_size)]
+        prefiltered = ticker_ranked[: max(self.cfg.top_gainers_pool_size, self.cfg.universe_size)]
         ranked: list[tuple[float, str, dict[str, float]]] = []
         for ticker_score, symbol, details in prefiltered:
             try:
@@ -458,11 +485,11 @@ class DailyBot:
                 """INSERT INTO bot_positions(
                     symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,
                     last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
-                    base_entry_price,base_qty,add_qty,add_price,lowest_price
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, "OPEN", utc_now(), utc_now(), price, qty, self.cfg.position_margin_usdt, 0, 0,
                  price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, today_kst(),
-                 price, qty, 0.0, 0.0, price),
+                 price, qty, 0.0, 0.0, price, price, price),
             )
         log_event(symbol, "ENTRY", price, qty, self.cfg.mode,
                   f"score={score:.1f}; margin={self.cfg.position_margin_usdt}", strategy)
@@ -478,10 +505,11 @@ class DailyBot:
         new_avg = (old_avg * old_qty + price * add_qty) / new_qty
         with db() as conn:
             conn.execute(
-                """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,dca_count=1,
+                """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,dca_count=?,
                    add_qty=?,add_price=?,updated_at=?,last_price=?,note=? WHERE symbol=?""",
                 (new_avg, new_qty, float(row["total_margin"]) + self.cfg.rebound_add_margin_usdt,
-                 add_qty, price, utc_now(), price, "반등 확인 후 순환 추가진입", row["symbol"]),
+                 int(row["dca_count"] or 0) + 1, add_qty, price, utc_now(), price,
+                 "반등 확인 후 순환 추가진입", row["symbol"]),
             )
         log_event(row["symbol"], "REBOUND_ADD", price, add_qty, self.cfg.mode,
                   details=f"blended_avg={new_avg:.8f}", strategy=row["strategy"] or "")
@@ -491,16 +519,17 @@ class DailyBot:
         if add_qty <= 0:
             return
         self._execute(row["symbol"], "sell", add_qty, reduce_only=True)
-        pnl_usdt = (price - float(row["avg_price"])) * add_qty
+        pnl_usdt = (price - float(row["add_price"] or row["avg_price"])) * add_qty
         remaining = max(0.0, float(row["total_qty"]) - add_qty)
         base_price = float(row["base_entry_price"] or row["avg_price"])
         total_realized = float(row["realized_pnl"] or 0) + pnl_usdt
         with db() as conn:
             conn.execute(
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,add_qty=0,add_price=0,
-                   updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?""",
+                   updated_at=?,last_price=?,note=?,realized_pnl=?,lowest_price=?,highest_price=?,cycle_anchor_price=? WHERE symbol=?""",
                 (base_price, remaining, max(0.0, float(row["total_margin"]) - self.cfg.rebound_add_margin_usdt),
-                 utc_now(), price, "순환 추가분 정리 · 최초 물량 유지", total_realized, row["symbol"]),
+                 utc_now(), price, "순환 추가분 정리 · 최초 물량 유지", total_realized,
+                 price, price, price, row["symbol"]),
             )
         log_event(row["symbol"], "CYCLE_REDUCE", price, add_qty, self.cfg.mode,
                   details="추가 수량만큼 정리", strategy=row["strategy"] or "", realized_pnl=pnl_usdt)
@@ -536,24 +565,27 @@ class DailyBot:
             base_pnl_pct = (price / base_price - 1) * 100
             age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(row["opened_at"])).total_seconds() / 3600
             lowest = min(float(row["lowest_price"] or price), price)
+            highest = max(float(row["highest_price"] or price), price)
             with db() as conn:
-                conn.execute("UPDATE bot_positions SET last_price=?,unrealized_pct=?,lowest_price=?,updated_at=? WHERE symbol=?",
-                             (price, base_pnl_pct, lowest, utc_now(), row["symbol"]))
+                conn.execute("UPDATE bot_positions SET last_price=?,unrealized_pct=?,lowest_price=?,highest_price=?,updated_at=? WHERE symbol=?",
+                             (price, base_pnl_pct, lowest, highest, utc_now(), row["symbol"]))
 
             # 추가분을 보유 중이면, 혼합평단 + 소폭 버퍼 회복 시 추가 수량만큼 우선 정리한다.
-            if int(row["dca_count"] or 0) == 1 and float(row["add_qty"] or 0) > 0:
+            if float(row["add_qty"] or 0) > 0:
                 cycle_target = avg * (1 + self.cfg.rebound_exit_buffer_pct / 100)
                 if price >= cycle_target:
                     self._cycle_reduce(row, price)
                     continue
 
-            # 하락 자체가 아니라, 일정 하락을 겪은 뒤 5분봉 반등이 확인될 때만 1회 추가한다.
-            if (self.cfg.rebound_add_enabled and int(row["dca_count"] or 0) == 0
+            # 순환 추가분을 이미 회수했다면 다시 밀린 뒤 새 반등이 확인될 때 최대 설정 횟수까지 반복한다.
+            if (self.cfg.rebound_add_enabled and float(row["add_qty"] or 0) <= 0
+                    and int(row["dca_count"] or 0) < self.cfg.max_cycle_adds
                     and int(row["tp1_done"] or 0) == 0):
-                drawdown_pct = (lowest / base_price - 1) * 100
+                anchor = float(row["cycle_anchor_price"] or base_price)
+                drawdown_pct = (lowest / anchor - 1) * 100
                 if drawdown_pct <= -abs(self.cfg.rebound_arm_drawdown_pct):
                     try:
-                        ok, details = rebound_add_signal(self.client, row["symbol"])
+                        ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
                         if ok:
                             self._rebound_add(row, float(details.get("price") or price))
                             continue
@@ -565,6 +597,9 @@ class DailyBot:
                 self._close(row, price, 1.0, "BE_EXIT")
             elif base_pnl_pct <= -self.cfg.hard_stop_pct:
                 self._close(row, price, 1.0, "STOP")
+            elif (age_h * 60 >= self.cfg.flat_exit_minutes
+                  and (highest / base_price - 1) * 100 < self.cfg.flat_min_favorable_pct):
+                self._close(row, price, 1.0, "FLAT_EXIT_75M")
             elif age_h >= self.cfg.max_hold_hours:
                 self._close(row, price, 1.0, "TIME_EXIT")
             elif int(row["tp1_done"]) == 0 and base_pnl_pct >= self.cfg.tp1_pct:
@@ -599,7 +634,7 @@ class DailyBot:
                           details=f"{self.cfg.same_symbol_cooldown_minutes}분 재진입 대기")
                 continue
             try:
-                strategy, score, details = candidate_signal(self.client, symbol)
+                strategy, score, details = candidate_signal(self.client, symbol, self.cfg)
                 log_event(symbol, "SCAN_OK" if strategy else "SCAN_WAIT", float(details.get("price", 0)),
                           mode=self.cfg.mode, details=json.dumps(details, ensure_ascii=False), strategy=strategy or "")
                 if strategy:
@@ -609,8 +644,18 @@ class DailyBot:
                 log_event(symbol, "SCAN_ERROR", mode=self.cfg.mode, details=str(exc))
 
         if candidates:
-            score, symbol, strategy, details = max(candidates, key=lambda x: x[0])
-            self._open(symbol, float(details["price"]), strategy, score)
+            open_symbols = {str(r["symbol"]) for r in self.open_rows()}
+            slots = max(0, self.cfg.max_positions - len(open_symbols))
+            entries_left = max(0, self.cfg.max_daily_entries - self.daily_entries())
+            for score, symbol, strategy, details in sorted(candidates, reverse=True, key=lambda x: x[0]):
+                if slots <= 0 or entries_left <= 0:
+                    break
+                if symbol in open_symbols or same_risk_group(symbol, open_symbols):
+                    continue
+                self._open(symbol, float(details["price"]), strategy, score)
+                open_symbols.add(symbol)
+                slots -= 1
+                entries_left -= 1
 
     def run_once(self) -> None:
         self.manage()
