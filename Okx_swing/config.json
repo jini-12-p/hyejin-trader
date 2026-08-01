@@ -172,5 +172,6 @@
     "WMT",
     "XAU",
     "XAG"
-  ]
+  ],
+  "paper_consecutive_loss_warning_only": true
 }

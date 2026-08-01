@@ -81,6 +81,7 @@ class DailyConfig:
     max_hold_hours: int = 3
     daily_loss_limit_usdt: float = 12.0
     max_consecutive_losses: int = 3
+    paper_consecutive_loss_warning_only: bool = True
     same_symbol_cooldown_minutes: int = 30
     min_balance_to_trade: float = 90.0
     emergency_stop_balance: float = 85.0
@@ -459,21 +460,36 @@ class DailyBot:
         return float(value or 0)
 
     def consecutive_losses(self) -> int:
-        """오늘 종료된 거래를 최신순으로 보고 연속 손실 횟수를 센다."""
+        """실제 손절(STOP/BE_EXIT)만 연속손실로 센다.
+
+        정체 종료(FLAT_EXIT)와 시간 종료(TIME_EXIT)는 데이터 수집용 중립 종료로
+        간주해 카운트에서 제외한다. 수익 거래가 나오면 연속손실은 즉시 0으로
+        초기화된다.
+        """
         day = trading_day()
         with db() as conn:
             rows = conn.execute(
-                """SELECT realized_pnl FROM bot_positions
+                """SELECT realized_pnl, note FROM bot_positions
                    WHERE status='CLOSED' AND substr(updated_at,1,10)=?
                    ORDER BY updated_at DESC""",
                 (day,),
             ).fetchall()
         count = 0
         for row in rows:
-            if float(row["realized_pnl"] or 0) < 0:
-                count += 1
-            else:
+            pnl = float(row["realized_pnl"] or 0)
+            reason = str(row["note"] or "").upper()
+            if pnl > 0 or reason in {"TP1", "TP2"}:
                 break
+            if reason in {"STOP", "BE_EXIT"} and pnl < 0:
+                count += 1
+                continue
+            if reason.startswith("FLAT_EXIT") or reason == "TIME_EXIT":
+                continue
+            # 알 수 없는 음수 종료는 안전하게 손절로 계산한다.
+            if pnl < 0:
+                count += 1
+                continue
+            break
         return count
 
     def symbol_in_cooldown(self, symbol: str) -> bool:
@@ -666,10 +682,15 @@ class DailyBot:
         if self.daily_realized() <= -abs(self.cfg.daily_loss_limit_usdt):
             log_event("", "DAILY_STOP", mode=self.cfg.mode, details=f"pnl={self.daily_realized():.2f}")
             return
-        if self.consecutive_losses() >= self.cfg.max_consecutive_losses:
-            log_event("", "CONSECUTIVE_LOSS_STOP", mode=self.cfg.mode,
-                      details=f"losses={self.consecutive_losses()}")
-            return
+        losses = self.consecutive_losses()
+        if losses >= self.cfg.max_consecutive_losses:
+            if self.cfg.mode == "paper" and self.cfg.paper_consecutive_loss_warning_only:
+                log_event("", "CONSECUTIVE_LOSS_WARNING", mode=self.cfg.mode,
+                          details=f"losses={losses}; PAPER는 진입 계속")
+            else:
+                log_event("", "CONSECUTIVE_LOSS_STOP", mode=self.cfg.mode,
+                          details=f"losses={losses}")
+                return
         if self.cfg.mode != "paper":
             balance = self.client.balance("USDT")
             if balance <= self.cfg.emergency_stop_balance:
