@@ -5,8 +5,13 @@
     "SOL-USDT-SWAP",
     "XRP-USDT-SWAP",
     "DOGE-USDT-SWAP",
-    "ADA-USDT-SWAP",
-    "LINK-USDT-SWAP"
+    "SUI-USDT-SWAP",
+    "AVAX-USDT-SWAP",
+    "LINK-USDT-SWAP",
+    "PEPE-USDT-SWAP",
+    "WIF-USDT-SWAP",
+    "BONK-USDT-SWAP",
+    "APT-USDT-SWAP"
   ],
   "mode": "paper",
   "leverage": 5,

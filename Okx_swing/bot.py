@@ -21,8 +21,9 @@ KST = timezone(timedelta(hours=9))
 @dataclass
 class DailyConfig:
     symbols: tuple[str, ...] = (
-        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
-        "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "ADA-USDT-SWAP", "LINK-USDT-SWAP",
+        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP",
+        "DOGE-USDT-SWAP", "SUI-USDT-SWAP", "AVAX-USDT-SWAP", "LINK-USDT-SWAP",
+        "PEPE-USDT-SWAP", "WIF-USDT-SWAP", "BONK-USDT-SWAP", "APT-USDT-SWAP",
     )
     mode: str = "paper"  # paper | demo | live
     leverage: int = 5
@@ -136,24 +137,32 @@ def candidate_signal(client: OKXClient, symbol: str) -> tuple[str | None, float,
     price = float(row.close)
     volume_ratio = float(row.volume / row.vol_avg) if pd.notna(row.vol_avg) and row.vol_avg > 0 else 0.0
 
-    # P형: 1시간 상승 흐름 안의 15분 눌림 후 재돌파
-    trend_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20)
-    pullback = bool(m15.tail(10).low.min() <= row.ema20 * 1.006)
-    rebound = bool(row.close > row.open and row.close > prev.high and row.close >= row.ema9)
-    p_rsi = bool(43 <= row.rsi <= 67)
-    p_ok = trend_up and pullback and rebound and p_rsi and volume_ratio >= 0.75
-    p_score = (35 if trend_up else 0) + (20 if pullback else 0) + (25 if rebound else 0) + \
-              (10 if p_rsi else 0) + min(10, volume_ratio * 7)
+    # 급등·급락 직후 추격 진입 방지. 변동성 알트는 허용하되 1시간 6% 이상 급변은 제외한다.
+    one_hour_move = abs(float(row.close / m15.iloc[-5].close - 1)) * 100
+    candle_range = abs(float(row.high / row.low - 1)) * 100 if float(row.low) > 0 else 99.0
+    not_extreme = bool(one_hour_move <= 6.0 and candle_range <= 4.0)
 
-    # R형: 과매도 뒤 하락 둔화와 15분 반등. 1시간 급락 지속 구간은 제외.
+    # P형(완화): 1시간 추세가 상승이거나 최소 횡보이고, 15분 흐름이 회복되는 눌림 반등.
+    h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20)
+    h1_flat = bool(hrow.ema20 >= hrow.ema60 * 0.995 and hrow.ema20 >= hprev.ema20 * 0.998)
+    m15_recovering = bool(row.ema9 >= row.ema20 or row.close >= row.ema20)
+    trend_ok = bool(h1_up or (h1_flat and m15_recovering))
+    pullback = bool(m15.tail(10).low.min() <= row.ema20 * 1.008)
+    rebound = bool(row.close > row.open and row.close > prev.high and row.close >= row.ema9)
+    p_rsi = bool(40 <= row.rsi <= 70)
+    p_score = (30 if trend_ok else 0) + (20 if pullback else 0) + (25 if rebound else 0) + \
+              (15 if p_rsi else 0) + min(10, volume_ratio * 7)
+    p_ok = bool(trend_ok and pullback and rebound and p_rsi and not_extreme and p_score >= 70)
+
+    # R형(완화): RSI 35 전후 과매도 후 저점 방어와 반등 확인. 거래량은 필수가 아닌 점수 항목이다.
     recent_rsi_min = float(m15.tail(12).rsi.min())
-    oversold = bool(recent_rsi_min <= 32 or row.rsi <= 36)
+    oversold = bool(recent_rsi_min <= 35 or row.rsi <= 38)
     reversal = bool(row.close > row.open and row.close > prev.high and row.rsi > prev.rsi)
-    not_crashing = bool(hrow.close >= hrow.ema60 * 0.965 and hrow.rsi >= 28)
-    low_hold = bool(row.low >= m15.tail(8).low.min() * 0.998)
-    r_ok = oversold and reversal and not_crashing and low_hold and volume_ratio >= 0.65
-    r_score = (35 if oversold else 0) + (30 if reversal else 0) + (20 if not_crashing else 0) + \
-              (5 if low_hold else 0) + min(10, volume_ratio * 7)
+    not_crashing = bool(hrow.close >= hrow.ema60 * 0.955 and hrow.rsi >= 26)
+    low_hold = bool(row.low >= m15.tail(8).low.min() * 0.997)
+    r_score = (30 if oversold else 0) + (30 if reversal else 0) + (20 if not_crashing else 0) + \
+              (10 if low_hold else 0) + min(10, volume_ratio * 7)
+    r_ok = bool(oversold and reversal and not_crashing and low_hold and not_extreme and r_score >= 70)
 
     strategy: str | None = None
     score = 0.0
@@ -164,10 +173,11 @@ def candidate_signal(client: OKXClient, symbol: str) -> tuple[str | None, float,
 
     details = {
         "price": price, "strategy": strategy, "score": round(float(score), 2),
-        "p_ok": bool(p_ok), "r_ok": bool(r_ok), "trend_up": trend_up,
-        "pullback": pullback, "rebound": rebound, "rsi": round(float(row.rsi), 2),
-        "recent_rsi_min": round(recent_rsi_min, 2), "volume_ratio": round(volume_ratio, 2),
-        "not_crashing": not_crashing,
+        "p_ok": bool(p_ok), "r_ok": bool(r_ok), "trend_ok": trend_ok,
+        "h1_up": h1_up, "h1_flat": h1_flat, "pullback": pullback, "rebound": rebound,
+        "rsi": round(float(row.rsi), 2), "recent_rsi_min": round(recent_rsi_min, 2),
+        "volume_ratio": round(volume_ratio, 2), "not_crashing": not_crashing,
+        "not_extreme": not_extreme, "one_hour_move_pct": round(one_hour_move, 2),
     }
     return strategy, float(score), details
 
@@ -290,11 +300,15 @@ class DailyBot:
 
         candidates: list[tuple[float, str, str, dict[str, Any]]] = []
         for symbol in self.cfg.symbols:
-            strategy, score, details = candidate_signal(self.client, symbol)
-            log_event(symbol, "SCAN_OK" if strategy else "SCAN_WAIT", float(details.get("price", 0)),
-                      mode=self.cfg.mode, details=json.dumps(details, ensure_ascii=False), strategy=strategy or "")
-            if strategy:
-                candidates.append((score, symbol, strategy, details))
+            try:
+                strategy, score, details = candidate_signal(self.client, symbol)
+                log_event(symbol, "SCAN_OK" if strategy else "SCAN_WAIT", float(details.get("price", 0)),
+                          mode=self.cfg.mode, details=json.dumps(details, ensure_ascii=False), strategy=strategy or "")
+                if strategy:
+                    candidates.append((score, symbol, strategy, details))
+            except Exception as exc:
+                # 특정 종목의 일시적 API/상장 상태 문제 때문에 전체 스캔이 멈추지 않게 한다.
+                log_event(symbol, "SCAN_ERROR", mode=self.cfg.mode, details=str(exc))
 
         if candidates:
             score, symbol, strategy, details = max(candidates, key=lambda x: x[0])
