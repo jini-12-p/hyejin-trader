@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import extra_streamlit_components as stx
@@ -482,7 +482,7 @@ st.title("📈 HJ Trader")
 st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 실제 포지션 자동 동기화")
 
 view_mode = st.radio(
-    "화면 선택", ["둘 다 보기", "Bybit만 보기", "OKX PAPER만 보기"],
+    "화면 선택", ["둘 다 보기", "Bybit만 보기", "OKX PAPER만 보기", "Bybit Swing PAPER만 보기"],
     horizontal=True, key="main_view_mode"
 )
 
@@ -494,7 +494,7 @@ default_margin_usdt = float(get_setting("order_margin_usdt", 12.0))
 default_leverage = int(get_setting("order_leverage", 5))
 hedge_mode = bool(get_setting("bybit_hedge_mode", True))
 
-if view_mode != "OKX PAPER만 보기":
+if view_mode not in {"OKX PAPER만 보기", "Bybit Swing PAPER만 보기"}:
     with st.expander("⚙️ 감시종목 및 기준", expanded=False):
         try:
             total_symbols = cached_symbols()
@@ -1399,7 +1399,7 @@ if view_mode != "OKX PAPER만 보기":
 
 
 
-if view_mode != "Bybit만 보기":
+if view_mode not in {"Bybit만 보기", "Bybit Swing PAPER만 보기"}:
     st.divider()
     st.subheader("🤖 OKX 상승상위 눌림 순환 PAPER 봇 v3.9.0")
     st.caption("한국시간 오전 9시 거래일 리셋 · PAPER 데이터 수집 중 진입 횟수 제한 없음 · 동시 최대 2종목")
@@ -1583,5 +1583,127 @@ if view_mode != "Bybit만 보기":
             st.warning(f"데일리봇 상태 읽기 실패: {exc}")
     else:
         st.info("데일리봇을 한 번 실행하면 상태 데이터가 여기에 표시됩니다.")
+
+
+
+if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
+    st.divider()
+    st.subheader("🤖 Bybit 상승상위 눌림 확인 PAPER 봇 v4.0.0")
+    st.caption("Bybit USDT 무기한선물 · 한국시간 오전 9시 거래일 리셋 · 동시 최대 2종목")
+    BYBIT_SWING_DB = Path(__file__).with_name("bybit_swing") / "bybit_swing_bot.db"
+    BYBIT_SWING_CONFIG = Path(__file__).with_name("bybit_swing") / "config.json"
+
+    def _bs_state_get(key: str, default: str = "") -> str:
+        if not BYBIT_SWING_DB.exists():
+            return default
+        try:
+            with sqlite3.connect(BYBIT_SWING_DB) as conn:
+                row = conn.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+            return str(row[0]) if row else default
+        except Exception:
+            return default
+
+    def _bs_state_set(key: str, value: str) -> None:
+        with sqlite3.connect(BYBIT_SWING_DB) as conn:
+            conn.execute(
+                "INSERT INTO bot_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def _kst_time(value: str) -> str:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M:%S")
+        except Exception:
+            return str(value)[:19]
+
+    bs_cfg = {}
+    if BYBIT_SWING_CONFIG.exists():
+        try:
+            bs_cfg = json.loads(BYBIT_SWING_CONFIG.read_text(encoding="utf-8"))
+            st.info(
+                f"모드 {str(bs_cfg.get('mode','paper')).upper()} · 격리 {bs_cfg.get('leverage',5)}배 · "
+                f"동시 {bs_cfg.get('max_positions',2)}종목 · 1회 증거금 {bs_cfg.get('position_margin_usdt',54)} USDT"
+            )
+            st.write(
+                f"TP1 +{bs_cfg.get('tp1_pct',1.5)}% 절반 · TP2 +{bs_cfg.get('tp2_pct',3.0)}% 나머지 · "
+                f"손절 -{bs_cfg.get('hard_stop_pct',1.5)}% · 최대 {bs_cfg.get('max_hold_hours',3)}시간"
+            )
+            st.caption("강화 조건: 최근 1시간 0.5% 이상 움직임 · 반등 다음 봉 유지 확인 · 3봉 거래량 연속감소 제외")
+            st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
+        except Exception as exc:
+            st.warning(f"Bybit Swing 설정 확인 실패: {exc}")
+
+    if BYBIT_SWING_DB.exists():
+        try:
+            with sqlite3.connect(BYBIT_SWING_DB) as conn:
+                conn.row_factory = sqlite3.Row
+                positions = conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
+                recent_events = conn.execute("SELECT * FROM bot_events ORDER BY id DESC LIMIT 60").fetchall()
+                history = conn.execute("SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' ORDER BY id DESC LIMIT 500").fetchall()
+                today = conn.execute("SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(ts,1,10)=date('now')").fetchone()
+                cumulative = conn.execute("SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0) FROM bot_events").fetchone()
+
+            paused = _bs_state_get("pause_new_entries", "0") == "1"
+            shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
+            st.markdown("### 🛠️ Bybit Swing 봇 제어")
+            st.success("신규 진입 허용" if not paused else "신규 진입 중지")
+            b1,b2,b3=st.columns(3)
+            if b1.button("⏸️ 진입 중지",use_container_width=True,disabled=paused or shutdown,key="bs_pause"):
+                _bs_state_set("pause_new_entries","1"); _bs_state_set("shutdown_when_flat","0"); st.rerun()
+            if b2.button("▶️ 진입 재개",use_container_width=True,disabled=(not paused) or shutdown,key="bs_resume"):
+                _bs_state_set("pause_new_entries","0"); _bs_state_set("shutdown_when_flat","0"); st.rerun()
+            if b3.button("⏹️ 안전 종료",use_container_width=True,disabled=shutdown,key="bs_stop"):
+                _bs_state_set("pause_new_entries","1"); _bs_state_set("shutdown_when_flat","1"); st.rerun()
+
+            m0,m1,m2,m3=st.columns(4)
+            m0.metric("전체 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
+            m1.metric("오늘 진입",f"{int(today[0] or 0)}회")
+            m2.metric("오늘 확정손익",f"{float(today[1] or 0):+.2f} USDT")
+            m3.metric("현재 포지션",str(len(positions)))
+
+            for row in positions:
+                with st.container(border=True):
+                    st.markdown(f"### {row['symbol']} · {row['strategy'] or 'P'}형 · {row['note'] or '관리 중'}")
+                    st.caption(f"진입시간(KST) {_kst_time(row['opened_at'])}")
+                    a,b,c=st.columns(3)
+                    a.metric("평단",format(float(row['avg_price']),'.10g'))
+                    b.metric("현재가",'-' if row['last_price'] is None else format(float(row['last_price']),'.10g'))
+                    c.metric("가격 변동",'-' if row['unrealized_pct'] is None else f"{float(row['unrealized_pct']):+.2f}%")
+            if not positions:
+                st.info("현재 Bybit Swing PAPER 보유 포지션이 없습니다.")
+
+            st.markdown("### 📒 Bybit Swing PAPER 매매기록")
+            grouped={}
+            for e in reversed(list(history)):
+                grouped.setdefault(e['trade_id'] or f"legacy-{e['symbol']}",[]).append(e)
+            names={"ENTRY":"최초 진입","REBOUND_ADD":"순환추가","CYCLE_REDUCE":"추가분 회수","TP1":"TP1 익절","TP2":"TP2 익절","STOP":"손절","BE_EXIT":"본절 보호 종료","FLAT_EXIT_75M":"정체 종료","TIME_EXIT":"시간 종료"}
+            for tid,events in list(reversed(list(grouped.items())))[:20]:
+                first=events[0]; total=sum(float(x['realized_pnl'] or 0) for x in events)
+                closed=any(x['event'] in {"TP2","STOP","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT"} for x in events)
+                with st.expander(f"{first['symbol']} · {'종료' if closed else '진행 중'} · {total:+.2f} USDT",expanded=False):
+                    for e in events:
+                        try: d=json.loads(e['details'] or '{}')
+                        except Exception: d={}
+                        when=_kst_time(e['ts']); label=names.get(e['event'],e['event'])
+                        if e['event']=='ENTRY':
+                            st.write(f"① {when} · {label} · 진입가 {float(e['price']):.10g} · 증거금 {float(d.get('margin_usdt',0)):.2f} USDT · 수량 {float(e['qty']):.8g}")
+                        elif e['event']=='REBOUND_ADD':
+                            st.write(f"② {when} · {label} · 추가가 {float(e['price']):.10g} · 평단 {float(d.get('previous_avg',0)):.10g} → {float(d.get('new_avg',0)):.10g}")
+                        elif e['event']=='CYCLE_REDUCE':
+                            st.write(f"③ {when} · {label} · 회수가 {float(e['price']):.10g} · 손익 {float(e['realized_pnl'] or 0):+.2f} USDT")
+                        elif e['event'] in names:
+                            st.write(f"④ {when} · {label} · 청산가 {float(e['price']):.10g} · 이번 손익 {float(e['realized_pnl'] or 0):+.2f} USDT · 누적 {float(d.get('trade_total_realized_pnl',total)):+.2f} USDT")
+                    st.caption("표시된 한국시간으로 Bybit 15분 차트에서 진입·TP·손절 봉을 바로 비교할 수 있습니다.")
+
+            with st.expander("최근 Bybit Swing 기록",expanded=False):
+                for e in recent_events:
+                    st.write(f"{_kst_time(e['ts'])} KST · {e['symbol'] or '-'} · {e['event']} · {e['details'] or ''}")
+        except Exception as exc:
+            st.warning(f"Bybit Swing 상태 읽기 실패: {exc}")
+    else:
+        st.info("run_bybit_swing_bot.py를 한 번 실행하면 Bybit Swing 상태가 표시됩니다.")
 
 st.caption("Bybit 실제 포지션이 원본입니다. 외부 진입 포지션에는 프로그램이 TP·SL을 임의 설정하지 않습니다.")
