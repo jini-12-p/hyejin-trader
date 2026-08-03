@@ -82,9 +82,15 @@ class DailyConfig:
     tp2_pct: float = 3.0
     hard_stop_pct: float = 1.5
     breakeven_stop_pct: float = 0.1
+    staged_stop_enabled: bool = True
+    stage1_stop_pct: float = 1.5
+    stage1_stop_fraction: float = 0.5
+    final_stop_pct: float = 2.3
+    recovery_exit_loss_pct: float = 0.3
     max_hold_hours: int = 3
     daily_loss_limit_usdt: float = 12.0
     max_consecutive_losses: int = 3
+    loss_cooldown_minutes: int = 60
     paper_consecutive_loss_warning_only: bool = True
     same_symbol_cooldown_minutes: int = 30
     min_balance_to_trade: float = 90.0
@@ -108,7 +114,10 @@ class DailyConfig:
     flat_min_favorable_pct: float = 0.40
     min_pullback_from_high_pct: float = 0.30
     max_pullback_from_high_pct: float = 6.00
-    max_entry_candle_gain_pct: float = 1.40
+    min_entry_candle_gain_pct: float = 0.15
+    max_entry_candle_gain_pct: float = 0.70
+    min_close_location_pct: float = 65.0
+    max_upper_wick_ratio: float = 0.35
     max_near_high_pct: float = 0.15
     min_rebound_from_low_pct: float = 0.25
     rebound_min_volume_ratio: float = 0.9
@@ -189,6 +198,7 @@ def init_db() -> None:
         _ensure_column(conn, "bot_positions", "highest_price", "REAL")
         _ensure_column(conn, "bot_positions", "cycle_anchor_price", "REAL")
         _ensure_column(conn, "bot_positions", "trade_id", "TEXT")
+        _ensure_column(conn, "bot_positions", "stop_stage1_done", "INTEGER DEFAULT 0")
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_events", "trade_id", "TEXT")
@@ -324,20 +334,22 @@ def indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def confirmed(df: pd.DataFrame) -> pd.DataFrame:
-    if "confirm" in df:
-        c = df[df["confirm"].astype(str) == "1"]
-        return c if len(c) >= 3 else df.iloc[:-1]
-    return df.iloc[:-1]
+    """Bybit kline의 마지막 행은 진행 중인 봉이므로 항상 제외한다.
+
+    이전 버전은 API에서 임의로 넣은 confirm=1 값을 신뢰해 미완성 봉을
+    진입 판단에 사용했고, 이 때문에 진입 직후 신호가 뒤집힐 수 있었다.
+    """
+    return df.iloc[:-1].copy() if len(df) > 1 else df.iloc[0:0].copy()
 
 
 def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[str | None, float, dict[str, Any]]:
-    """24시간 상승 종목이 충분히 눌린 뒤 재반등할 때만 진입한다."""
+    """완성된 15분 확인봉에서만, 추격이 아닌 눌림 후 재상승을 진입한다."""
     m15 = confirmed(indicators(client.candles(symbol, "15m", 220)))
     h1 = confirmed(indicators(client.candles(symbol, "1H", 140)))
     if len(m15) < 70 or len(h1) < 70:
-        return None, 0.0, {"reason": "캔들 부족"}
+        return None, 0.0, {"reason": "완성 캔들 부족"}
 
-    row, prev = m15.iloc[-1], m15.iloc[-2]
+    row, prev, prevprev = m15.iloc[-1], m15.iloc[-2], m15.iloc[-3]
     hrow, hprev = h1.iloc[-1], h1.iloc[-2]
     price = float(row.close)
     volume_ratio = float(row.volume / row.vol_avg) if pd.notna(row.vol_avg) and row.vol_avg > 0 else 0.0
@@ -348,48 +360,75 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     pullback_from_high = (recent_high / price - 1) * 100 if price > 0 else 99.0
     rebound_from_low = (price / recent_low - 1) * 100 if recent_low > 0 else 0.0
     entry_candle_gain = (float(row.close) / float(row.open) - 1) * 100 if float(row.open) > 0 else 99.0
-    distance_to_high = (recent_high / price - 1) * 100 if price > 0 else 0.0
+    distance_to_high = pullback_from_high
     one_hour_move = abs(float(row.close / m15.iloc[-5].close - 1)) * 100
-    candle_range = abs(float(row.high / row.low - 1)) * 100 if float(row.low) > 0 else 99.0
+    recent4h_high = float(recent.high.max())
+    recent4h_low = float(recent.low.min())
+    recent_4h_range = (recent4h_high / recent4h_low - 1) * 100 if recent4h_low > 0 else 0.0
+    candle_range_abs = float(row.high - row.low)
+    candle_range_pct = abs(float(row.high / row.low - 1)) * 100 if float(row.low) > 0 else 99.0
+    close_location_pct = ((float(row.close) - float(row.low)) / candle_range_abs * 100) if candle_range_abs > 0 else 0.0
+    upper_wick_ratio = ((float(row.high) - float(row.close)) / candle_range_abs) if candle_range_abs > 0 else 1.0
 
-    h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20)
+    ticker = client.ticker(symbol)
+    try:
+        change_24h_pct = float(ticker.get("price24hPcnt") or 0) * 100
+    except (TypeError, ValueError):
+        change_24h_pct = math.nan
+
+    required_values = [row.ema9, row.ema20, row.ema60, hrow.ema20, hrow.ema60,
+                       row.rsi, row.vol_avg, price, change_24h_pct, one_hour_move, recent_4h_range]
+    data_complete = bool(all(pd.notna(v) and math.isfinite(float(v)) for v in required_values))
+
+    h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20 and hrow.close >= hrow.ema20)
     pullback_ok = bool(cfg.min_pullback_from_high_pct <= pullback_from_high <= cfg.max_pullback_from_high_pct)
-    not_chasing = bool(entry_candle_gain <= cfg.max_entry_candle_gain_pct and distance_to_high >= cfg.max_near_high_pct)
-    rebound = bool(row.close > row.open and row.close > prev.close and row.close >= row.ema9)
-    momentum_ok = bool(row.rsi >= 40 and row.rsi <= 75 and row.rsi >= prev.rsi)
-    volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
-    not_extreme = bool(one_hour_move <= cfg.max_recent_1h_move_pct and candle_range <= 4.0)
-
-    # 반등봉 다음 마감봉이 저점과 종가를 유지해야 진입한다.
-    prevprev = m15.iloc[-3]
+    candle_gain_ok = bool(cfg.min_entry_candle_gain_pct <= entry_candle_gain <= cfg.max_entry_candle_gain_pct)
+    not_chasing = bool(distance_to_high >= cfg.max_near_high_pct and candle_gain_ok)
     rebound_setup = bool(prev.close > prev.open and prev.close > prevprev.close and prev.close >= prev.ema9)
-    confirmation_hold = bool(row.low >= prev.low and row.close >= prev.close * 0.998 and row.close > row.open)
-    rebound = bool(rebound and (not cfg.require_rebound_confirmation_candle or (rebound_setup and confirmation_hold)))
+    confirmation_hold = bool(row.low >= prev.low and row.close > prev.close and row.close > row.open and row.close >= row.ema9)
+    rebound = bool(rebound_setup and (confirmation_hold if cfg.require_rebound_confirmation_candle else row.close > row.open))
+    momentum_ok = bool(42 <= row.rsi <= 70 and row.rsi >= prev.rsi)
+    volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
     recent_volumes = m15["volume"].tail(3).tolist()
     volume_declining_3 = bool(len(recent_volumes) == 3 and recent_volumes[0] > recent_volumes[1] > recent_volumes[2])
     volume_trend_ok = bool(not cfg.reject_three_bar_volume_decline or not volume_declining_3)
-    movement_ok = bool(one_hour_move >= cfg.min_recent_1h_move_pct)
+    movement_ok = bool(cfg.min_recent_1h_move_pct <= one_hour_move <= cfg.max_recent_1h_move_pct)
+    candle_quality_ok = bool(close_location_pct >= cfg.min_close_location_pct and upper_wick_ratio <= cfg.max_upper_wick_ratio)
+    not_extreme = bool(candle_range_pct <= 4.0)
 
     score = (
-        (25 if h1_up else 0)
-        + (25 if pullback_ok else 0)
-        + (25 if rebound else 0)
-        + (10 if momentum_ok else 0)
-        + min(10, volume_ratio * 7)
-        + min(5, rebound_from_low * 4)
+        (20 if h1_up else 0) + (15 if pullback_ok else 0) + (20 if rebound else 0)
+        + (10 if momentum_ok else 0) + min(10, max(0.0, volume_ratio) * 8)
+        + (10 if candle_gain_ok else 0) + (10 if candle_quality_ok else 0)
+        + (5 if data_complete else 0)
     )
-    ok = bool(h1_up and pullback_ok and not_chasing and rebound and momentum_ok and volume_ok and volume_trend_ok and movement_ok and not_extreme and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 65)
+    checks = {
+        "data_complete": data_complete, "h1_up": h1_up, "pullback_ok": pullback_ok,
+        "rebound": rebound, "momentum_ok": momentum_ok, "volume_ok": volume_ok,
+        "volume_trend_ok": volume_trend_ok, "movement_ok": movement_ok,
+        "candle_gain_ok": candle_gain_ok, "candle_quality_ok": candle_quality_ok,
+        "not_chasing": not_chasing, "not_extreme": not_extreme,
+    }
+    rejected = [name for name, passed in checks.items() if not passed]
+    ok = bool(all(checks.values()) and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 75)
     strategy = "P" if ok else None
     details = {
         "price": price, "strategy": strategy, "score": round(float(score), 2),
-        "h1_up": h1_up, "pullback_ok": pullback_ok, "rebound": rebound,
-        "not_chasing": not_chasing, "volume_ok": volume_ok, "volume_trend_ok": volume_trend_ok, "movement_ok": movement_ok,
-        "rsi": round(float(row.rsi), 2), "volume_ratio": round(volume_ratio, 2),
+        **checks, "rejected_conditions": rejected,
+        "rsi": round(float(row.rsi), 2), "ema9": float(row.ema9),
+        "ema20": float(row.ema20), "ema60": float(row.ema60),
+        "volume_ratio": round(volume_ratio, 2), "change_24h_pct": round(change_24h_pct, 2),
+        "recent_1h_move_pct": round(one_hour_move, 2), "recent_4h_range_pct": round(recent_4h_range, 2),
+        "pullback_pct": round(pullback_from_high, 2), "rebound_pct": round(rebound_from_low, 2),
         "pullback_from_high_pct": round(pullback_from_high, 2),
         "rebound_from_low_pct": round(rebound_from_low, 2),
         "entry_candle_gain_pct": round(entry_candle_gain, 2),
         "distance_to_recent_high_pct": round(distance_to_high, 2),
-        "one_hour_move_pct": round(one_hour_move, 2), "volume_declining_3": volume_declining_3, "confirmation_hold": confirmation_hold,
+        "one_hour_move_pct": round(one_hour_move, 2),
+        "close_location_pct": round(close_location_pct, 2),
+        "upper_wick_ratio": round(upper_wick_ratio, 3),
+        "volume_declining_3": volume_declining_3, "confirmation_hold": confirmation_hold,
+        "reason": "조건 통과" if ok else ", ".join(rejected),
     }
     return strategy, float(score), details
 
@@ -605,6 +644,24 @@ class DailyBot:
             break
         return count
 
+    def loss_cooldown_active(self) -> bool:
+        """연속 손절 3회 뒤 설정 시간 동안 신규 진입을 쉬어 시장 국면 전환을 기다린다."""
+        if self.consecutive_losses() < self.cfg.max_consecutive_losses:
+            return False
+        with db() as conn:
+            row = conn.execute(
+                """SELECT updated_at FROM bot_positions
+                   WHERE status='CLOSED' AND note IN ('STOP','BE_EXIT')
+                   ORDER BY updated_at DESC LIMIT 1"""
+            ).fetchone()
+        if not row or not row["updated_at"]:
+            return False
+        try:
+            last_loss = datetime.fromisoformat(row["updated_at"])
+            return datetime.now(timezone.utc) - last_loss < timedelta(minutes=max(0, self.cfg.loss_cooldown_minutes))
+        except (TypeError, ValueError):
+            return False
+
     def symbol_in_cooldown(self, symbol: str) -> bool:
         """같은 종목을 종료한 뒤 설정 시간 동안 재진입하지 않는다."""
         minutes = max(0, int(self.cfg.same_symbol_cooldown_minutes))
@@ -645,11 +702,11 @@ class DailyBot:
                 """INSERT INTO bot_positions(
                     symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,
                     last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
-                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id,stop_stage1_done
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, "OPEN", utc_now(), utc_now(), price, qty, self.cfg.position_margin_usdt, 0, 0,
                  price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
-                 price, qty, 0.0, 0.0, price, price, price, trade_id),
+                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0),
             )
         signal_details = signal_details or {}
         details = json.dumps({
@@ -737,10 +794,22 @@ class DailyBot:
                     (utc_now(), price, reason, total_realized, row["symbol"]),
                 )
             else:
-                conn.execute(
-                    "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
-                    (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
-                )
+                if reason == "TP1":
+                    conn.execute(
+                        "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
+                        (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
+                    )
+                elif reason == "STOP_HALF":
+                    # 1차 손절은 TP1 완료로 처리하지 않는다. 그렇지 않으면 다음 틱에 BE_EXIT가 잘못 발동한다.
+                    conn.execute(
+                        "UPDATE bot_positions SET total_qty=?,stop_stage1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
+                        (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE bot_positions SET total_qty=?,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
+                        (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
+                    )
         details = json.dumps({"exit_price": price,
                               "detected_market_price": detected_price if detected_price is not None else price,
                               "configured_trigger_price": trigger_price,
@@ -779,7 +848,8 @@ class DailyBot:
             # 순환 추가분을 이미 회수했다면 다시 밀린 뒤 새 반등이 확인될 때 최대 설정 횟수까지 반복한다.
             if (self.cfg.rebound_add_enabled and float(row["add_qty"] or 0) <= 0
                     and int(row["dca_count"] or 0) < self.cfg.max_cycle_adds
-                    and int(row["tp1_done"] or 0) == 0):
+                    and int(row["tp1_done"] or 0) == 0
+                    and int(row["stop_stage1_done"] or 0) == 0):
                 anchor = float(row["cycle_anchor_price"] or base_price)
                 drawdown_pct = (lowest / anchor - 1) * 100
                 if drawdown_pct <= -abs(self.cfg.rebound_arm_drawdown_pct):
@@ -799,10 +869,21 @@ class DailyBot:
                     return trigger
                 return price
 
+            stop_stage1_done = int(row["stop_stage1_done"] or 0)
             if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
                 trigger = base_price * (1 - self.cfg.breakeven_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
-            elif base_pnl_pct <= -self.cfg.hard_stop_pct:
+            elif self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
+                trigger = base_price * (1 - self.cfg.stage1_stop_pct / 100)
+                self._close(row, paper_fill(trigger), self.cfg.stage1_stop_fraction, "STOP_HALF", price, trigger)
+            elif self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct <= -self.cfg.final_stop_pct:
+                trigger = base_price * (1 - self.cfg.final_stop_pct / 100)
+                self._close(row, paper_fill(trigger), 1.0, "FINAL_STOP", price, trigger)
+            elif self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct >= -self.cfg.recovery_exit_loss_pct:
+                # 1차 손절 뒤 본절권으로 회복하면 남은 물량을 실제 감지가격에 정리한다.
+                trigger = base_price * (1 - self.cfg.recovery_exit_loss_pct / 100)
+                self._close(row, price, 1.0, "RECOVERY_EXIT", price, trigger)
+            elif (not self.cfg.staged_stop_enabled) and base_pnl_pct <= -self.cfg.hard_stop_pct:
                 trigger = base_price * (1 - self.cfg.hard_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "STOP", price, trigger)
             elif (age_h * 60 >= self.cfg.flat_exit_minutes
@@ -828,14 +909,10 @@ class DailyBot:
             log_event("", "DAILY_STOP", mode=self.cfg.mode, details=f"pnl={self.daily_realized():.2f}")
             return
         losses = self.consecutive_losses()
-        if losses >= self.cfg.max_consecutive_losses:
-            if self.cfg.mode == "paper" and self.cfg.paper_consecutive_loss_warning_only:
-                log_event("", "CONSECUTIVE_LOSS_WARNING", mode=self.cfg.mode,
-                          details=f"losses={losses}; PAPER는 진입 계속")
-            else:
-                log_event("", "CONSECUTIVE_LOSS_STOP", mode=self.cfg.mode,
-                          details=f"losses={losses}")
-                return
+        if losses >= self.cfg.max_consecutive_losses and self.loss_cooldown_active():
+            log_event("", "LOSS_COOLDOWN", mode=self.cfg.mode,
+                      details=f"losses={losses}; {self.cfg.loss_cooldown_minutes}분 신규 진입 휴식")
+            return
         if self.cfg.mode != "paper":
             balance = self.client.balance("USDT")
             if balance <= self.cfg.emergency_stop_balance:
