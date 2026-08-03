@@ -1736,6 +1736,19 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 )
                 st.caption("파일에는 진입·추가·회수·TP·손절 시간(KST), 손익과 진입 당시 지표가 포함됩니다.")
 
+                scan_csv_path = Path(__file__).with_name("bybit_swing") / "scan_rejected.csv"
+                if scan_csv_path.exists():
+                    st.download_button(
+                        "📥 SCAN CSV",
+                        scan_csv_path.read_bytes(),
+                        file_name=f"scan_rejected_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="bs_scan_csv_download",
+                    )
+                else:
+                    st.caption("SCAN CSV file not found.")
+
             grouped={}
             for e in reversed(list(history)):
                 grouped.setdefault(e['trade_id'] or f"legacy-{e['symbol']}",[]).append(e)
