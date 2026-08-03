@@ -4,6 +4,9 @@ import json
 import math
 import sqlite3
 import time
+import os
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -87,6 +90,15 @@ class DailyConfig:
     min_balance_to_trade: float = 90.0
     emergency_stop_balance: float = 85.0
     scan_seconds: int = 60
+    manage_seconds: float = 1.0
+    paper_fill_at_trigger: bool = True
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_notify_entry: bool = True
+    telegram_notify_cycle: bool = True
+    telegram_notify_exit: bool = True
+    telegram_notify_error: bool = True
     rebound_add_enabled: bool = True
     rebound_arm_drawdown_pct: float = 0.6
     rebound_add_margin_usdt: float = 27.0
@@ -202,14 +214,100 @@ def state_flag(key: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _kst_stamp(iso_ts: str | None = None) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_ts) if iso_ts else datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(KST).strftime("%m/%d %H:%M:%S")
+    except Exception:
+        return datetime.now(KST).strftime("%m/%d %H:%M:%S")
+
+
+def telegram_notify(text: str) -> None:
+    """텔레그램 알림. 토큰은 환경변수를 우선 사용하며 실패해도 봇 거래는 계속한다."""
+    try:
+        cfg = DailyConfig.load()
+        if not cfg.telegram_enabled:
+            return
+        token = (os.getenv("TELEGRAM_BOT_TOKEN") or cfg.telegram_bot_token or "").strip()
+        chat_id = (os.getenv("TELEGRAM_CHAT_ID") or cfg.telegram_chat_id or "").strip()
+        if not token or not chat_id:
+            return
+        payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read(1)
+    except Exception:
+        # 알림 장애가 주문/포지션 관리를 막지 않도록 삼킨다.
+        return
+
+
+def _telegram_event_message(symbol: str, event: str, price: float, details: str, realized_pnl: float) -> str | None:
+    cfg = DailyConfig.load()
+    entry_events = {"ENTRY"}
+    cycle_events = {"REBOUND_ADD", "CYCLE_REDUCE"}
+    exit_events = {"TP1", "TP2", "STOP", "BE_EXIT", "FLAT_EXIT_75M", "TIME_EXIT"}
+    error_events = {"ERROR", "SCAN_ERROR", "REBOUND_CHECK_ERROR", "BOT_SAFE_STOP"}
+    if event in entry_events and not cfg.telegram_notify_entry:
+        return None
+    if event in cycle_events and not cfg.telegram_notify_cycle:
+        return None
+    if event in exit_events and not cfg.telegram_notify_exit:
+        return None
+    if event in error_events and not cfg.telegram_notify_error:
+        return None
+    if event not in entry_events | cycle_events | exit_events | error_events:
+        return None
+    try:
+        d = json.loads(details or "{}")
+    except Exception:
+        d = {}
+    labels = {
+        "ENTRY": "신규 진입", "REBOUND_ADD": "순환추가", "CYCLE_REDUCE": "추가분 회수",
+        "TP1": "TP1 익절", "TP2": "TP2 익절", "STOP": "손절",
+        "BE_EXIT": "본절 보호 종료", "FLAT_EXIT_75M": "정체 종료", "TIME_EXIT": "시간 종료",
+        "ERROR": "봇 오류", "SCAN_ERROR": "스캔 오류", "REBOUND_CHECK_ERROR": "반등 확인 오류",
+        "BOT_SAFE_STOP": "안전 종료 완료",
+    }
+    lines = [f"[{_kst_stamp()} KST] {labels.get(event, event)}", f"종목: {symbol or '-'}"]
+    if price:
+        lines.append(f"가격: {price:.10g}")
+    if event == "ENTRY":
+        lines += [
+            f"증거금: {float(d.get('margin_usdt', 0)):.2f} USDT · 레버리지 {d.get('leverage', '')}배",
+            f"점수: {float(d.get('score', 0)):.2f} · RSI {d.get('rsi', '-')} · 거래량비 {d.get('volume_ratio', '-')}배",
+            f"24h: {d.get('change_24h_pct', '-')}% · 최근1h: {d.get('recent_1h_move_pct', '-')}%",
+        ]
+    elif event == "REBOUND_ADD":
+        lines.append(f"평단: {float(d.get('previous_avg', 0)):.10g} → {float(d.get('new_avg', 0)):.10g}")
+    elif event == "CYCLE_REDUCE":
+        lines.append(f"회수손익: {realized_pnl:+.2f} USDT")
+    elif event in exit_events:
+        lines.append(f"이번 손익: {realized_pnl:+.2f} USDT")
+        lines.append(f"거래 누적: {float(d.get('trade_total_realized_pnl', realized_pnl)):+.2f} USDT")
+    elif details:
+        lines.append(str(details)[:500])
+    return "\n".join(lines)
+
+
 def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: str = "",
               details: str = "", strategy: str = "", realized_pnl: float = 0.0,
               trade_id: str = "") -> None:
+    ts = utc_now()
     with db() as conn:
         conn.execute(
             "INSERT INTO bot_events(ts,symbol,event,price,qty,mode,details,strategy,realized_pnl,trade_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (utc_now(), symbol, event, float(price), float(qty), mode, details, strategy, float(realized_pnl), trade_id),
+            (ts, symbol, event, float(price), float(qty), mode, details, strategy, float(realized_pnl), trade_id),
         )
+    msg = _telegram_event_message(symbol, event, float(price), details, float(realized_pnl))
+    if msg:
+        telegram_notify(msg)
 
 
 def indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -537,7 +635,7 @@ class DailyBot:
             client_order_id=f"HJ{int(time.time())}{symbol[:4]}"
         )
 
-    def _open(self, symbol: str, price: float, strategy: str, score: float) -> None:
+    def _open(self, symbol: str, price: float, strategy: str, score: float, signal_details: dict[str, Any] | None = None) -> None:
         qty = qty_from_margin(price, self.cfg.position_margin_usdt, self.cfg.leverage)
         self._execute(symbol, "buy", qty)
         trade_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
@@ -553,9 +651,26 @@ class DailyBot:
                  price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
                  price, qty, 0.0, 0.0, price, price, price, trade_id),
             )
+        signal_details = signal_details or {}
         details = json.dumps({
             "entry_price": price, "margin_usdt": self.cfg.position_margin_usdt,
-            "leverage": self.cfg.leverage, "qty": qty, "score": round(score, 2)
+            "leverage": self.cfg.leverage, "qty": qty, "score": round(score, 2),
+            "strategy": strategy,
+            "rsi": signal_details.get("rsi"),
+            "ema9": signal_details.get("ema9"),
+            "ema20": signal_details.get("ema20"),
+            "ema60": signal_details.get("ema60"),
+            "volume_ratio": signal_details.get("volume_ratio"),
+            "change_24h_pct": signal_details.get("change_24h_pct"),
+            "recent_1h_move_pct": signal_details.get("recent_1h_move_pct"),
+            "recent_4h_range_pct": signal_details.get("recent_4h_range_pct"),
+            "pullback_pct": signal_details.get("pullback_pct"),
+            "rebound_pct": signal_details.get("rebound_pct"),
+            "h1_up": signal_details.get("h1_up"),
+            "rebound": signal_details.get("rebound"),
+            "not_chasing": signal_details.get("not_chasing"),
+            "entry_reason": signal_details.get("reason") or signal_details.get("entry_reason") or "조건 통과",
+            "signal_snapshot": signal_details,
         }, ensure_ascii=False)
         log_event(symbol, "ENTRY", price, qty, self.cfg.mode, details, strategy, trade_id=trade_id)
 
@@ -607,7 +722,8 @@ class DailyBot:
                   details=details, strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
                   trade_id=row["trade_id"] or "")
 
-    def _close(self, row: sqlite3.Row, price: float, fraction: float, reason: str) -> None:
+    def _close(self, row: sqlite3.Row, price: float, fraction: float, reason: str,
+               detected_price: float | None = None, trigger_price: float | None = None) -> None:
         current_qty = float(row["total_qty"])
         qty = current_qty * fraction
         self._execute(row["symbol"], "sell", qty, reduce_only=True)
@@ -625,7 +741,10 @@ class DailyBot:
                     "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
                     (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
                 )
-        details = json.dumps({"exit_price": price, "avg_at_exit": float(row["avg_price"]),
+        details = json.dumps({"exit_price": price,
+                              "detected_market_price": detected_price if detected_price is not None else price,
+                              "configured_trigger_price": trigger_price,
+                              "avg_at_exit": float(row["avg_price"]),
                               "base_entry_price": float(row["base_entry_price"] or row["avg_price"]),
                               "closed_qty": qty, "fraction": fraction, "remaining_qty": remaining,
                               "step_realized_pnl": pnl_usdt, "trade_total_realized_pnl": total_realized,
@@ -673,19 +792,30 @@ class DailyBot:
                         log_event(row["symbol"], "REBOUND_CHECK_ERROR", mode=self.cfg.mode, details=str(exc))
 
             # 손절과 목표가는 최초 진입가 기준으로 관리한다.
+            # PAPER에서는 조회 주기 사이 급변으로 계획 손절폭을 초과해 기록하지 않도록
+            # 최초 터치 가격(설정 트리거가)을 체결가로 사용하고, 감지 당시 시장가는 별도 기록한다.
+            def paper_fill(trigger: float) -> float:
+                if self.cfg.mode == "paper" and self.cfg.paper_fill_at_trigger:
+                    return trigger
+                return price
+
             if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
-                self._close(row, price, 1.0, "BE_EXIT")
+                trigger = base_price * (1 - self.cfg.breakeven_stop_pct / 100)
+                self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
             elif base_pnl_pct <= -self.cfg.hard_stop_pct:
-                self._close(row, price, 1.0, "STOP")
+                trigger = base_price * (1 - self.cfg.hard_stop_pct / 100)
+                self._close(row, paper_fill(trigger), 1.0, "STOP", price, trigger)
             elif (age_h * 60 >= self.cfg.flat_exit_minutes
                   and (highest / base_price - 1) * 100 < self.cfg.flat_min_favorable_pct):
-                self._close(row, price, 1.0, "FLAT_EXIT_75M")
+                self._close(row, price, 1.0, "FLAT_EXIT_75M", price, None)
             elif age_h >= self.cfg.max_hold_hours:
-                self._close(row, price, 1.0, "TIME_EXIT")
+                self._close(row, price, 1.0, "TIME_EXIT", price, None)
             elif int(row["tp1_done"]) == 0 and base_pnl_pct >= self.cfg.tp1_pct:
-                self._close(row, price, 0.5, "TP1")
+                trigger = base_price * (1 + self.cfg.tp1_pct / 100)
+                self._close(row, paper_fill(trigger), 0.5, "TP1", price, trigger)
             elif int(row["tp1_done"]) == 1 and base_pnl_pct >= self.cfg.tp2_pct:
-                self._close(row, price, 1.0, "TP2")
+                trigger = base_price * (1 + self.cfg.tp2_pct / 100)
+                self._close(row, paper_fill(trigger), 1.0, "TP2", price, trigger)
 
     def scan_entries(self) -> None:
         if state_flag("pause_new_entries", False):
@@ -740,7 +870,7 @@ class DailyBot:
                     break
                 if symbol in open_symbols or same_risk_group(symbol, open_symbols):
                     continue
-                self._open(symbol, float(details["price"]), strategy, score)
+                self._open(symbol, float(details["price"]), strategy, score, details)
                 open_symbols.add(symbol)
                 slots -= 1
                 entries_left -= 1
@@ -752,18 +882,25 @@ class DailyBot:
     def run_forever(self) -> None:
         state_set("bot_process_status", "RUNNING")
         log_event("", "BOT_START", mode=self.cfg.mode, details=json.dumps(asdict(self.cfg), ensure_ascii=False))
+        next_scan_at = 0.0
         while True:
+            loop_started = time.monotonic()
             try:
+                # 보유 포지션 TP/SL 관리는 1초 주기로, 신규 후보 스캔은 별도 주기로 분리한다.
                 self.manage()
                 if state_flag("shutdown_when_flat", False) and not self.open_rows():
                     state_set("bot_process_status", "STOPPED")
                     state_set("shutdown_when_flat", "0")
                     log_event("", "BOT_SAFE_STOP", mode=self.cfg.mode, details="포지션 0 확인 후 안전 종료")
                     break
-                self.scan_entries()
+                now_mono = time.monotonic()
+                if now_mono >= next_scan_at:
+                    self.scan_entries()
+                    next_scan_at = now_mono + max(30.0, float(self.cfg.scan_seconds))
             except Exception as exc:
                 log_event("", "ERROR", mode=self.cfg.mode, details=str(exc))
-            time.sleep(max(30, self.cfg.scan_seconds))
+            elapsed = time.monotonic() - loop_started
+            time.sleep(max(0.1, float(self.cfg.manage_seconds) - elapsed))
 
 
 # 기존 실행 파일(run_okx_swing_bot.py)과 호환

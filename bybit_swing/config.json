@@ -177,5 +177,14 @@
   "min_recent_1h_move_pct": 0.5,
   "entry_min_volume_ratio": 0.75,
   "require_rebound_confirmation_candle": true,
-  "reject_three_bar_volume_decline": true
+  "reject_three_bar_volume_decline": true,
+  "manage_seconds": 1.0,
+  "paper_fill_at_trigger": true,
+  "telegram_enabled": false,
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "telegram_notify_entry": true,
+  "telegram_notify_cycle": true,
+  "telegram_notify_exit": true,
+  "telegram_notify_error": true
 }
