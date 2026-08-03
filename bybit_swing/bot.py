@@ -434,9 +434,20 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20 and hrow.close >= hrow.ema20)
     pullback_ok = bool(cfg.min_pullback_from_high_pct <= pullback_from_high <= cfg.max_pullback_from_high_pct)
     candle_gain_ok = bool(cfg.min_entry_candle_gain_pct <= entry_candle_gain <= cfg.max_entry_candle_gain_pct)
-    not_chasing = bool(distance_to_high >= cfg.max_near_high_pct and candle_gain_ok)
-    rebound_setup = bool(prev.close > prev.open and prev.close > prevprev.close and prev.close >= prev.ema9)
-    confirmation_hold = bool(row.low >= prev.low and row.close > prev.close and row.close > row.open and row.close >= row.ema9)
+    # v4.0.7: 과도한 진입 차단은 유지하되, 고점 이격 기준을 0.05%p만 완화한다.
+    effective_near_high_pct = max(0.08, cfg.max_near_high_pct - 0.05)
+    not_chasing = bool(distance_to_high >= effective_near_high_pct and candle_gain_ok)
+
+    # v4.0.7: 반등 판정 완화
+    # 이전 봉이 반드시 양봉일 필요는 없고, 직전 2개 봉 대비 회복하며 EMA9 위를 지키면 후보로 인정한다.
+    rebound_setup = bool(prev.close > prevprev.close and prev.close >= prev.ema9)
+    # 확인봉은 저가/종가에 아주 작은 허용폭을 두되 양봉과 EMA9 회복은 그대로 요구한다.
+    confirmation_hold = bool(
+        row.low >= prev.low * 0.998
+        and row.close >= prev.close * 0.999
+        and row.close > row.open
+        and row.close >= row.ema9
+    )
     rebound = bool(rebound_setup and (confirmation_hold if cfg.require_rebound_confirmation_candle else row.close > row.open))
     momentum_ok = bool(42 <= row.rsi <= 70 and row.rsi >= prev.rsi)
     volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
