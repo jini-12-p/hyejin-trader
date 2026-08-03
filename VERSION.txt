@@ -1,1 +1,2 @@
-4.0.4
+4.0.5
+Bybit staged stop + scan rejection CSV
