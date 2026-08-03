@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
 import sqlite3
@@ -19,6 +20,7 @@ from bybit_swing.bybit_api import BybitSwingClient, BybitSwingError
 DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
+SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
 
 
 @dataclass
@@ -157,6 +159,40 @@ def trading_day() -> str:
 def today_kst() -> str:
     # 이전 DB 컬럼명/호출과의 호환용 별칭
     return trading_day()
+
+
+def append_scan_record(symbol: str, strategy: str | None, score: float, details: dict[str, Any]) -> None:
+    """진입 후보의 통과/탈락 사유를 CSV에 누적한다."""
+    fields = [
+        "time_kst", "symbol", "result", "strategy", "score", "price",
+        "rejected_conditions", "rsi", "ema9", "ema20", "ema60",
+        "volume_ratio", "change_24h_pct", "recent_1h_move_pct",
+        "recent_4h_range_pct", "pullback_from_high_pct",
+        "rebound_from_low_pct", "entry_candle_gain_pct",
+        "distance_to_recent_high_pct", "close_location_pct",
+        "upper_wick_ratio", "confirmation_hold", "data_complete",
+    ]
+    row = {
+        "time_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": symbol,
+        "result": "SCAN_OK" if strategy else "SCAN_WAIT",
+        "strategy": strategy or "",
+        "score": round(float(score), 2),
+        "price": details.get("price", ""),
+        "rejected_conditions": ",".join(details.get("rejected_conditions") or []),
+    }
+    for key in fields:
+        if key not in row:
+            row[key] = details.get(key, "")
+    try:
+        write_header = not SCAN_REJECTED_CSV_PATH.exists() or SCAN_REJECTED_CSV_PATH.stat().st_size == 0
+        with SCAN_REJECTED_CSV_PATH.open("a", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as exc:
+        log_event(symbol, "SCAN_CSV_ERROR", mode="paper", details=str(exc))
 
 
 def db() -> sqlite3.Connection:
@@ -931,6 +967,7 @@ class DailyBot:
                 strategy, score, details = candidate_signal(self.client, symbol, self.cfg)
                 log_event(symbol, "SCAN_OK" if strategy else "SCAN_WAIT", float(details.get("price", 0)),
                           mode=self.cfg.mode, details=json.dumps(details, ensure_ascii=False), strategy=strategy or "")
+                append_scan_record(symbol, strategy, score, details)
                 if strategy:
                     candidates.append((score, symbol, strategy, details))
             except Exception as exc:
