@@ -123,7 +123,7 @@ class DailyConfig:
     max_near_high_pct: float = 0.15
     min_rebound_from_low_pct: float = 0.25
     rebound_min_volume_ratio: float = 0.9
-    entry_min_volume_ratio: float = 0.75
+    entry_min_volume_ratio: float = 0.70
     require_rebound_confirmation_candle: bool = True
     reject_three_bar_volume_decline: bool = True
     rebound_min_rsi: float = 44.0
@@ -450,6 +450,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     )
     rebound = bool(rebound_setup and (confirmation_hold if cfg.require_rebound_confirmation_candle else row.close > row.open))
     momentum_ok = bool(42 <= row.rsi <= 70 and row.rsi >= prev.rsi)
+    # v4.0.8: scan 결과에서 단독 병목이 가장 많았던 진입 거래량 기준만 소폭 완화한다.
     volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
     recent_volumes = m15["volume"].tail(3).tolist()
     volume_declining_3 = bool(len(recent_volumes) == 3 and recent_volumes[0] > recent_volumes[1] > recent_volumes[2])

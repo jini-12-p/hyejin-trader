@@ -175,7 +175,7 @@
   ],
   "paper_consecutive_loss_warning_only": false,
   "min_recent_1h_move_pct": 0.5,
-  "entry_min_volume_ratio": 0.8,
+  "entry_min_volume_ratio": 0.7,
   "require_rebound_confirmation_candle": true,
   "reject_three_bar_volume_decline": true,
   "manage_seconds": 1.0,
