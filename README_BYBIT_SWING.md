@@ -1,3 +1,10 @@
+# Bybit Swing v4.0.6
+
+- 봇 시작 즉시 `bybit_swing/scan_rejected.csv` 생성
+- 첫 스캔 전에도 CSV 헤더 확인 가능
+- 각 스캔 결과를 append 후 즉시 flush/fsync
+- 단계형 손절(STOP_HALF / RECOVERY_EXIT / FINAL_STOP) 유지
+
 # Bybit Swing PAPER v4.0.4
 
 ## 핵심 변경
