@@ -117,7 +117,7 @@ class DailyConfig:
     min_pullback_from_high_pct: float = 0.30
     max_pullback_from_high_pct: float = 6.00
     min_entry_candle_gain_pct: float = 0.15
-    max_entry_candle_gain_pct: float = 0.70
+    max_entry_candle_gain_pct: float = 0.90
     min_close_location_pct: float = 65.0
     max_upper_wick_ratio: float = 0.35
     max_near_high_pct: float = 0.15

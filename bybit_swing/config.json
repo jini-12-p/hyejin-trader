@@ -110,7 +110,7 @@
   "flat_min_favorable_pct": 0.45,
   "min_pullback_from_high_pct": 0.3,
   "max_pullback_from_high_pct": 6.0,
-  "max_entry_candle_gain_pct": 0.7,
+  "max_entry_candle_gain_pct": 0.9,
   "max_near_high_pct": 0.15,
   "min_rebound_from_low_pct": 0.25,
   "rebound_min_volume_ratio": 0.9,
