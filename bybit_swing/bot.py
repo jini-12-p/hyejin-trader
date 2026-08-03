@@ -431,7 +431,12 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                        row.rsi, row.vol_avg, price, change_24h_pct, one_hour_move, recent_4h_range]
     data_complete = bool(all(pd.notna(v) and math.isfinite(float(v)) for v in required_values))
 
-    h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20 and hrow.close >= hrow.ema20)
+    # v4.0.11: 1시간 추세는 EMA20>EMA60을 유지하되,
+    # EMA20 상승 또는 종가의 EMA20 회복 중 하나만 충족해도 허용한다.
+    h1_up = bool(
+        hrow.ema20 > hrow.ema60
+        and (hrow.ema20 >= hprev.ema20 or hrow.close >= hrow.ema20)
+    )
     pullback_ok = bool(cfg.min_pullback_from_high_pct <= pullback_from_high <= cfg.max_pullback_from_high_pct)
     candle_gain_ok = bool(cfg.min_entry_candle_gain_pct <= entry_candle_gain <= cfg.max_entry_candle_gain_pct)
     # v4.0.7: 과도한 진입 차단은 유지하되, 고점 이격 기준을 0.05%p만 완화한다.
