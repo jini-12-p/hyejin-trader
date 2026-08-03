@@ -448,7 +448,11 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and row.close > row.open
         and row.close >= row.ema9
     )
-    rebound = bool(rebound_setup and (confirmation_hold if cfg.require_rebound_confirmation_candle else row.close > row.open))
+    # v4.0.10: 확인봉 자체가 안정적으로 버티면 이전 봉 반등조건이 부족해도 진입 후보로 인정한다.
+    rebound = bool(
+        confirmation_hold
+        or (rebound_setup and row.close > row.open)
+    )
     momentum_ok = bool(42 <= row.rsi <= 70 and row.rsi >= prev.rsi)
     # v4.0.8: scan 결과에서 단독 병목이 가장 많았던 진입 거래량 기준만 소폭 완화한다.
     volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
