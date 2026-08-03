@@ -1,1 +1,2 @@
-v4.0.0-bybit-swing-paper
+v4.0.2
+Bybit fast TP/SL + CSV/JSON journal + Telegram alerts

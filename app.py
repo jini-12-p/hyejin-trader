@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import io
+import csv
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -1633,6 +1635,11 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
             )
             st.caption("강화 조건: 최근 1시간 0.5% 이상 움직임 · 반등 다음 봉 유지 확인 · 3봉 거래량 연속감소 제외")
             st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
+            tg_on = bool(bs_cfg.get("telegram_enabled", False))
+            st.caption(
+                "텔레그램 알림: " + ("사용 설정됨" if tg_on else "꺼짐") +
+                " · 실제 토큰/채팅ID는 서버 환경변수 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID 사용 권장"
+            )
         except Exception as exc:
             st.warning(f"Bybit Swing 설정 확인 실패: {exc}")
 
@@ -1676,6 +1683,59 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 st.info("현재 Bybit Swing PAPER 보유 포지션이 없습니다.")
 
             st.markdown("### 📒 Bybit Swing PAPER 매매기록")
+
+            # 전체 이벤트를 분석용 CSV/JSON으로 내려받는다. 시간은 한국시간으로 변환한다.
+            export_rows=[]
+            for e in reversed(list(history)):
+                try:
+                    d=json.loads(e['details'] or '{}')
+                except Exception:
+                    d={}
+                snap=d.get('signal_snapshot') if isinstance(d.get('signal_snapshot'),dict) else {}
+                export_rows.append({
+                    'time_kst': _kst_time(e['ts']),
+                    'trade_id': e['trade_id'] or '',
+                    'symbol': e['symbol'] or '',
+                    'event': e['event'],
+                    'strategy': e['strategy'] or '',
+                    'price': float(e['price'] or 0),
+                    'qty': float(e['qty'] or 0),
+                    'realized_pnl_usdt': float(e['realized_pnl'] or 0),
+                    'entry_price': d.get('entry_price',''),
+                    'avg_at_exit': d.get('avg_at_exit',''),
+                    'configured_trigger_price': d.get('configured_trigger_price',''),
+                    'detected_market_price': d.get('detected_market_price',''),
+                    'score': d.get('score',''),
+                    'rsi': d.get('rsi', snap.get('rsi','')),
+                    'ema9': d.get('ema9', snap.get('ema9','')),
+                    'ema20': d.get('ema20', snap.get('ema20','')),
+                    'ema60': d.get('ema60', snap.get('ema60','')),
+                    'volume_ratio': d.get('volume_ratio', snap.get('volume_ratio','')),
+                    'change_24h_pct': d.get('change_24h_pct', snap.get('change_24h_pct','')),
+                    'recent_1h_move_pct': d.get('recent_1h_move_pct', snap.get('recent_1h_move_pct','')),
+                    'recent_4h_range_pct': d.get('recent_4h_range_pct', snap.get('recent_4h_range_pct','')),
+                    'pullback_pct': d.get('pullback_pct', snap.get('pullback_pct','')),
+                    'rebound_pct': d.get('rebound_pct', snap.get('rebound_pct','')),
+                    'entry_reason': d.get('entry_reason',''),
+                    'details_json': json.dumps(d,ensure_ascii=False),
+                })
+            if export_rows:
+                out=io.StringIO()
+                writer=csv.DictWriter(out,fieldnames=list(export_rows[0].keys()))
+                writer.writeheader(); writer.writerows(export_rows)
+                dl1,dl2=st.columns(2)
+                dl1.download_button(
+                    "📥 매매기록 CSV", out.getvalue().encode('utf-8-sig'),
+                    file_name=f"bybit_swing_trades_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.csv",
+                    mime="text/csv", use_container_width=True, key="bs_csv_download"
+                )
+                dl2.download_button(
+                    "📥 매매기록 JSON", json.dumps(export_rows,ensure_ascii=False,indent=2).encode('utf-8'),
+                    file_name=f"bybit_swing_trades_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.json",
+                    mime="application/json", use_container_width=True, key="bs_json_download"
+                )
+                st.caption("파일에는 진입·추가·회수·TP·손절 시간(KST), 손익과 진입 당시 지표가 포함됩니다.")
+
             grouped={}
             for e in reversed(list(history)):
                 grouped.setdefault(e['trade_id'] or f"legacy-{e['symbol']}",[]).append(e)
@@ -1690,6 +1750,11 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                         when=_kst_time(e['ts']); label=names.get(e['event'],e['event'])
                         if e['event']=='ENTRY':
                             st.write(f"① {when} · {label} · 진입가 {float(e['price']):.10g} · 증거금 {float(d.get('margin_usdt',0)):.2f} USDT · 수량 {float(e['qty']):.8g}")
+                            st.caption(
+                                f"진입 당시: 점수 {d.get('score','-')} · RSI {d.get('rsi','-')} · "
+                                f"거래량비 {d.get('volume_ratio','-')}배 · 24h {d.get('change_24h_pct','-')}% · "
+                                f"최근1h {d.get('recent_1h_move_pct','-')}% · 사유 {d.get('entry_reason','조건 통과')}"
+                            )
                         elif e['event']=='REBOUND_ADD':
                             st.write(f"② {when} · {label} · 추가가 {float(e['price']):.10g} · 평단 {float(d.get('previous_avg',0)):.10g} → {float(d.get('new_avg',0)):.10g}")
                         elif e['event']=='CYCLE_REDUCE':
