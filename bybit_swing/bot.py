@@ -161,17 +161,30 @@ def today_kst() -> str:
     return trading_day()
 
 
+SCAN_REJECTED_FIELDS = [
+    "time_kst", "symbol", "result", "strategy", "score", "price",
+    "rejected_conditions", "rsi", "ema9", "ema20", "ema60",
+    "volume_ratio", "change_24h_pct", "recent_1h_move_pct",
+    "recent_4h_range_pct", "pullback_from_high_pct",
+    "rebound_from_low_pct", "entry_candle_gain_pct",
+    "distance_to_recent_high_pct", "close_location_pct",
+    "upper_wick_ratio", "confirmation_hold", "data_complete",
+]
+
+def ensure_scan_rejected_csv() -> None:
+    """봇 시작 즉시 CSV 파일과 헤더를 만든다."""
+    SCAN_REJECTED_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SCAN_REJECTED_CSV_PATH.exists() and SCAN_REJECTED_CSV_PATH.stat().st_size > 0:
+        return
+    with SCAN_REJECTED_CSV_PATH.open("w", encoding="utf-8-sig", newline="") as fh:
+        csv.DictWriter(fh, fieldnames=SCAN_REJECTED_FIELDS).writeheader()
+        fh.flush()
+        os.fsync(fh.fileno())
+
 def append_scan_record(symbol: str, strategy: str | None, score: float, details: dict[str, Any]) -> None:
-    """진입 후보의 통과/탈락 사유를 CSV에 누적한다."""
-    fields = [
-        "time_kst", "symbol", "result", "strategy", "score", "price",
-        "rejected_conditions", "rsi", "ema9", "ema20", "ema60",
-        "volume_ratio", "change_24h_pct", "recent_1h_move_pct",
-        "recent_4h_range_pct", "pullback_from_high_pct",
-        "rebound_from_low_pct", "entry_candle_gain_pct",
-        "distance_to_recent_high_pct", "close_location_pct",
-        "upper_wick_ratio", "confirmation_hold", "data_complete",
-    ]
+    """진입 후보의 통과/탈락 사유를 CSV에 즉시 누적한다."""
+    ensure_scan_rejected_csv()
+    fields = SCAN_REJECTED_FIELDS
     row = {
         "time_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
         "symbol": symbol,
@@ -191,6 +204,8 @@ def append_scan_record(symbol: str, strategy: str | None, score: float, details:
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
     except Exception as exc:
         log_event(symbol, "SCAN_CSV_ERROR", mode="paper", details=str(exc))
 
@@ -512,6 +527,7 @@ class DailyBot:
         self.cfg = config or DailyConfig.load()
         self.client = BybitSwingClient(demo=self.cfg.mode != "live")
         init_db()
+        ensure_scan_rejected_csv()
 
     def _saved_active_symbols(self) -> list[str]:
         try:
