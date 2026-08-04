@@ -573,7 +573,22 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         recent_low_holding,
     ]
     hj_trend_score = sum(1 for x in hj_trend_checks if x)
-    hj_volume_ok = bool(live_volume_ratio >= cfg.hj_min_volume_ratio)
+
+    # HJ 패턴별 거래량 기준을 분리한다.
+    # 아래꼬리 반전은 이미 몸통회복·종가위치·윗꼬리 조건으로 힘을 확인하므로 완화한다.
+    hj_wick_volume_ok = bool(wick_reversal and live_volume_ratio >= 0.35)
+    hj_continuation_volume_ok = bool(
+        continuation_three_bulls and live_volume_ratio >= 0.60
+    )
+    hj_breakout_volume_ok = bool(
+        trend_breakout and live_volume_ratio >= 0.75
+    )
+    hj_volume_ok = bool(
+        hj_wick_volume_ok
+        or hj_continuation_volume_ok
+        or hj_breakout_volume_ok
+    )
+
     hj_momentum_ok = bool(45 <= float(live.rsi) <= 90)
     hj_pattern_ok = bool(wick_reversal or continuation_three_bulls or trend_breakout)
     hj_ok = bool(
@@ -661,6 +676,15 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_wick_reversal": wick_reversal,
         "hj_continuation_three_bulls": continuation_three_bulls,
         "hj_trend_breakout": trend_breakout,
+        "hj_wick_volume_ok": hj_wick_volume_ok,
+        "hj_continuation_volume_ok": hj_continuation_volume_ok,
+        "hj_breakout_volume_ok": hj_breakout_volume_ok,
+        "hj_required_volume_ratio": (
+            0.35 if wick_reversal
+            else 0.60 if continuation_three_bulls
+            else 0.75 if trend_breakout
+            else None
+        ),
         "hj_breakout_extension_pct": round(breakout_extension_pct, 2),
         "hj_live_close_location_pct": round(live_close_location_pct, 2),
         "hj_live_upper_wick_ratio": round(live_upper_wick_ratio, 3),
