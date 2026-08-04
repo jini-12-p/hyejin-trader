@@ -399,13 +399,13 @@ def confirmed(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[str | None, float, dict[str, Any]]:
-    """완성된 15분 확인봉에서만, 추격이 아닌 눌림 후 재상승을 진입한다."""
+    """24시간 상승 종목이 충분히 눌린 뒤 재반등할 때만 진입한다."""
     m15 = confirmed(indicators(client.candles(symbol, "15m", 220)))
     h1 = confirmed(indicators(client.candles(symbol, "1H", 140)))
     if len(m15) < 70 or len(h1) < 70:
-        return None, 0.0, {"reason": "완성 캔들 부족"}
+        return None, 0.0, {"reason": "캔들 부족"}
 
-    row, prev, prevprev = m15.iloc[-1], m15.iloc[-2], m15.iloc[-3]
+    row, prev = m15.iloc[-1], m15.iloc[-2]
     hrow, hprev = h1.iloc[-1], h1.iloc[-2]
     price = float(row.close)
     volume_ratio = float(row.volume / row.vol_avg) if pd.notna(row.vol_avg) and row.vol_avg > 0 else 0.0
@@ -416,144 +416,50 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     pullback_from_high = (recent_high / price - 1) * 100 if price > 0 else 99.0
     rebound_from_low = (price / recent_low - 1) * 100 if recent_low > 0 else 0.0
     entry_candle_gain = (float(row.close) / float(row.open) - 1) * 100 if float(row.open) > 0 else 99.0
-    distance_to_high = pullback_from_high
+    distance_to_high = (recent_high / price - 1) * 100 if price > 0 else 0.0
     one_hour_move = abs(float(row.close / m15.iloc[-5].close - 1)) * 100
-    recent4h_high = float(recent.high.max())
-    recent4h_low = float(recent.low.min())
-    recent_4h_range = (recent4h_high / recent4h_low - 1) * 100 if recent4h_low > 0 else 0.0
-    candle_range_abs = float(row.high - row.low)
-    candle_range_pct = abs(float(row.high / row.low - 1)) * 100 if float(row.low) > 0 else 99.0
-    close_location_pct = ((float(row.close) - float(row.low)) / candle_range_abs * 100) if candle_range_abs > 0 else 0.0
-    upper_wick_ratio = ((float(row.high) - float(row.close)) / candle_range_abs) if candle_range_abs > 0 else 1.0
-    ema9_distance_pct = (
-        (price / float(row.ema9) - 1) * 100
-        if pd.notna(row.ema9) and float(row.ema9) > 0 else 99.0
-    )
+    candle_range = abs(float(row.high / row.low - 1)) * 100 if float(row.low) > 0 else 99.0
 
-    # 직전 종가보다 계속 높아진 봉의 연속 개수.
-    rising_close_streak = 0
-    recent_closes = [float(x) for x in m15["close"].tail(6).tolist()]
-    for idx in range(len(recent_closes) - 1, 0, -1):
-        if recent_closes[idx] > recent_closes[idx - 1]:
-            rising_close_streak += 1
-        else:
-            break
-
-    ticker = client.ticker(symbol)
-    try:
-        change_24h_pct = float(ticker.get("price24hPcnt") or 0) * 100
-    except (TypeError, ValueError):
-        change_24h_pct = math.nan
-
-    required_values = [row.ema9, row.ema20, row.ema60, hrow.ema20, hrow.ema60,
-                       row.rsi, row.vol_avg, price, change_24h_pct, one_hour_move, recent_4h_range]
-    data_complete = bool(all(pd.notna(v) and math.isfinite(float(v)) for v in required_values))
-
-    # v4.0.11: 1시간 추세는 EMA20>EMA60을 유지하되,
-    # EMA20 상승 또는 종가의 EMA20 회복 중 하나만 충족해도 허용한다.
-    h1_up = bool(
-        hrow.ema20 > hrow.ema60
-        and (hrow.ema20 >= hprev.ema20 or hrow.close >= hrow.ema20)
-    )
+    h1_up = bool(hrow.ema20 > hrow.ema60 and hrow.ema20 >= hprev.ema20)
     pullback_ok = bool(cfg.min_pullback_from_high_pct <= pullback_from_high <= cfg.max_pullback_from_high_pct)
-    candle_gain_ok = bool(cfg.min_entry_candle_gain_pct <= entry_candle_gain <= cfg.max_entry_candle_gain_pct)
-    # v4.0.7: 과도한 진입 차단은 유지하되, 고점 이격 기준을 0.05%p만 완화한다.
-    effective_near_high_pct = max(0.08, cfg.max_near_high_pct - 0.05)
-    not_chasing = bool(distance_to_high >= effective_near_high_pct and candle_gain_ok)
-
-    # v4.0.7: 반등 판정 완화
-    # 이전 봉이 반드시 양봉일 필요는 없고, 직전 2개 봉 대비 회복하며 EMA9 위를 지키면 후보로 인정한다.
-    rebound_setup = bool(prev.close > prevprev.close and prev.close >= prev.ema9)
-    # 확인봉은 저가/종가에 아주 작은 허용폭을 두되 양봉과 EMA9 회복은 그대로 요구한다.
-    confirmation_hold = bool(
-        row.low >= prev.low * 0.998
-        and row.close >= prev.close * 0.999
-        and row.close > row.open
-        and row.close >= row.ema9
-    )
-    # v4.0.10: 확인봉 자체가 안정적으로 버티면 이전 봉 반등조건이 부족해도 진입 후보로 인정한다.
-    rebound = bool(
-        confirmation_hold
-        or (rebound_setup and row.close > row.open)
-    )
-    # v4.0.12: RSI 범위를 소폭 넓히고, 직전 봉 대비 2포인트 이내 둔화는 허용한다.
-    momentum_ok = bool(40 <= row.rsi <= 72 and row.rsi >= prev.rsi - 2.0)
-    # v4.0.8: scan 결과에서 단독 병목이 가장 많았던 진입 거래량 기준만 소폭 완화한다.
+    not_chasing = bool(entry_candle_gain <= cfg.max_entry_candle_gain_pct and distance_to_high >= cfg.max_near_high_pct)
+    rebound = bool(row.close > row.open and row.close > prev.close and row.close >= row.ema9)
+    momentum_ok = bool(row.rsi >= 40 and row.rsi <= 75 and row.rsi >= prev.rsi)
     volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
+    not_extreme = bool(one_hour_move <= cfg.max_recent_1h_move_pct and candle_range <= 4.0)
+
+    # 반등봉 다음 마감봉이 저점과 종가를 유지해야 진입한다.
+    prevprev = m15.iloc[-3]
+    rebound_setup = bool(prev.close > prev.open and prev.close > prevprev.close and prev.close >= prev.ema9)
+    confirmation_hold = bool(row.low >= prev.low and row.close >= prev.close * 0.998 and row.close > row.open)
+    rebound = bool(rebound and (not cfg.require_rebound_confirmation_candle or (rebound_setup and confirmation_hold)))
     recent_volumes = m15["volume"].tail(3).tolist()
     volume_declining_3 = bool(len(recent_volumes) == 3 and recent_volumes[0] > recent_volumes[1] > recent_volumes[2])
     volume_trend_ok = bool(not cfg.reject_three_bar_volume_decline or not volume_declining_3)
-    movement_ok = bool(cfg.min_recent_1h_move_pct <= one_hour_move <= cfg.max_recent_1h_move_pct)
-    candle_quality_ok = bool(close_location_pct >= cfg.min_close_location_pct and upper_wick_ratio <= cfg.max_upper_wick_ratio)
-    not_extreme = bool(candle_range_pct <= 4.0)
-
-    # v4.0.13:
-    # - EMA9에서 1% 넘게 벌어진 종목은 진입하지 않는다.
-    # - 종가가 3봉 이상 연속 상승한 상태라면 EMA9와 0.55% 이내일 때만 허용한다.
-    late_entry_ok = bool(
-        ema9_distance_pct <= cfg.max_ema9_distance_pct
-        and not (
-            rising_close_streak >= cfg.late_rise_streak_bars
-            and ema9_distance_pct > cfg.late_rise_streak_max_ema9_distance_pct
-        )
-    )
+    movement_ok = bool(one_hour_move >= cfg.min_recent_1h_move_pct)
 
     score = (
-        (20 if h1_up else 0) + (15 if pullback_ok else 0) + (20 if rebound else 0)
-        + (10 if momentum_ok else 0) + min(10, max(0.0, volume_ratio) * 8)
-        + (10 if candle_gain_ok else 0) + (10 if candle_quality_ok else 0)
-        + (10 if late_entry_ok else 0) + (5 if data_complete else 0)
+        (25 if h1_up else 0)
+        + (25 if pullback_ok else 0)
+        + (25 if rebound else 0)
+        + (10 if momentum_ok else 0)
+        + min(10, volume_ratio * 7)
+        + min(5, rebound_from_low * 4)
     )
-    checks = {
-        "data_complete": data_complete, "h1_up": h1_up, "pullback_ok": pullback_ok,
-        "rebound": rebound, "momentum_ok": momentum_ok, "volume_ok": volume_ok,
-        "volume_trend_ok": volume_trend_ok, "movement_ok": movement_ok,
-        "candle_gain_ok": candle_gain_ok, "candle_quality_ok": candle_quality_ok,
-        "not_chasing": not_chasing, "not_extreme": not_extreme,
-        "late_entry_ok": late_entry_ok,
-    }
-    rejected = [name for name, passed in checks.items() if not passed]
-
-    # v4.0.12: 핵심 안전조건은 반드시 통과하고,
-    # rebound / momentum / candle_quality는 3개 중 2개 이상 통과하면 허용한다.
-    core_checks = (
-        data_complete
-        and h1_up
-        and pullback_ok
-        and volume_ok
-        and volume_trend_ok
-        and movement_ok
-        and candle_gain_ok
-        and not_chasing
-        and not_extreme
-        and late_entry_ok
-    )
-    optional_passes = sum([rebound, momentum_ok, candle_quality_ok])
-    ok = bool(core_checks and optional_passes >= 2 and score >= 65)
+    ok = bool(h1_up and pullback_ok and not_chasing and rebound and momentum_ok and volume_ok and volume_trend_ok and movement_ok and not_extreme and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 65)
     strategy = "P" if ok else None
     details = {
         "price": price, "strategy": strategy, "score": round(float(score), 2),
-        **checks, "rejected_conditions": rejected,
-        "rsi": round(float(row.rsi), 2), "ema9": float(row.ema9),
-        "ema20": float(row.ema20), "ema60": float(row.ema60),
-        "volume_ratio": round(volume_ratio, 2), "change_24h_pct": round(change_24h_pct, 2),
-        "recent_1h_move_pct": round(one_hour_move, 2), "recent_4h_range_pct": round(recent_4h_range, 2),
-        "pullback_pct": round(pullback_from_high, 2), "rebound_pct": round(rebound_from_low, 2),
+        "h1_up": h1_up, "pullback_ok": pullback_ok, "rebound": rebound,
+        "not_chasing": not_chasing, "volume_ok": volume_ok, "volume_trend_ok": volume_trend_ok, "movement_ok": movement_ok,
+        "rsi": round(float(row.rsi), 2), "volume_ratio": round(volume_ratio, 2),
         "pullback_from_high_pct": round(pullback_from_high, 2),
         "rebound_from_low_pct": round(rebound_from_low, 2),
         "entry_candle_gain_pct": round(entry_candle_gain, 2),
         "distance_to_recent_high_pct": round(distance_to_high, 2),
-        "ema9_distance_pct": round(ema9_distance_pct, 3),
-        "rising_close_streak": rising_close_streak,
-        "late_entry_ok": late_entry_ok,
-        "one_hour_move_pct": round(one_hour_move, 2),
-        "close_location_pct": round(close_location_pct, 2),
-        "upper_wick_ratio": round(upper_wick_ratio, 3),
-        "volume_declining_3": volume_declining_3, "confirmation_hold": confirmation_hold,
-        "reason": "조건 통과" if ok else ", ".join(rejected),
+        "one_hour_move_pct": round(one_hour_move, 2), "volume_declining_3": volume_declining_3, "confirmation_hold": confirmation_hold,
     }
     return strategy, float(score), details
-
 
 def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
     """횡보성 작은 반등은 제외하고, 15분 구조와 거래량이 함께 회복될 때만 순환 추가한다."""
