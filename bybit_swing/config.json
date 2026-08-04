@@ -116,6 +116,7 @@
   "rebound_min_volume_ratio": 0.9,
   "rebound_min_rsi": 44.0,
   "non_crypto_base_exclusions": [
+    "AAOI",
     "AAPL",
     "ABBV",
     "ABT",
@@ -132,6 +133,7 @@
     "COIN",
     "COST",
     "CRM",
+    "CRWV",
     "CVX",
     "DIS",
     "GOOG",
@@ -170,8 +172,8 @@
     "UNH",
     "V",
     "WMT",
-    "XAU",
-    "XAG"
+    "XAG",
+    "XAU"
   ],
   "paper_consecutive_loss_warning_only": false,
   "min_recent_1h_move_pct": 0.5,
@@ -196,5 +198,8 @@
   "stage1_stop_fraction": 0.5,
   "final_stop_pct": 2.3,
   "recovery_exit_loss_pct": 0.3,
-  "strategy_version": "v4.0.12"
+  "strategy_version": "v4.0.13",
+  "max_ema9_distance_pct": 1.0,
+  "late_rise_streak_bars": 3,
+  "late_rise_streak_max_ema9_distance_pct": 0.55
 }

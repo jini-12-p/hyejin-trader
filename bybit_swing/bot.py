@@ -61,7 +61,7 @@ class DailyConfig:
         "KO", "LLY", "MA", "META", "MMM", "MRK", "MSFT", "MSTR", "MU",
         "NFLX", "NKE", "NVDA", "ORCL", "PEP", "PFE", "PLTR", "PYPL",
         "QCOM", "SBUX", "SKHYNIX", "SNDK", "SOXL", "SPY", "TSLA", "TSM",
-        "UNH", "V", "WMT", "XAU", "XAG",
+        "UNH", "V", "WMT", "XAU", "XAG", "AAOI", "CRWV",
     )
     candidate_pool: tuple[str, ...] = (
         "SOLUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT",
@@ -118,6 +118,10 @@ class DailyConfig:
     max_pullback_from_high_pct: float = 6.00
     min_entry_candle_gain_pct: float = 0.15
     max_entry_candle_gain_pct: float = 0.90
+    # v4.0.13: 이미 여러 봉 오른 뒤 EMA9에서 멀어진 추격 진입을 제한한다.
+    max_ema9_distance_pct: float = 1.00
+    late_rise_streak_bars: int = 3
+    late_rise_streak_max_ema9_distance_pct: float = 0.55
     min_close_location_pct: float = 65.0
     max_upper_wick_ratio: float = 0.35
     max_near_high_pct: float = 0.15
@@ -167,7 +171,8 @@ SCAN_REJECTED_FIELDS = [
     "volume_ratio", "change_24h_pct", "recent_1h_move_pct",
     "recent_4h_range_pct", "pullback_from_high_pct",
     "rebound_from_low_pct", "entry_candle_gain_pct",
-    "distance_to_recent_high_pct", "close_location_pct",
+    "distance_to_recent_high_pct", "ema9_distance_pct",
+    "rising_close_streak", "late_entry_ok", "close_location_pct",
     "upper_wick_ratio", "confirmation_hold", "data_complete",
 ]
 
@@ -420,6 +425,19 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     candle_range_pct = abs(float(row.high / row.low - 1)) * 100 if float(row.low) > 0 else 99.0
     close_location_pct = ((float(row.close) - float(row.low)) / candle_range_abs * 100) if candle_range_abs > 0 else 0.0
     upper_wick_ratio = ((float(row.high) - float(row.close)) / candle_range_abs) if candle_range_abs > 0 else 1.0
+    ema9_distance_pct = (
+        (price / float(row.ema9) - 1) * 100
+        if pd.notna(row.ema9) and float(row.ema9) > 0 else 99.0
+    )
+
+    # 직전 종가보다 계속 높아진 봉의 연속 개수.
+    rising_close_streak = 0
+    recent_closes = [float(x) for x in m15["close"].tail(6).tolist()]
+    for idx in range(len(recent_closes) - 1, 0, -1):
+        if recent_closes[idx] > recent_closes[idx - 1]:
+            rising_close_streak += 1
+        else:
+            break
 
     ticker = client.ticker(symbol)
     try:
@@ -469,11 +487,22 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     candle_quality_ok = bool(close_location_pct >= cfg.min_close_location_pct and upper_wick_ratio <= cfg.max_upper_wick_ratio)
     not_extreme = bool(candle_range_pct <= 4.0)
 
+    # v4.0.13:
+    # - EMA9에서 1% 넘게 벌어진 종목은 진입하지 않는다.
+    # - 종가가 3봉 이상 연속 상승한 상태라면 EMA9와 0.55% 이내일 때만 허용한다.
+    late_entry_ok = bool(
+        ema9_distance_pct <= cfg.max_ema9_distance_pct
+        and not (
+            rising_close_streak >= cfg.late_rise_streak_bars
+            and ema9_distance_pct > cfg.late_rise_streak_max_ema9_distance_pct
+        )
+    )
+
     score = (
         (20 if h1_up else 0) + (15 if pullback_ok else 0) + (20 if rebound else 0)
         + (10 if momentum_ok else 0) + min(10, max(0.0, volume_ratio) * 8)
         + (10 if candle_gain_ok else 0) + (10 if candle_quality_ok else 0)
-        + (5 if data_complete else 0)
+        + (10 if late_entry_ok else 0) + (5 if data_complete else 0)
     )
     checks = {
         "data_complete": data_complete, "h1_up": h1_up, "pullback_ok": pullback_ok,
@@ -481,6 +510,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "volume_trend_ok": volume_trend_ok, "movement_ok": movement_ok,
         "candle_gain_ok": candle_gain_ok, "candle_quality_ok": candle_quality_ok,
         "not_chasing": not_chasing, "not_extreme": not_extreme,
+        "late_entry_ok": late_entry_ok,
     }
     rejected = [name for name, passed in checks.items() if not passed]
 
@@ -496,6 +526,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and candle_gain_ok
         and not_chasing
         and not_extreme
+        and late_entry_ok
     )
     optional_passes = sum([rebound, momentum_ok, candle_quality_ok])
     ok = bool(core_checks and optional_passes >= 2 and score >= 65)
@@ -512,6 +543,9 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "rebound_from_low_pct": round(rebound_from_low, 2),
         "entry_candle_gain_pct": round(entry_candle_gain, 2),
         "distance_to_recent_high_pct": round(distance_to_high, 2),
+        "ema9_distance_pct": round(ema9_distance_pct, 3),
+        "rising_close_streak": rising_close_streak,
+        "late_entry_ok": late_entry_ok,
         "one_hour_move_pct": round(one_hour_move, 2),
         "close_location_pct": round(close_location_pct, 2),
         "upper_wick_ratio": round(upper_wick_ratio, 3),
