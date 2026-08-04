@@ -125,6 +125,7 @@
     "AMZN",
     "ASML",
     "AVGO",
+    "AXTI",
     "BA",
     "BABA",
     "BAC",
@@ -198,8 +199,14 @@
   "stage1_stop_fraction": 0.5,
   "final_stop_pct": 2.3,
   "recovery_exit_loss_pct": 0.3,
-  "strategy_version": "v4.1.0-first-entry-current-exit",
+  "strategy_version": "v4.2.0-hj-dual-strategy",
   "max_ema9_distance_pct": 1.0,
   "late_rise_streak_bars": 3,
-  "late_rise_streak_max_ema9_distance_pct": 0.55
+  "late_rise_streak_max_ema9_distance_pct": 0.55,
+  "hj_pattern_enabled": true,
+  "hj_min_volume_ratio": 0.75,
+  "hj_min_current_gain_pct": 0.45,
+  "hj_min_body_recovery_pct": 0.55,
+  "hj_min_lower_wick_body_ratio": 0.8,
+  "hj_min_trend_score": 3
 }

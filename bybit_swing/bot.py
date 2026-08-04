@@ -61,7 +61,7 @@ class DailyConfig:
         "KO", "LLY", "MA", "META", "MMM", "MRK", "MSFT", "MSTR", "MU",
         "NFLX", "NKE", "NVDA", "ORCL", "PEP", "PFE", "PLTR", "PYPL",
         "QCOM", "SBUX", "SKHYNIX", "SNDK", "SOXL", "SPY", "TSLA", "TSM",
-        "UNH", "V", "WMT", "XAU", "XAG", "AAOI", "CRWV",
+        "UNH", "V", "WMT", "XAU", "XAG", "AAOI", "CRWV", "AXTI",
     )
     candidate_pool: tuple[str, ...] = (
         "SOLUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT",
@@ -131,6 +131,12 @@ class DailyConfig:
     require_rebound_confirmation_candle: bool = True
     reject_three_bar_volume_decline: bool = True
     rebound_min_rsi: float = 44.0
+    hj_pattern_enabled: bool = True
+    hj_min_volume_ratio: float = 0.75
+    hj_min_current_gain_pct: float = 0.45
+    hj_min_body_recovery_pct: float = 0.55
+    hj_min_lower_wick_body_ratio: float = 0.80
+    hj_min_trend_score: int = 3
 
     @classmethod
     def load(cls) -> "DailyConfig":
@@ -242,6 +248,30 @@ def init_db() -> None:
             event TEXT NOT NULL, price REAL, qty REAL, mode TEXT, details TEXT
         );
         CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS stop_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            strategy TEXT,
+            stop_event TEXT NOT NULL,
+            stop_ts TEXT NOT NULL,
+            entry_price REAL,
+            stop_price REAL NOT NULL,
+            pnl_at_stop_pct REAL,
+            price_15m REAL,
+            pct_15m REAL,
+            price_30m REAL,
+            pct_30m REAL,
+            price_60m REAL,
+            pct_60m REAL,
+            price_120m REAL,
+            pct_120m REAL,
+            price_180m REAL,
+            pct_180m REAL,
+            review_label TEXT,
+            completed INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(trade_id, stop_event, stop_ts)
+        );
         """)
         _ensure_column(conn, "bot_positions", "strategy", "TEXT DEFAULT 'P'")
         _ensure_column(conn, "bot_positions", "realized_pnl", "REAL DEFAULT 0")
@@ -399,17 +429,21 @@ def confirmed(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[str | None, float, dict[str, Any]]:
-    """24시간 상승 종목이 충분히 눌린 뒤 재반등할 때만 진입한다."""
-    m15 = confirmed(indicators(client.candles(symbol, "15m", 220)))
-    h1 = confirmed(indicators(client.candles(symbol, "1H", 140)))
-    if len(m15) < 70 or len(h1) < 70:
+    """기존 반등형(P)과 혜진 추세지속형(HJ)을 독립적으로 평가한다."""
+    raw15 = indicators(client.candles(symbol, "15m", 220))
+    raw1h = indicators(client.candles(symbol, "1H", 140))
+    m15 = confirmed(raw15)
+    h1 = confirmed(raw1h)
+    if len(m15) < 70 or len(h1) < 70 or len(raw15) < 71:
         return None, 0.0, {"reason": "캔들 부족"}
 
+    # 기존 반등 전략은 마감봉 기준
     row, prev = m15.iloc[-1], m15.iloc[-2]
+    prevprev = m15.iloc[-3]
     hrow, hprev = h1.iloc[-1], h1.iloc[-2]
+
     price = float(row.close)
     volume_ratio = float(row.volume / row.vol_avg) if pd.notna(row.vol_avg) and row.vol_avg > 0 else 0.0
-
     recent = m15.tail(16)
     recent_high = float(recent.iloc[:-1].high.max())
     recent_low = float(recent.low.min())
@@ -424,12 +458,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     pullback_ok = bool(cfg.min_pullback_from_high_pct <= pullback_from_high <= cfg.max_pullback_from_high_pct)
     not_chasing = bool(entry_candle_gain <= cfg.max_entry_candle_gain_pct and distance_to_high >= cfg.max_near_high_pct)
     rebound = bool(row.close > row.open and row.close > prev.close and row.close >= row.ema9)
-    momentum_ok = bool(row.rsi >= 40 and row.rsi <= 75 and row.rsi >= prev.rsi)
+    momentum_ok = bool(40 <= row.rsi <= 75 and row.rsi >= prev.rsi)
     volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
     not_extreme = bool(one_hour_move <= cfg.max_recent_1h_move_pct and candle_range <= 4.0)
 
-    # 반등봉 다음 마감봉이 저점과 종가를 유지해야 진입한다.
-    prevprev = m15.iloc[-3]
     rebound_setup = bool(prev.close > prev.open and prev.close > prevprev.close and prev.close >= prev.ema9)
     confirmation_hold = bool(row.low >= prev.low and row.close >= prev.close * 0.998 and row.close > row.open)
     rebound = bool(rebound and (not cfg.require_rebound_confirmation_candle or (rebound_setup and confirmation_hold)))
@@ -438,62 +470,172 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     volume_trend_ok = bool(not cfg.reject_three_bar_volume_decline or not volume_declining_3)
     movement_ok = bool(one_hour_move >= cfg.min_recent_1h_move_pct)
 
-    score = (
+    # 약한 횡보 반등은 감점, 실제 상승 추세는 가점
+    ema_ordered = bool(row.ema9 > row.ema20 > row.ema60)
+    ema9_rising = bool(row.ema9 > prev.ema9 > prevprev.ema9)
+    higher_lows = bool(row.low > prev.low and prev.low >= prevprev.low)
+    higher_highs = bool(row.high > prev.high and prev.high >= prevprev.high)
+    trend_bonus = (
+        (8 if ema_ordered else -8)
+        + (6 if ema9_rising else -4)
+        + (4 if higher_lows else 0)
+        + (4 if higher_highs else 0)
+    )
+
+    p_score = (
         (25 if h1_up else 0)
         + (25 if pullback_ok else 0)
         + (25 if rebound else 0)
         + (10 if momentum_ok else 0)
         + min(10, volume_ratio * 7)
         + min(5, rebound_from_low * 4)
+        + trend_bonus
     )
-    ok = bool(h1_up and pullback_ok and not_chasing and rebound and momentum_ok and volume_ok and volume_trend_ok and movement_ok and not_extreme and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 65)
-    strategy = "P" if ok else None
+    p_ok = bool(
+        h1_up and pullback_ok and not_chasing and rebound and momentum_ok
+        and volume_ok and volume_trend_ok and movement_ok and not_extreme
+        and rebound_from_low >= cfg.min_rebound_from_low_pct and p_score >= 65
+    )
+
+    # HJ 패턴은 진행 중인 현재 15분봉을 사용한다.
+    # 강한 추세에서 긴 아래꼬리 음봉 뒤 양봉이 몸통을 회복하거나,
+    # 연속 양봉 뒤 현재 장대양봉이 힘 있게 확장하는 경우를 별도로 잡는다.
+    live = raw15.iloc[-1]
+    last = raw15.iloc[-2]
+    before = raw15.iloc[-3]
+    live_price = float(live.close)
+    live_gain = (live_price / float(live.open) - 1) * 100 if float(live.open) > 0 else 0.0
+    live_volume_ratio = float(live.volume / live.vol_avg) if pd.notna(live.vol_avg) and live.vol_avg > 0 else 0.0
+
+    last_body = abs(float(last.close - last.open))
+    last_lower_wick = max(0.0, min(float(last.open), float(last.close)) - float(last.low))
+    lower_wick_ratio = last_lower_wick / max(last_body, 1e-12)
+    last_bearish = bool(last.close < last.open)
+    body_recovery = (
+        (live_price - float(last.close)) / max(float(last.open - last.close), 1e-12)
+        if last_bearish else 0.0
+    )
+
+    live_ema_ordered = bool(live.ema9 > live.ema20 > live.ema60)
+    live_ema_rising = bool(live.ema9 > last.ema9 and live.ema20 >= last.ema20)
+    live_above_ema9 = bool(live_price >= live.ema9)
+    recent_high_rising = bool(last.high >= before.high or live.high > last.high)
+    recent_low_holding = bool(last.low >= before.low * 0.995 or live.low >= last.low)
+    live_bullish = bool(live.close > live.open)
+
+    continuation_three_bulls = bool(
+        before.close > before.open
+        and last.close > last.open
+        and live_bullish
+        and live_gain >= cfg.hj_min_current_gain_pct
+        and live.close > last.close
+    )
+    wick_reversal = bool(
+        last_bearish
+        and lower_wick_ratio >= cfg.hj_min_lower_wick_body_ratio
+        and live_bullish
+        and body_recovery >= cfg.hj_min_body_recovery_pct
+    )
+
+    hj_trend_checks = [
+        h1_up,
+        live_ema_ordered,
+        live_ema_rising,
+        live_above_ema9,
+        recent_high_rising,
+        recent_low_holding,
+    ]
+    hj_trend_score = sum(1 for x in hj_trend_checks if x)
+    hj_volume_ok = bool(live_volume_ratio >= cfg.hj_min_volume_ratio)
+    hj_momentum_ok = bool(45 <= float(live.rsi) <= 90)
+    hj_pattern_ok = bool(wick_reversal or continuation_three_bulls)
+    hj_ok = bool(
+        cfg.hj_pattern_enabled
+        and hj_pattern_ok
+        and hj_trend_score >= cfg.hj_min_trend_score
+        and hj_volume_ok
+        and hj_momentum_ok
+        and live_gain <= 4.0
+    )
+    hj_score = (
+        hj_trend_score * 10
+        + (20 if wick_reversal else 0)
+        + (20 if continuation_three_bulls else 0)
+        + min(15, live_volume_ratio * 8)
+        + min(10, max(0.0, live_gain) * 4)
+    )
+
+    if hj_ok and (not p_ok or hj_score >= p_score):
+        strategy = "HJ"
+        score = float(hj_score)
+        selected_price = live_price
+    elif p_ok:
+        strategy = "P"
+        score = float(p_score)
+        selected_price = price
+    else:
+        strategy = None
+        score = float(max(p_score, hj_score))
+        selected_price = live_price
+
+    rejected = []
+    if not strategy:
+        if not p_ok:
+            if not rebound:
+                rejected.append("rebound")
+            if not h1_up:
+                rejected.append("h1_up")
+            if not volume_ok:
+                rejected.append("volume_ok")
+            if p_score < 65:
+                rejected.append("p_score")
+        if not hj_ok:
+            if not hj_pattern_ok:
+                rejected.append("hj_pattern")
+            if hj_trend_score < cfg.hj_min_trend_score:
+                rejected.append("hj_trend")
+            if not hj_volume_ok:
+                rejected.append("hj_volume")
+
     details = {
-        "price": price, "strategy": strategy, "score": round(float(score), 2),
-        "h1_up": h1_up, "pullback_ok": pullback_ok, "rebound": rebound,
-        "not_chasing": not_chasing, "volume_ok": volume_ok, "volume_trend_ok": volume_trend_ok, "movement_ok": movement_ok,
-        "rsi": round(float(row.rsi), 2), "volume_ratio": round(volume_ratio, 2),
+        "price": selected_price,
+        "strategy": strategy,
+        "score": round(float(score), 2),
+        "entry_reason": (
+            "긴꼬리 음봉 후 양봉 몸통회복" if strategy == "HJ" and wick_reversal
+            else "연속 양봉 후 장대양봉 확장" if strategy == "HJ"
+            else "기존 반등 확인" if strategy == "P"
+            else ""
+        ),
+        "h1_up": h1_up,
+        "pullback_ok": pullback_ok,
+        "rebound": rebound,
+        "not_chasing": not_chasing,
+        "volume_ok": volume_ok,
+        "volume_trend_ok": volume_trend_ok,
+        "movement_ok": movement_ok,
+        "rsi": round(float(live.rsi if strategy == "HJ" else row.rsi), 2),
+        "volume_ratio": round(float(live_volume_ratio if strategy == "HJ" else volume_ratio), 2),
         "pullback_from_high_pct": round(pullback_from_high, 2),
         "rebound_from_low_pct": round(rebound_from_low, 2),
-        "entry_candle_gain_pct": round(entry_candle_gain, 2),
+        "entry_candle_gain_pct": round(float(live_gain if strategy == "HJ" else entry_candle_gain), 2),
         "distance_to_recent_high_pct": round(distance_to_high, 2),
-        "one_hour_move_pct": round(one_hour_move, 2), "volume_declining_3": volume_declining_3, "confirmation_hold": confirmation_hold,
+        "one_hour_move_pct": round(one_hour_move, 2),
+        "volume_declining_3": volume_declining_3,
+        "confirmation_hold": confirmation_hold,
+        "ema_ordered": ema_ordered,
+        "ema9_rising": ema9_rising,
+        "higher_lows": higher_lows,
+        "higher_highs": higher_highs,
+        "hj_wick_reversal": wick_reversal,
+        "hj_continuation_three_bulls": continuation_three_bulls,
+        "hj_trend_score": hj_trend_score,
+        "hj_body_recovery_pct": round(body_recovery * 100, 2),
+        "hj_lower_wick_body_ratio": round(lower_wick_ratio, 2),
+        "rejected_conditions": list(dict.fromkeys(rejected)),
     }
     return strategy, float(score), details
 
-def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
-    """횡보성 작은 반등은 제외하고, 15분 구조와 거래량이 함께 회복될 때만 순환 추가한다."""
-    m5 = confirmed(indicators(client.candles(symbol, "5m", 140)))
-    m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
-    if len(m5) < 50 or len(m15) < 30:
-        return False, {"reason": "반등 캔들 부족"}
-    row5, prev5 = m5.iloc[-1], m5.iloc[-2]
-    row15, prev15 = m15.iloc[-1], m15.iloc[-2]
-    recent_low = float(m5.tail(12).low.min())
-    rebound_pct = (float(row5.close) / recent_low - 1) * 100 if recent_low > 0 else 0.0
-    vol_ratio = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
-    prior_15m_high = float(m15.iloc[-4:-1].high.max())
-
-    bullish = bool(row5.close > row5.open and row15.close > row15.open)
-    break_structure = bool(row15.close > prior_15m_high and row5.close > prev5.high)
-    rsi_ok = bool(row15.rsi >= cfg.rebound_min_rsi and row15.rsi > prev15.rsi)
-    ema_ok = bool(row15.close >= row15.ema9 and row15.ema9 >= row15.ema20)
-    volume_ok = bool(vol_ratio >= cfg.rebound_min_volume_ratio)
-    rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
-    ok = bool(bullish and break_structure and rsi_ok and ema_ok and volume_ok and rebound_ok)
-    return ok, {
-        "price": float(row5.close), "bullish": bullish, "break_structure": break_structure,
-        "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
-        "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
-        "volume_ratio": round(vol_ratio, 2), "rebound_pct": round(rebound_pct, 2),
-    }
-
-
-def qty_from_margin(price: float, margin_usdt: float, leverage: int) -> float:
-    return max(0.0, margin_usdt * leverage / price)
-
-
-MEME_SYMBOLS = {"PEPEUSDT", "WIFUSDT", "BONKUSDT", "SHIBUSDT", "DOGEUSDT"}
 
 def same_risk_group(symbol: str, open_symbols: set[str]) -> bool:
     return symbol in MEME_SYMBOLS and any(s in MEME_SYMBOLS for s in open_symbols)
@@ -532,12 +674,22 @@ class DailyBot:
         ticker_ranked: list[tuple[float, str, dict[str, float]]] = []
         for ticker in self.client.tickers("SWAP"):
             symbol = str(ticker.get("symbol") or "")
-            base = symbol[:-4].upper() if symbol.endswith("USDT") else symbol.upper()
+            normalized = symbol.upper().replace("-", "").replace("_", "")
+            base = normalized[:-4] if normalized.endswith("USDT") else normalized
+            blocked_bases = {str(x).upper().replace("-", "").replace("_", "")
+                             for x in self.cfg.non_crypto_base_exclusions}
+            # 1000AXTIUSDT, AXTI-USDT 같은 변형도 차단한다.
+            non_crypto_match = any(
+                base == blocked or base.endswith(blocked) or blocked in base
+                for blocked in blocked_bases
+            )
             if (
                 symbol in excluded
-                or base in set(self.cfg.non_crypto_base_exclusions)
-                or not symbol.endswith("USDT")
+                or non_crypto_match
+                or not normalized.endswith("USDT")
             ):
+                if non_crypto_match:
+                    log_event(symbol, "NON_CRYPTO_EXCLUDED", mode=self.cfg.mode, details=f"base={base}")
                 continue
             try:
                 last = float(ticker.get("lastPrice") or 0)
@@ -850,6 +1002,95 @@ class DailyBot:
         log_event(row["symbol"], reason, price, qty, self.cfg.mode, details=details,
                   strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
                   trade_id=row["trade_id"] or "")
+        self._register_stop_review(row, reason, price)
+
+    def _register_stop_review(self, row: sqlite3.Row, stop_event: str, stop_price: float) -> None:
+        """손절 발생 후 15·30·60·120·180분 가격을 자동 추적한다."""
+        if stop_event not in {"STOP_HALF", "FINAL_STOP", "STOP", "BE_EXIT"}:
+            return
+        entry_price = float(row["base_entry_price"] or row["avg_price"] or 0)
+        pnl_at_stop_pct = ((stop_price / entry_price) - 1) * 100 if entry_price > 0 else None
+        with db() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO stop_reviews(
+                    trade_id,symbol,strategy,stop_event,stop_ts,entry_price,stop_price,pnl_at_stop_pct
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    str(row["trade_id"] or ""),
+                    str(row["symbol"]),
+                    str(row["strategy"] or ""),
+                    stop_event,
+                    utc_now(),
+                    entry_price,
+                    float(stop_price),
+                    pnl_at_stop_pct,
+                ),
+            )
+
+    def update_stop_reviews(self) -> None:
+        """미완료 손절 리뷰를 현재 시세로 채우고 3시간 뒤 자동 분류한다."""
+        milestones = (
+            (15, "price_15m", "pct_15m"),
+            (30, "price_30m", "pct_30m"),
+            (60, "price_60m", "pct_60m"),
+            (120, "price_120m", "pct_120m"),
+            (180, "price_180m", "pct_180m"),
+        )
+        with db() as conn:
+            pending = conn.execute(
+                "SELECT * FROM stop_reviews WHERE completed=0 ORDER BY stop_ts"
+            ).fetchall()
+
+        for review in pending:
+            try:
+                stopped_at = datetime.fromisoformat(str(review["stop_ts"]))
+                if stopped_at.tzinfo is None:
+                    stopped_at = stopped_at.replace(tzinfo=timezone.utc)
+                elapsed_min = (datetime.now(timezone.utc) - stopped_at).total_seconds() / 60
+                due = [
+                    (m, pcol, pctcol)
+                    for m, pcol, pctcol in milestones
+                    if elapsed_min >= m and review[pcol] is None
+                ]
+                if not due:
+                    continue
+
+                current_price = float(self.client.ticker(review["symbol"]).get("last") or 0)
+                if current_price <= 0:
+                    continue
+                stop_price = float(review["stop_price"])
+                pct_vs_stop = ((current_price / stop_price) - 1) * 100 if stop_price > 0 else 0.0
+
+                updates = []
+                values = []
+                for _, pcol, pctcol in due:
+                    updates.extend([f"{pcol}=?", f"{pctcol}=?"])
+                    values.extend([current_price, pct_vs_stop])
+
+                if elapsed_min >= 180:
+                    if pct_vs_stop >= 1.5:
+                        label = "아까운 손절"
+                    elif pct_vs_stop <= -1.5:
+                        label = "좋은 손절"
+                    else:
+                        label = "애매한 손절"
+                    updates.extend(["review_label=?", "completed=1"])
+                    values.append(label)
+
+                values.append(int(review["id"]))
+                with db() as conn:
+                    conn.execute(
+                        f"UPDATE stop_reviews SET {', '.join(updates)} WHERE id=?",
+                        values,
+                    )
+            except Exception as exc:
+                log_event(
+                    str(review["symbol"] or ""),
+                    "STOP_REVIEW_ERROR",
+                    mode=self.cfg.mode,
+                    details=str(exc),
+                    trade_id=str(review["trade_id"] or ""),
+                )
 
     def manage(self) -> None:
         for row in self.open_rows():
@@ -984,6 +1225,7 @@ class DailyBot:
 
     def run_once(self) -> None:
         self.manage()
+        self.update_stop_reviews()
         self.scan_entries()
 
     def run_forever(self) -> None:
@@ -995,6 +1237,7 @@ class DailyBot:
             try:
                 # 보유 포지션 TP/SL 관리는 1초 주기로, 신규 후보 스캔은 별도 주기로 분리한다.
                 self.manage()
+                self.update_stop_reviews()
                 if state_flag("shutdown_when_flat", False) and not self.open_rows():
                     state_set("bot_process_status", "STOPPED")
                     state_set("shutdown_when_flat", "0")
