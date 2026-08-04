@@ -1280,10 +1280,11 @@ class DailyBot:
                 append_scan_record(symbol, strategy, score, details)
                 if strategy:
                     cls = asset_class(symbol, self.cfg)
-                    strategy_label = f"{strategy}_{cls}"
+                    # 실제 진입 전략명은 기존과 동일하게 P/HJ만 사용한다.
+                    # 자산 구분은 details의 asset_class로 별도 기록한다.
                     details["asset_class"] = cls
-                    details["strategy"] = strategy_label
-                    candidates.append((score, symbol, strategy_label, details))
+                    details["strategy"] = strategy
+                    candidates.append((score, symbol, strategy, details))
             except Exception as exc:
                 # 특정 종목의 일시적 API/상장 상태 문제 때문에 전체 스캔이 멈추지 않게 한다.
                 log_event(symbol, "SCAN_ERROR", mode=self.cfg.mode, details=str(exc))
@@ -1308,7 +1309,27 @@ class DailyBot:
                 if symbol in open_symbols or same_risk_group(symbol, open_symbols):
                     continue
 
-                self._open(symbol, float(details["price"]), strategy, score, details)
+                try:
+                    log_event(
+                        symbol, "ENTRY_ATTEMPT", float(details["price"]),
+                        mode=self.cfg.mode,
+                        details=json.dumps({
+                            "strategy": strategy,
+                            "asset_class": cls,
+                            "score": score,
+                        }, ensure_ascii=False),
+                        strategy=strategy,
+                    )
+                    self._open(symbol, float(details["price"]), strategy, score, details)
+                except Exception as exc:
+                    log_event(
+                        symbol, "ENTRY_ERROR", float(details.get("price", 0)),
+                        mode=self.cfg.mode,
+                        details=f"{type(exc).__name__}: {exc}",
+                        strategy=strategy,
+                    )
+                    continue
+
                 open_symbols.add(symbol)
                 if cls == "COIN":
                     coin_open += 1
