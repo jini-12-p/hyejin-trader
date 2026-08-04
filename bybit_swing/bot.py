@@ -1290,40 +1290,43 @@ class DailyBot:
                 log_event(symbol, "SCAN_ERROR", mode=self.cfg.mode, details=str(exc))
 
         if candidates:
-            open_rows = self.open_rows()
-            open_symbols = {str(r["symbol"]) for r in open_rows}
-            coin_open = sum(1 for r in open_rows if asset_class(str(r["symbol"]), self.cfg) == "COIN")
-            stock_open = sum(1 for r in open_rows if asset_class(str(r["symbol"]), self.cfg) == "STOCK")
-            total_slots = max(0, self.cfg.max_positions - len(open_symbols))
-            entries_left = (max(0, self.cfg.max_daily_entries - self.daily_entries())
-                            if self.cfg.max_daily_entries > 0 else total_slots)
+            # v4.2에서 실제로 진입하던 단순 슬롯 방식으로 복원한다.
+            # 코인/주식형 구분은 기록만 유지하고 진입을 막는 조건으로 사용하지 않는다.
+            open_symbols = {str(r["symbol"]) for r in self.open_rows()}
+            slots = max(0, self.cfg.max_positions - len(open_symbols))
+            entries_left = (
+                max(0, self.cfg.max_daily_entries - self.daily_entries())
+                if self.cfg.max_daily_entries > 0 else slots
+            )
 
-            for score, symbol, strategy, details in sorted(candidates, reverse=True, key=lambda x: x[0]):
-                if total_slots <= 0 or entries_left <= 0:
+            for score, symbol, strategy, details in sorted(
+                candidates, reverse=True, key=lambda x: x[0]
+            ):
+                if slots <= 0 or entries_left <= 0:
                     break
-                cls = asset_class(symbol, self.cfg)
-                if cls == "COIN" and coin_open >= self.cfg.coin_max_positions:
-                    continue
-                if cls == "STOCK" and stock_open >= self.cfg.stock_max_positions:
-                    continue
                 if symbol in open_symbols or same_risk_group(symbol, open_symbols):
                     continue
 
+                cls = asset_class(symbol, self.cfg)
+                log_event(
+                    symbol, "ENTRY_ATTEMPT", float(details["price"]),
+                    mode=self.cfg.mode,
+                    details=json.dumps({
+                        "strategy": strategy,
+                        "asset_class": cls,
+                        "score": score,
+                    }, ensure_ascii=False),
+                    strategy=strategy,
+                )
                 try:
-                    log_event(
-                        symbol, "ENTRY_ATTEMPT", float(details["price"]),
-                        mode=self.cfg.mode,
-                        details=json.dumps({
-                            "strategy": strategy,
-                            "asset_class": cls,
-                            "score": score,
-                        }, ensure_ascii=False),
-                        strategy=strategy,
+                    self._open(
+                        symbol, float(details["price"]),
+                        strategy, score, details
                     )
-                    self._open(symbol, float(details["price"]), strategy, score, details)
                 except Exception as exc:
                     log_event(
-                        symbol, "ENTRY_ERROR", float(details.get("price", 0)),
+                        symbol, "ENTRY_ERROR",
+                        float(details.get("price", 0)),
                         mode=self.cfg.mode,
                         details=f"{type(exc).__name__}: {exc}",
                         strategy=strategy,
@@ -1331,11 +1334,7 @@ class DailyBot:
                     continue
 
                 open_symbols.add(symbol)
-                if cls == "COIN":
-                    coin_open += 1
-                else:
-                    stock_open += 1
-                total_slots -= 1
+                slots -= 1
                 entries_left -= 1
 
     def run_once(self) -> None:
