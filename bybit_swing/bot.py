@@ -33,7 +33,9 @@ class DailyConfig:
     )
     # 24시간 거래대금·변동성으로 실제 감시 종목을 자동 선별
     dynamic_universe: bool = True
-    universe_size: int = 15
+    universe_size: int = 40
+    coin_universe_size: int = 32
+    stock_universe_size: int = 12
     universe_refresh_minutes: int = 15
     top_gainers_pool_size: int = 50
     min_change_24h_pct: float = 2.0
@@ -62,6 +64,7 @@ class DailyConfig:
         "NFLX", "NKE", "NVDA", "ORCL", "PEP", "PFE", "PLTR", "PYPL",
         "QCOM", "SBUX", "SKHYNIX", "SNDK", "SOXL", "SPY", "TSLA", "TSM",
         "UNH", "V", "WMT", "XAU", "XAG", "AAOI", "CRWV", "AXTI",
+        "DRAM", "KORU", "COHR", "UNITREE", "AEHR", "LITE", "MUU",
     )
     candidate_pool: tuple[str, ...] = (
         "SOLUSDT", "XRPUSDT", "DOGEUSDT", "SUIUSDT",
@@ -77,7 +80,9 @@ class DailyConfig:
     mode: str = "paper"  # paper | demo | live
     leverage: int = 5
     margin_mode: str = "isolated"
-    max_positions: int = 2
+    max_positions: int = 3
+    coin_max_positions: int = 2
+    stock_max_positions: int = 1
     max_daily_entries: int = 0  # 0이면 PAPER 데이터 수집 중 횟수 제한 없음
     position_margin_usdt: float = 54.0
     tp1_pct: float = 1.5
@@ -537,6 +542,28 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and body_recovery >= cfg.hj_min_body_recovery_pct
     )
 
+    # HJ-B: strong trend -> 1~3 candle pause/pullback -> live breakout.
+    prior3 = raw15.iloc[-5:-2]
+    prior_high = float(prior3.high.max()) if len(prior3) else float(last.high)
+    prior_low = float(prior3.low.min()) if len(prior3) else float(last.low)
+    prior_range_pct = ((prior_high / prior_low) - 1) * 100 if prior_low > 0 else 99.0
+    breakout_extension_pct = ((live_price / prior_high) - 1) * 100 if prior_high > 0 else 99.0
+    live_range = max(float(live.high - live.low), 1e-12)
+    live_close_location_pct = (float(live.close - live.low) / live_range) * 100
+    live_upper_wick_ratio = max(0.0, float(live.high - live.close)) / live_range
+    pause_or_pullback = bool(
+        prior_range_pct <= 6.0
+        and min(float(x.close) for _, x in prior3.iterrows()) >= float(live.ema20) * 0.985
+    ) if len(prior3) else False
+    breakout_reclaim = bool(
+        live_bullish
+        and live_price > prior_high
+        and 0.0 <= breakout_extension_pct <= 3.5
+        and live_close_location_pct >= 62.0
+        and live_upper_wick_ratio <= 0.38
+    )
+    trend_breakout = bool(pause_or_pullback and breakout_reclaim)
+
     hj_trend_checks = [
         h1_up,
         live_ema_ordered,
@@ -548,19 +575,22 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     hj_trend_score = sum(1 for x in hj_trend_checks if x)
     hj_volume_ok = bool(live_volume_ratio >= cfg.hj_min_volume_ratio)
     hj_momentum_ok = bool(45 <= float(live.rsi) <= 90)
-    hj_pattern_ok = bool(wick_reversal or continuation_three_bulls)
+    hj_pattern_ok = bool(wick_reversal or continuation_three_bulls or trend_breakout)
     hj_ok = bool(
         cfg.hj_pattern_enabled
         and hj_pattern_ok
         and hj_trend_score >= cfg.hj_min_trend_score
         and hj_volume_ok
         and hj_momentum_ok
-        and live_gain <= 4.0
+        and live_gain <= 12.0
+        and live_close_location_pct >= 60.0
+        and live_upper_wick_ratio <= 0.40
     )
     hj_score = (
         hj_trend_score * 10
         + (20 if wick_reversal else 0)
         + (20 if continuation_three_bulls else 0)
+        + (24 if trend_breakout else 0)
         + min(15, live_volume_ratio * 8)
         + min(10, max(0.0, live_gain) * 4)
     )
@@ -602,9 +632,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "strategy": strategy,
         "score": round(float(score), 2),
         "entry_reason": (
-            "긴꼬리 음봉 후 양봉 몸통회복" if strategy == "HJ" and wick_reversal
-            else "연속 양봉 후 장대양봉 확장" if strategy == "HJ"
-            else "기존 반등 확인" if strategy == "P"
+            "긴꼬리 음봉 후 양봉 몸통회복" if strategy and strategy.startswith("HJ") and wick_reversal
+            else "짧은 조정 후 재돌파" if strategy and strategy.startswith("HJ") and trend_breakout
+            else "연속 양봉 후 장대양봉 확장" if strategy and strategy.startswith("HJ")
+            else "기존 반등 확인" if strategy and strategy.startswith("P")
             else ""
         ),
         "h1_up": h1_up,
@@ -629,12 +660,35 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "higher_highs": higher_highs,
         "hj_wick_reversal": wick_reversal,
         "hj_continuation_three_bulls": continuation_three_bulls,
+        "hj_trend_breakout": trend_breakout,
+        "hj_breakout_extension_pct": round(breakout_extension_pct, 2),
+        "hj_live_close_location_pct": round(live_close_location_pct, 2),
+        "hj_live_upper_wick_ratio": round(live_upper_wick_ratio, 3),
         "hj_trend_score": hj_trend_score,
         "hj_body_recovery_pct": round(body_recovery * 100, 2),
         "hj_lower_wick_body_ratio": round(lower_wick_ratio, 2),
         "rejected_conditions": list(dict.fromkeys(rejected)),
     }
     return strategy, float(score), details
+
+
+def symbol_base(symbol: str) -> str:
+    normalized = str(symbol).upper().replace("-", "").replace("_", "")
+    return normalized[:-4] if normalized.endswith("USDT") else normalized
+
+
+def asset_class(symbol: str, cfg: DailyConfig) -> str:
+    """Configured stock-token bases are tracked separately from crypto."""
+    base = symbol_base(symbol)
+    stock_bases = {
+        str(x).upper().replace("-", "").replace("_", "")
+        for x in cfg.non_crypto_base_exclusions
+    }
+    is_stock = any(
+        base == item or base.endswith(item) or item in base
+        for item in stock_bases
+    )
+    return "STOCK" if is_stock else "COIN"
 
 
 def same_risk_group(symbol: str, open_symbols: set[str]) -> bool:
@@ -675,22 +729,9 @@ class DailyBot:
         for ticker in self.client.tickers("SWAP"):
             symbol = str(ticker.get("symbol") or "")
             normalized = symbol.upper().replace("-", "").replace("_", "")
-            base = normalized[:-4] if normalized.endswith("USDT") else normalized
-            blocked_bases = {str(x).upper().replace("-", "").replace("_", "")
-                             for x in self.cfg.non_crypto_base_exclusions}
-            # 1000AXTIUSDT, AXTI-USDT 같은 변형도 차단한다.
-            non_crypto_match = any(
-                base == blocked or base.endswith(blocked) or blocked in base
-                for blocked in blocked_bases
-            )
-            if (
-                symbol in excluded
-                or non_crypto_match
-                or not normalized.endswith("USDT")
-            ):
-                if non_crypto_match:
-                    log_event(symbol, "NON_CRYPTO_EXCLUDED", mode=self.cfg.mode, details=f"base={base}")
+            if symbol in excluded or not normalized.endswith("USDT"):
                 continue
+            symbol_asset_class = asset_class(symbol, self.cfg)
             try:
                 last = float(ticker.get("lastPrice") or 0)
                 open24 = float(ticker.get("prevPrice24h") or 0)
@@ -720,6 +761,7 @@ class DailyBot:
                 ticker_ranked.append((ticker_score, symbol, {
                     "quote_volume": quote_vol, "range_pct": range_pct,
                     "change_pct": change_pct, "spread_pct": spread_pct,
+                    "asset_class": symbol_asset_class,
                 }))
             except (TypeError, ValueError, ZeroDivisionError):
                 continue
@@ -761,13 +803,22 @@ class DailyBot:
                 log_event(symbol, "UNIVERSE_VOL_ERROR", mode=self.cfg.mode, details=str(exc))
 
         ranked.sort(reverse=True, key=lambda x: x[0])
-        selected = [symbol for _, symbol, _ in ranked[: max(1, self.cfg.universe_size)]]
+        coin_ranked = [x for x in ranked if x[2].get("asset_class") != "STOCK"]
+        stock_ranked = [x for x in ranked if x[2].get("asset_class") == "STOCK"]
+
+        selected_rows = (
+            coin_ranked[: max(1, self.cfg.coin_universe_size)]
+            + stock_ranked[: max(0, self.cfg.stock_universe_size)]
+        )
+        selected_rows.sort(reverse=True, key=lambda x: x[0])
+        selected = [symbol for _, symbol, _ in selected_rows]
         if not selected:
             selected = list(self.cfg.symbols)
+
         state_set("active_symbols", json.dumps(selected, ensure_ascii=False))
         state_set("universe_refreshed_at", str(now_ts))
         state_set("universe_details", json.dumps(
-            [{"symbol": symbol, "score": round(score, 2), **details} for score, symbol, details in ranked[: self.cfg.universe_size]],
+            [{"symbol": symbol, "score": round(score, 2), **details} for score, symbol, details in selected_rows],
             ensure_ascii=False,
         ))
         log_event("", "UNIVERSE_REFRESH", mode=self.cfg.mode, details=json.dumps(selected, ensure_ascii=False))
@@ -1171,7 +1222,8 @@ class DailyBot:
     def scan_entries(self) -> None:
         if state_flag("pause_new_entries", False):
             return
-        if len(self.open_rows()) >= self.cfg.max_positions:
+        open_now = self.open_rows()
+        if len(open_now) >= self.cfg.max_positions:
             return
         if self.cfg.max_daily_entries > 0 and self.daily_entries() >= self.cfg.max_daily_entries:
             return
@@ -1203,24 +1255,42 @@ class DailyBot:
                           mode=self.cfg.mode, details=json.dumps(details, ensure_ascii=False), strategy=strategy or "")
                 append_scan_record(symbol, strategy, score, details)
                 if strategy:
-                    candidates.append((score, symbol, strategy, details))
+                    cls = asset_class(symbol, self.cfg)
+                    strategy_label = f"{strategy}_{cls}"
+                    details["asset_class"] = cls
+                    details["strategy"] = strategy_label
+                    candidates.append((score, symbol, strategy_label, details))
             except Exception as exc:
                 # 특정 종목의 일시적 API/상장 상태 문제 때문에 전체 스캔이 멈추지 않게 한다.
                 log_event(symbol, "SCAN_ERROR", mode=self.cfg.mode, details=str(exc))
 
         if candidates:
-            open_symbols = {str(r["symbol"]) for r in self.open_rows()}
-            slots = max(0, self.cfg.max_positions - len(open_symbols))
+            open_rows = self.open_rows()
+            open_symbols = {str(r["symbol"]) for r in open_rows}
+            coin_open = sum(1 for r in open_rows if asset_class(str(r["symbol"]), self.cfg) == "COIN")
+            stock_open = sum(1 for r in open_rows if asset_class(str(r["symbol"]), self.cfg) == "STOCK")
+            total_slots = max(0, self.cfg.max_positions - len(open_symbols))
             entries_left = (max(0, self.cfg.max_daily_entries - self.daily_entries())
-                            if self.cfg.max_daily_entries > 0 else slots)
+                            if self.cfg.max_daily_entries > 0 else total_slots)
+
             for score, symbol, strategy, details in sorted(candidates, reverse=True, key=lambda x: x[0]):
-                if slots <= 0 or entries_left <= 0:
+                if total_slots <= 0 or entries_left <= 0:
                     break
+                cls = asset_class(symbol, self.cfg)
+                if cls == "COIN" and coin_open >= self.cfg.coin_max_positions:
+                    continue
+                if cls == "STOCK" and stock_open >= self.cfg.stock_max_positions:
+                    continue
                 if symbol in open_symbols or same_risk_group(symbol, open_symbols):
                     continue
+
                 self._open(symbol, float(details["price"]), strategy, score, details)
                 open_symbols.add(symbol)
-                slots -= 1
+                if cls == "COIN":
+                    coin_open += 1
+                else:
+                    stock_open += 1
+                total_slots -= 1
                 entries_left -= 1
 
     def run_once(self) -> None:
