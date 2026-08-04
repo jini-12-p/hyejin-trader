@@ -483,10 +483,9 @@ require_password()
 st.title("📈 HJ Trader")
 st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 실제 포지션 자동 동기화")
 
-view_mode = st.radio(
-    "화면 선택", ["둘 다 보기", "Bybit만 보기", "OKX PAPER만 보기", "Bybit Swing PAPER만 보기"],
-    horizontal=True, key="main_view_mode"
-)
+# v4.0.13 UI: 현재 사용하는 Bybit Swing PAPER 화면만 표시한다.
+# 기존 Bybit 단타/OKX 코드는 삭제하지 않고 화면에서만 숨긴다.
+view_mode = "Bybit Swing PAPER만 보기"
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
