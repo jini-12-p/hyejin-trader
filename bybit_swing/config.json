@@ -195,5 +195,6 @@
   "stage1_stop_pct": 1.5,
   "stage1_stop_fraction": 0.5,
   "final_stop_pct": 2.3,
-  "recovery_exit_loss_pct": 0.3
+  "recovery_exit_loss_pct": 0.3,
+  "strategy_version": "v4.0.12"
 }

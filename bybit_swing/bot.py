@@ -458,7 +458,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         confirmation_hold
         or (rebound_setup and row.close > row.open)
     )
-    momentum_ok = bool(42 <= row.rsi <= 70 and row.rsi >= prev.rsi)
+    # v4.0.12: RSI 범위를 소폭 넓히고, 직전 봉 대비 2포인트 이내 둔화는 허용한다.
+    momentum_ok = bool(40 <= row.rsi <= 72 and row.rsi >= prev.rsi - 2.0)
     # v4.0.8: scan 결과에서 단독 병목이 가장 많았던 진입 거래량 기준만 소폭 완화한다.
     volume_ok = bool(volume_ratio >= cfg.entry_min_volume_ratio)
     recent_volumes = m15["volume"].tail(3).tolist()
@@ -482,7 +483,22 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "not_chasing": not_chasing, "not_extreme": not_extreme,
     }
     rejected = [name for name, passed in checks.items() if not passed]
-    ok = bool(all(checks.values()) and rebound_from_low >= cfg.min_rebound_from_low_pct and score >= 75)
+
+    # v4.0.12: 핵심 안전조건은 반드시 통과하고,
+    # rebound / momentum / candle_quality는 3개 중 2개 이상 통과하면 허용한다.
+    core_checks = (
+        data_complete
+        and h1_up
+        and pullback_ok
+        and volume_ok
+        and volume_trend_ok
+        and movement_ok
+        and candle_gain_ok
+        and not_chasing
+        and not_extreme
+    )
+    optional_passes = sum([rebound, momentum_ok, candle_quality_ok])
+    ok = bool(core_checks and optional_passes >= 2 and score >= 65)
     strategy = "P" if ok else None
     details = {
         "price": price, "strategy": strategy, "score": round(float(score), 2),
