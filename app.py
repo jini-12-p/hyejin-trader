@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.4-BybitSwing-Only"
+APP_VERSION = "v3.6.0"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -482,9 +482,11 @@ require_password()
 
 st.title("📈 HJ Trader")
 st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 실제 포지션 자동 동기화")
-st.success("✅ BYBIT SWING ONLY 테스트 빌드")
 
-view_mode = "Bybit Swing PAPER만 보기"
+view_mode = st.radio(
+    "화면 선택", ["둘 다 보기", "Bybit만 보기", "OKX PAPER만 보기", "Bybit Swing PAPER만 보기"],
+    horizontal=True, key="main_view_mode"
+)
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
