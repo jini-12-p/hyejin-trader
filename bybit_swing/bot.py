@@ -221,6 +221,42 @@ def append_scan_record(symbol: str, strategy: str | None, score: float, details:
         log_event(symbol, "SCAN_CSV_ERROR", mode="paper", details=str(exc))
 
 
+def append_entry_record(
+    symbol: str,
+    result: str,
+    strategy: str,
+    score: float,
+    price: float,
+    message: str = "",
+) -> None:
+    """진입 시도/성공/오류를 기존 SCAN CSV에 같은 열 구조로 기록한다."""
+    ensure_scan_rejected_csv()
+    row = {key: "" for key in SCAN_REJECTED_FIELDS}
+    row.update({
+        "time_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": symbol,
+        "result": result,
+        "strategy": strategy or "",
+        "score": round(float(score), 2),
+        "price": price,
+        "rejected_conditions": message,
+    })
+    try:
+        with SCAN_REJECTED_CSV_PATH.open("a", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(
+                fh, fieldnames=SCAN_REJECTED_FIELDS, extrasaction="ignore"
+            )
+            writer.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception as exc:
+        log_event(
+            symbol, "ENTRY_CSV_ERROR", price,
+            mode="paper", details=f"{type(exc).__name__}: {exc}",
+            strategy=strategy,
+        )
+
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
@@ -1179,14 +1215,17 @@ class DailyBot:
             return
         if self.cfg.max_daily_entries > 0 and self.daily_entries() >= self.cfg.max_daily_entries:
             return
-        if self.daily_realized() <= -abs(self.cfg.daily_loss_limit_usdt):
-            log_event("", "DAILY_STOP", mode=self.cfg.mode, details=f"pnl={self.daily_realized():.2f}")
-            return
-        losses = self.consecutive_losses()
-        if losses >= self.cfg.max_consecutive_losses and self.loss_cooldown_active():
-            log_event("", "LOSS_COOLDOWN", mode=self.cfg.mode,
-                      details=f"losses={losses}; {self.cfg.loss_cooldown_minutes}분 신규 진입 휴식")
-            return
+        # PAPER 긴급복구: 과거 손익/연속손절 기록이 신규 진입을 영구 차단하지 않게 한다.
+        if self.cfg.mode != "paper":
+            if self.daily_realized() <= -abs(self.cfg.daily_loss_limit_usdt):
+                log_event("", "DAILY_STOP", mode=self.cfg.mode,
+                          details=f"pnl={self.daily_realized():.2f}")
+                return
+            losses = self.consecutive_losses()
+            if losses >= self.cfg.max_consecutive_losses and self.loss_cooldown_active():
+                log_event("", "LOSS_COOLDOWN", mode=self.cfg.mode,
+                          details=f"losses={losses}; {self.cfg.loss_cooldown_minutes}분 신규 진입 휴식")
+                return
         if self.cfg.mode != "paper":
             balance = self.client.balance("USDT")
             if balance <= self.cfg.emergency_stop_balance:
@@ -1217,12 +1256,45 @@ class DailyBot:
             slots = max(0, self.cfg.max_positions - len(open_symbols))
             entries_left = (max(0, self.cfg.max_daily_entries - self.daily_entries())
                             if self.cfg.max_daily_entries > 0 else slots)
-            for score, symbol, strategy, details in sorted(candidates, reverse=True, key=lambda x: x[0]):
+            for score, symbol, strategy, details in sorted(
+                candidates, reverse=True, key=lambda x: x[0]
+            ):
                 if slots <= 0 or entries_left <= 0:
                     break
                 if symbol in open_symbols or same_risk_group(symbol, open_symbols):
                     continue
-                self._open(symbol, float(details["price"]), strategy, score, details)
+
+                price = float(details["price"])
+                append_entry_record(
+                    symbol, "ENTRY_ATTEMPT", strategy, score, price
+                )
+                log_event(
+                    symbol, "ENTRY_ATTEMPT", price,
+                    mode=self.cfg.mode,
+                    details=json.dumps({
+                        "strategy": strategy,
+                        "score": score,
+                        "slots": slots,
+                    }, ensure_ascii=False),
+                    strategy=strategy,
+                )
+                try:
+                    self._open(symbol, price, strategy, score, details)
+                except Exception as exc:
+                    message = f"{type(exc).__name__}: {exc}"
+                    append_entry_record(
+                        symbol, "ENTRY_ERROR", strategy, score, price, message
+                    )
+                    log_event(
+                        symbol, "ENTRY_ERROR", price,
+                        mode=self.cfg.mode, details=message,
+                        strategy=strategy,
+                    )
+                    continue
+
+                append_entry_record(
+                    symbol, "ENTRY_SUCCESS", strategy, score, price
+                )
                 open_symbols.add(symbol)
                 slots -= 1
                 entries_left -= 1
