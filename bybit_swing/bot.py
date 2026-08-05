@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "EMERGENCY-v4.2.7-qty-fix"
+BOT_RUNTIME_VERSION = "STABLE-v4.2.8-HJ-trend-filter"
 
 
 @dataclass
@@ -560,6 +560,23 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     recent_low_holding = bool(last.low >= before.low * 0.995 or live.low >= last.low)
     live_bullish = bool(live.close > live.open)
 
+    # HJ 롱 추세 필터:
+    # 하락추세 속 단순 엔골핑은 제외하고 상승 흐름 안의 반등만 허용한다.
+    hj_price_above_ema20 = bool(live_price > float(live.ema20))
+    hj_ema20_above_ema60 = bool(float(live.ema20) > float(live.ema60))
+    hj_ema20_rising_3 = bool(
+        float(live.ema20) >= float(last.ema20) >= float(before.ema20)
+    )
+    hj_rsi_ok = bool(float(live.rsi) >= 48.0)
+
+    recent_bodies = raw15["close"].sub(raw15["open"]).abs().iloc[-12:-2]
+    median_body = float(recent_bodies.median()) if len(recent_bodies) else 0.0
+    last_large_bearish = bool(
+        last_bearish
+        and median_body > 0
+        and last_body >= median_body * 1.8
+    )
+
     continuation_three_bulls = bool(
         before.close > before.open
         and last.close > last.open
@@ -588,14 +605,22 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         continuation_three_bulls and live_volume_ratio >= 0.60
     )
     hj_volume_ok = bool(hj_wick_volume_ok or hj_continuation_volume_ok)
-    hj_momentum_ok = bool(45 <= float(live.rsi) <= 90)
+    hj_momentum_ok = bool(48 <= float(live.rsi) <= 90)
     hj_pattern_ok = bool(wick_reversal or continuation_three_bulls)
+    hj_trend_filter_ok = bool(
+        hj_price_above_ema20
+        and hj_ema20_above_ema60
+        and hj_ema20_rising_3
+        and hj_rsi_ok
+        and not last_large_bearish
+    )
     hj_ok = bool(
         cfg.hj_pattern_enabled
         and hj_pattern_ok
         and hj_trend_score >= cfg.hj_min_trend_score
         and hj_volume_ok
         and hj_momentum_ok
+        and hj_trend_filter_ok
         and live_gain <= 8.0
     )
     hj_score = (
@@ -637,6 +662,16 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_trend")
             if not hj_volume_ok:
                 rejected.append("hj_volume")
+            if not hj_price_above_ema20:
+                rejected.append("hj_price_below_ema20")
+            if not hj_ema20_above_ema60:
+                rejected.append("hj_ema20_below_ema60")
+            if not hj_ema20_rising_3:
+                rejected.append("hj_ema20_not_rising")
+            if not hj_rsi_ok:
+                rejected.append("hj_rsi_below_48")
+            if last_large_bearish:
+                rejected.append("hj_after_large_bearish")
 
     details = {
         "price": selected_price,
@@ -671,6 +706,12 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_wick_reversal": wick_reversal,
         "hj_continuation_three_bulls": continuation_three_bulls,
         "hj_trend_score": hj_trend_score,
+        "hj_trend_filter_ok": hj_trend_filter_ok,
+        "hj_price_above_ema20": hj_price_above_ema20,
+        "hj_ema20_above_ema60": hj_ema20_above_ema60,
+        "hj_ema20_rising_3": hj_ema20_rising_3,
+        "hj_rsi_ok": hj_rsi_ok,
+        "hj_last_large_bearish": last_large_bearish,
         "hj_body_recovery_pct": round(body_recovery * 100, 2),
         "hj_lower_wick_body_ratio": round(lower_wick_ratio, 2),
         "rejected_conditions": list(dict.fromkeys(rejected)),
