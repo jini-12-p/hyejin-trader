@@ -406,7 +406,7 @@ def _telegram_event_message(symbol: str, event: str, price: float, details: str,
     cfg = DailyConfig.load()
     entry_events = {"ENTRY"}
     cycle_events = {"REBOUND_ADD", "CYCLE_REDUCE"}
-    exit_events = {"TP1", "TP2", "STOP", "BE_EXIT", "FLAT_EXIT_75M", "TIME_EXIT"}
+    exit_events = {"TP1", "TP2", "STOP", "STOP_HALF", "FINAL_STOP", "RECOVERY_EXIT", "BE_EXIT", "FLAT_EXIT_75M", "TIME_EXIT", "MANUAL_EXIT"}
     error_events = {"ERROR", "SCAN_ERROR", "REBOUND_CHECK_ERROR", "BOT_SAFE_STOP"}
     if event in entry_events and not cfg.telegram_notify_entry:
         return None
@@ -426,6 +426,7 @@ def _telegram_event_message(symbol: str, event: str, price: float, details: str,
         "ENTRY": "신규 진입", "REBOUND_ADD": "순환추가", "CYCLE_REDUCE": "추가분 회수",
         "TP1": "TP1 익절", "TP2": "TP2 익절", "STOP": "손절",
         "BE_EXIT": "본절 보호 종료", "FLAT_EXIT_75M": "정체 종료", "TIME_EXIT": "시간 종료",
+        "STOP_HALF": "1차 손절", "FINAL_STOP": "최종 손절", "RECOVERY_EXIT": "회복 종료", "MANUAL_EXIT": "수동 종료",
         "ERROR": "봇 오류", "SCAN_ERROR": "스캔 오류", "REBOUND_CHECK_ERROR": "반등 확인 오류",
         "BOT_SAFE_STOP": "안전 종료 완료",
     }
