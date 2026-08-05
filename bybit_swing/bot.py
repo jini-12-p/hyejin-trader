@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "STABLE-v4.2.10-DataUI-StatusFix"
+BOT_RUNTIME_VERSION = "STABLE-v4.3.0-BybitSwing-Dashboard"
 
 
 @dataclass
