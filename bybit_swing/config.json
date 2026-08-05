@@ -199,7 +199,7 @@
   "stage1_stop_fraction": 0.5,
   "final_stop_pct": 2.3,
   "recovery_exit_loss_pct": 0.3,
-  "strategy_version": "EMERGENCY-v4.2.4-runtime-fix",
+  "strategy_version": "EMERGENCY-v4.2.5-direct-entry",
   "max_ema9_distance_pct": 1.0,
   "late_rise_streak_bars": 3,
   "late_rise_streak_max_ema9_distance_pct": 0.55,
