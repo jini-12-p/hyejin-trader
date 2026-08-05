@@ -1,2 +1,2 @@
-4.0.7
-Bybit relaxed rebound + slight anti-chasing relaxation
+4.3.6
+RSI 90+ 차단 + 볼린저 상단 추격금지 + 1시간 초고변동 제외 + 3연속 손실 60분 자동정지 + 동일종목 90분 재진입 금지
