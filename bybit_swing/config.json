@@ -81,7 +81,7 @@
   "recent_volatility_prefilter_size": 40,
   "min_recent_4h_range_pct": 1.2,
   "min_avg_hourly_range_pct": 0.5,
-  "max_recent_1h_move_pct": 10.0,
+  "max_recent_1h_move_pct": 6.0,
   "slow_symbol_exclusions": [
     "AAVEUSDT",
     "ADAUSDT",
@@ -102,7 +102,7 @@
     "XRPUSDT"
   ],
   "max_consecutive_losses": 3,
-  "same_symbol_cooldown_minutes": 30,
+  "same_symbol_cooldown_minutes": 90,
   "top_gainers_pool_size": 50,
   "min_change_24h_pct": 2.0,
   "max_cycle_adds": 2,
@@ -199,7 +199,7 @@
   "stage1_stop_fraction": 0.5,
   "final_stop_pct": 2.3,
   "recovery_exit_loss_pct": 0.3,
-  "strategy_version": "STABLE-v4.3.5-ManualExit-DataCard",
+  "strategy_version": "STABLE-v4.3.6-RSI90-BBChase-VolGuard",
   "max_ema9_distance_pct": 1.0,
   "late_rise_streak_bars": 3,
   "late_rise_streak_max_ema9_distance_pct": 0.55,
@@ -209,5 +209,12 @@
   "hj_min_body_recovery_pct": 0.55,
   "hj_min_lower_wick_body_ratio": 0.8,
   "hj_min_trend_score": 3,
-  "taker_fee_rate": 0.00055
+  "taker_fee_rate": 0.00055,
+  "hj_max_rsi": 89.99,
+  "bb_chase_soft_pct": 0.5,
+  "bb_chase_hard_pct": 1.0,
+  "bb_chase_soft_rsi": 85.0,
+  "bb_chase_soft_candle_gain_pct": 2.0,
+  "bb_chase_soft_candle_range_pct": 3.0,
+  "bb_chase_soft_volume_ratio": 2.0
 }

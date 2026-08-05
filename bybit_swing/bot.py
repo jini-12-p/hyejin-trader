@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "STABLE-v4.3.0-BybitSwing-Dashboard"
+BOT_RUNTIME_VERSION = "STABLE-v4.3.6-RSI90-BBChase-VolGuard"
 
 
 @dataclass
@@ -47,7 +47,7 @@ class DailyConfig:
     recent_volatility_prefilter_size: int = 40
     min_recent_4h_range_pct: float = 1.2
     min_avg_hourly_range_pct: float = 0.50
-    max_recent_1h_move_pct: float = 10.0
+    max_recent_1h_move_pct: float = 6.0
     min_recent_1h_move_pct: float = 0.50
     # 장기 스윙에 더 어울리는 느린 종목은 데일리 후보에서 제외한다.
     slow_symbol_exclusions: tuple[str, ...] = (
@@ -95,7 +95,7 @@ class DailyConfig:
     max_consecutive_losses: int = 3
     loss_cooldown_minutes: int = 60
     paper_consecutive_loss_warning_only: bool = True
-    same_symbol_cooldown_minutes: int = 30
+    same_symbol_cooldown_minutes: int = 90
     min_balance_to_trade: float = 90.0
     emergency_stop_balance: float = 85.0
     scan_seconds: int = 60
@@ -138,6 +138,13 @@ class DailyConfig:
     hj_min_body_recovery_pct: float = 0.55
     hj_min_lower_wick_body_ratio: float = 0.80
     hj_min_trend_score: int = 3
+    hj_max_rsi: float = 89.99
+    bb_chase_soft_pct: float = 0.50
+    bb_chase_hard_pct: float = 1.00
+    bb_chase_soft_rsi: float = 85.0
+    bb_chase_soft_candle_gain_pct: float = 2.0
+    bb_chase_soft_candle_range_pct: float = 3.0
+    bb_chase_soft_volume_ratio: float = 2.0
 
     @classmethod
     def load(cls) -> "DailyConfig":
@@ -474,6 +481,10 @@ def indicators(df: pd.DataFrame) -> pd.DataFrame:
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean().replace(0, math.nan)
     out["rsi"] = (100 - 100 / (1 + gain / loss)).fillna(50)
     out["vol_avg"] = out["volume"].rolling(20).mean()
+    out["bb_mid"] = out["close"].rolling(20).mean()
+    bb_std = out["close"].rolling(20).std(ddof=0)
+    out["bb_upper"] = out["bb_mid"] + 2 * bb_std
+    out["bb_lower"] = out["bb_mid"] - 2 * bb_std
     return out
 
 
@@ -588,7 +599,26 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     hj_ema20_rising_3 = bool(
         float(live.ema20) >= float(last.ema20) >= float(before.ema20)
     )
-    hj_rsi_ok = bool(float(live.rsi) >= 48.0)
+    live_rsi = float(live.rsi)
+    hj_rsi_ok = bool(48.0 <= live_rsi <= cfg.hj_max_rsi)
+
+    # 볼린저 상단 과돌파 추격 방지:
+    # 1% 이상은 무조건 차단, 0.5~1%는 RSI/봉크기/거래량 과열이 동반될 때 차단한다.
+    live_bb_upper = float(live.bb_upper) if pd.notna(live.bb_upper) else 0.0
+    bb_upper_excess_pct = (live_price / live_bb_upper - 1) * 100 if live_bb_upper > 0 else 0.0
+    live_candle_range_pct = (float(live.high) / float(live.low) - 1) * 100 if float(live.low) > 0 else 99.0
+    bb_hard_chase = bool(bb_upper_excess_pct >= cfg.bb_chase_hard_pct)
+    bb_soft_overheat = bool(
+        bb_upper_excess_pct >= cfg.bb_chase_soft_pct
+        and (
+            live_rsi >= cfg.bb_chase_soft_rsi
+            or live_gain >= cfg.bb_chase_soft_candle_gain_pct
+            or live_candle_range_pct >= cfg.bb_chase_soft_candle_range_pct
+            or live_volume_ratio >= cfg.bb_chase_soft_volume_ratio
+        )
+    )
+    hj_bb_chase_ok = bool(not bb_hard_chase and not bb_soft_overheat)
+    hj_volatility_ok = bool(one_hour_move < cfg.max_recent_1h_move_pct)
 
     recent_bodies = raw15["close"].sub(raw15["open"]).abs().iloc[-12:-2]
     median_body = float(recent_bodies.median()) if len(recent_bodies) else 0.0
@@ -626,7 +656,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         continuation_three_bulls and live_volume_ratio >= 0.60
     )
     hj_volume_ok = bool(hj_wick_volume_ok or hj_continuation_volume_ok)
-    hj_momentum_ok = bool(48 <= float(live.rsi) <= 90)
+    hj_momentum_ok = bool(48 <= live_rsi <= cfg.hj_max_rsi)
     hj_pattern_ok = bool(wick_reversal or continuation_three_bulls)
     hj_trend_filter_ok = bool(
         hj_price_above_ema20
@@ -642,6 +672,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and hj_volume_ok
         and hj_momentum_ok
         and hj_trend_filter_ok
+        and hj_bb_chase_ok
+        and hj_volatility_ok
         and live_gain <= 8.0
     )
     hj_score = (
@@ -690,7 +722,11 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
             if not hj_ema20_rising_3:
                 rejected.append("hj_ema20_not_rising")
             if not hj_rsi_ok:
-                rejected.append("hj_rsi_below_48")
+                rejected.append("hj_rsi_out_of_range")
+            if not hj_bb_chase_ok:
+                rejected.append("hj_bb_upper_chase")
+            if not hj_volatility_ok:
+                rejected.append("hj_extreme_1h_volatility")
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
@@ -732,6 +768,12 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_ema20_above_ema60": hj_ema20_above_ema60,
         "hj_ema20_rising_3": hj_ema20_rising_3,
         "hj_rsi_ok": hj_rsi_ok,
+        "hj_max_rsi": cfg.hj_max_rsi,
+        "bb_upper": round(live_bb_upper, 10) if live_bb_upper > 0 else None,
+        "bb_upper_excess_pct": round(bb_upper_excess_pct, 2),
+        "hj_bb_chase_ok": hj_bb_chase_ok,
+        "hj_volatility_ok": hj_volatility_ok,
+        "live_candle_range_pct": round(live_candle_range_pct, 2),
         "hj_last_large_bearish": last_large_bearish,
         "hj_body_recovery_pct": round(body_recovery * 100, 2),
         "hj_lower_wick_body_ratio": round(lower_wick_ratio, 2),
@@ -1309,6 +1351,12 @@ class DailyBot:
         if state_flag("pause_new_entries", False):
             append_entry_record("", "ENTRY_BLOCKED", "", 0, 0, "pause_new_entries=1")
             return
+        if self.loss_cooldown_active():
+            losses = self.consecutive_losses()
+            state_set("loss_cooldown_active", "1")
+            append_entry_record("", "ENTRY_BLOCKED", "", 0, 0, f"loss_cooldown=1; consecutive_losses={losses}")
+            return
+        state_set("loss_cooldown_active", "0")
 
         open_rows = self.open_rows()
         open_symbols = {str(r["symbol"]) for r in open_rows}
