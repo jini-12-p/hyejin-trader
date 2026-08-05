@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "STABLE-v4.2.8-HJ-trend-filter"
+BOT_RUNTIME_VERSION = "STABLE-v4.2.10-DataUI-StatusFix"
 
 
 @dataclass
@@ -193,9 +193,29 @@ def ensure_scan_rejected_csv() -> None:
         fh.flush()
         os.fsync(fh.fileno())
 
+def rotate_scan_csv_if_needed(max_bytes: int = 5_000_000, keep_rows: int = 3000) -> None:
+    """SCAN CSV가 커지면 전체 원본은 날짜별 archive로 옮기고 최근 행만 유지한다."""
+    try:
+        if not SCAN_REJECTED_CSV_PATH.exists() or SCAN_REJECTED_CSV_PATH.stat().st_size <= max_bytes:
+            return
+        archive_dir = SCAN_REJECTED_CSV_PATH.parent / "scan_archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(KST).strftime("%Y%m%d_%H%M%S")
+        archive_path = archive_dir / f"scan_rejected_{stamp}_KST.csv"
+        raw = SCAN_REJECTED_CSV_PATH.read_bytes()
+        archive_path.write_bytes(raw)
+        text = raw.decode("utf-8-sig", errors="replace").splitlines()
+        header = text[:1]
+        recent = text[-keep_rows:] if len(text) > keep_rows + 1 else text[1:]
+        SCAN_REJECTED_CSV_PATH.write_text("\n".join(header + recent) + "\n", encoding="utf-8-sig")
+    except Exception as exc:
+        log_event("", "SCAN_ROTATE_ERROR", mode="paper", details=str(exc))
+
+
 def append_scan_record(symbol: str, strategy: str | None, score: float, details: dict[str, Any]) -> None:
     """진입 후보의 통과/탈락 사유를 CSV에 즉시 누적한다."""
     ensure_scan_rejected_csv()
+    rotate_scan_csv_if_needed()
     fields = SCAN_REJECTED_FIELDS
     row = {
         "time_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -232,6 +252,7 @@ def append_entry_record(
 ) -> None:
     """진입 시도/성공/오류를 기존 SCAN CSV에 같은 열 구조로 기록한다."""
     ensure_scan_rejected_csv()
+    rotate_scan_csv_if_needed()
     row = {key: "" for key in SCAN_REJECTED_FIELDS}
     row.update({
         "time_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -1103,7 +1124,7 @@ class DailyBot:
 
     def _register_stop_review(self, row: sqlite3.Row, stop_event: str, stop_price: float) -> None:
         """손절 발생 후 15·30·60·120·180분 가격을 자동 추적한다."""
-        if stop_event not in {"STOP_HALF", "FINAL_STOP", "STOP", "BE_EXIT"}:
+        if stop_event not in {"STOP_HALF", "FINAL_STOP", "STOP", "BE_EXIT", "FLAT_EXIT_75M", "TIME_EXIT", "MANUAL_EXIT"}:
             return
         entry_price = float(row["base_entry_price"] or row["avg_price"] or 0)
         pnl_at_stop_pct = ((stop_price / entry_price) - 1) * 100 if entry_price > 0 else None
@@ -1190,9 +1211,23 @@ class DailyBot:
                 )
 
     def manage(self) -> None:
+        manual_request = state_get("manual_exit_request", "")
+        try:
+            manual_payload = json.loads(manual_request) if manual_request else {}
+        except Exception:
+            manual_payload = {}
+        manual_symbol = str(manual_payload.get("symbol") or "")
+
         for row in self.open_rows():
             price = float(self.client.ticker(row["symbol"]).get("last") or 0)
             if price <= 0:
+                continue
+            if manual_symbol and str(row["symbol"]) == manual_symbol:
+                self._close(row, price, 1.0, "MANUAL_EXIT", price, None)
+                state_set("manual_exit_request", "")
+                log_event(row["symbol"], "MANUAL_EXIT_ACK", price, mode=self.cfg.mode,
+                          details=json.dumps(manual_payload, ensure_ascii=False),
+                          strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
                 continue
             avg = float(row["avg_price"])
             base_price = float(row["base_entry_price"] or avg)
