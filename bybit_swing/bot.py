@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "EMERGENCY-v4.2.4-runtime-fix"
+BOT_RUNTIME_VERSION = "EMERGENCY-v4.2.5-direct-entry"
 
 
 @dataclass
@@ -1213,74 +1213,52 @@ class DailyBot:
                 self._close(row, paper_fill(trigger), 1.0, "TP2", price, trigger)
 
     def scan_entries(self) -> None:
+        """긴급복구: SCAN_OK가 나오면 같은 스캔 안에서 바로 진입한다.
+
+        기존처럼 모든 후보를 모은 뒤 별도 진입 루프로 넘기지 않아
+        SCAN_OK 이후 발생하던 공통 오류를 우회한다.
+        """
         if state_flag("pause_new_entries", False):
+            append_entry_record("", "ENTRY_BLOCKED", "", 0, 0, "pause_new_entries=1")
             return
-        if len(self.open_rows()) >= self.cfg.max_positions:
-            return
-        if self.cfg.max_daily_entries > 0 and self.daily_entries() >= self.cfg.max_daily_entries:
-            return
-        # PAPER 긴급복구: 과거 손익/연속손절 기록이 신규 진입을 영구 차단하지 않게 한다.
-        if self.cfg.mode != "paper":
-            if self.daily_realized() <= -abs(self.cfg.daily_loss_limit_usdt):
-                log_event("", "DAILY_STOP", mode=self.cfg.mode,
-                          details=f"pnl={self.daily_realized():.2f}")
-                return
-            losses = self.consecutive_losses()
-            if losses >= self.cfg.max_consecutive_losses and self.loss_cooldown_active():
-                log_event("", "LOSS_COOLDOWN", mode=self.cfg.mode,
-                          details=f"losses={losses}; {self.cfg.loss_cooldown_minutes}분 신규 진입 휴식")
-                return
-        if self.cfg.mode != "paper":
-            balance = self.client.balance("USDT")
-            if balance <= self.cfg.emergency_stop_balance:
-                log_event("", "EMERGENCY_STOP", mode=self.cfg.mode, details=f"balance={balance}")
-                return
-            if balance < self.cfg.min_balance_to_trade:
-                return
 
-        candidates: list[tuple[float, str, str, dict[str, Any]]] = []
+        open_rows = self.open_rows()
+        open_symbols = {str(r["symbol"]) for r in open_rows}
+        slots = max(0, int(self.cfg.max_positions) - len(open_symbols))
+        if slots <= 0:
+            append_entry_record("", "ENTRY_BLOCKED", "", 0, 0, "slots=0")
+            return
+
         for symbol in self.active_symbols():
-            if self.symbol_in_cooldown(symbol):
-                log_event(symbol, "COOLDOWN_WAIT", mode=self.cfg.mode,
-                          details=f"{self.cfg.same_symbol_cooldown_minutes}분 재진입 대기")
+            if slots <= 0:
+                break
+            if symbol in open_symbols:
                 continue
-            try:
-                strategy, score, details = candidate_signal(self.client, symbol, self.cfg)
-                log_event(symbol, "SCAN_OK" if strategy else "SCAN_WAIT", float(details.get("price", 0)),
-                          mode=self.cfg.mode, details=json.dumps(details, ensure_ascii=False), strategy=strategy or "")
-                append_scan_record(symbol, strategy, score, details)
-                if strategy:
-                    candidates.append((score, symbol, strategy, details))
-            except Exception as exc:
-                # 특정 종목의 일시적 API/상장 상태 문제 때문에 전체 스캔이 멈추지 않게 한다.
-                log_event(symbol, "SCAN_ERROR", mode=self.cfg.mode, details=str(exc))
+            if self.symbol_in_cooldown(symbol):
+                continue
 
-        if candidates:
-            open_symbols = {str(r["symbol"]) for r in self.open_rows()}
-            slots = max(0, self.cfg.max_positions - len(open_symbols))
-            entries_left = (max(0, self.cfg.max_daily_entries - self.daily_entries())
-                            if self.cfg.max_daily_entries > 0 else slots)
-            for score, symbol, strategy, details in sorted(
-                candidates, reverse=True, key=lambda x: x[0]
-            ):
-                if slots <= 0 or entries_left <= 0:
-                    break
-                if symbol in open_symbols or same_risk_group(symbol, open_symbols):
+            try:
+                strategy, score, details = candidate_signal(
+                    self.client, symbol, self.cfg
+                )
+                price = float(details.get("price", 0) or 0)
+                log_event(
+                    symbol,
+                    "SCAN_OK" if strategy else "SCAN_WAIT",
+                    price,
+                    mode=self.cfg.mode,
+                    details=json.dumps(details, ensure_ascii=False),
+                    strategy=strategy or "",
+                )
+                append_scan_record(symbol, strategy, score, details)
+
+                if not strategy:
+                    continue
+                if same_risk_group(symbol, open_symbols):
                     continue
 
-                price = float(details["price"])
                 append_entry_record(
                     symbol, "ENTRY_ATTEMPT", strategy, score, price
-                )
-                log_event(
-                    symbol, "ENTRY_ATTEMPT", price,
-                    mode=self.cfg.mode,
-                    details=json.dumps({
-                        "strategy": strategy,
-                        "score": score,
-                        "slots": slots,
-                    }, ensure_ascii=False),
-                    strategy=strategy,
                 )
                 try:
                     self._open(symbol, price, strategy, score, details)
@@ -1291,7 +1269,8 @@ class DailyBot:
                     )
                     log_event(
                         symbol, "ENTRY_ERROR", price,
-                        mode=self.cfg.mode, details=message,
+                        mode=self.cfg.mode,
+                        details=message,
                         strategy=strategy,
                     )
                     continue
@@ -1301,7 +1280,15 @@ class DailyBot:
                 )
                 open_symbols.add(symbol)
                 slots -= 1
-                entries_left -= 1
+
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                log_event(
+                    symbol, "SCAN_ERROR", mode=self.cfg.mode, details=message
+                )
+                append_entry_record(
+                    symbol, "SCAN_ERROR", "", 0, 0, message
+                )
 
     def run_once(self) -> None:
         self.manage()
