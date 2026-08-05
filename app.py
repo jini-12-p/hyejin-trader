@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.2.10-DataUI-StatusFix"
+APP_VERSION = "STABLE-v4.3.0-BybitSwing-Dashboard"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -480,13 +480,10 @@ def latest_signal_for_symbol(symbol: str) -> dict | None:
 init_db()
 require_password()
 
-st.title("📈 HJ Trader")
-st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 실제 포지션 자동 동기화")
+st.title("🤖 Bybit Swing")
+st.caption(f"{APP_VERSION} · PAPER 운영 대시보드")
 
-view_mode = st.radio(
-    "화면 선택", ["둘 다 보기", "Bybit만 보기", "OKX PAPER만 보기", "Bybit Swing PAPER만 보기"],
-    horizontal=True, key="main_view_mode"
-)
+view_mode = "Bybit Swing PAPER만 보기"
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -1591,7 +1588,7 @@ if view_mode not in {"Bybit만 보기", "Bybit Swing PAPER만 보기"}:
 
 if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
     st.divider()
-    st.subheader("🤖 Bybit Swing · STABLE-v4.2.10-DataUI-StatusFix")
+    st.subheader("📊 운영 현황")
     st.caption("Bybit USDT 무기한선물 · 한국시간 오전 9시 거래일 리셋 · 동시 최대 2종목")
     BYBIT_SWING_DB = Path(__file__).with_name("bybit_swing") / "bybit_swing_bot.db"
     BYBIT_SWING_CONFIG = Path(__file__).with_name("bybit_swing") / "config.json"
@@ -1641,6 +1638,14 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 "텔레그램 알림: " + ("사용 설정됨" if tg_on else "꺼짐") +
                 " · 실제 토큰/채팅ID는 서버 환경변수 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID 사용 권장"
             )
+            with st.expander("✅ 이번 버전 확인 항목", expanded=False):
+                st.write("• Bybit Swing 화면만 표시")
+                st.write("• 포지션 카드: 최초 진입가·현재 평단·TP1·TP2·1차/최종 손절·본절보호")
+                st.write("• 물타기 횟수·현재 수량·총 증거금·보유시간·시간종료까지 남은 시간")
+                st.write("• 예상 수수료·예상 순손익")
+                st.write("• 종목별 수동 종료 확인 체크 + 종료 버튼")
+                st.write("• 종료 후 1시간·2시간·3시간 추적")
+                st.write("• SCAN CSV 경량화")
         except Exception as exc:
             st.warning(f"Bybit Swing 설정 확인 실패: {exc}")
 
@@ -1703,16 +1708,27 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                     t2.metric("TP2",format(tp2,'.10g'),delta=f"+{float(bs_cfg.get('tp2_pct',3.0)):.2f}%")
                     t3.metric("최종 손절",format(final_stop,'.10g'),delta=f"-{float(bs_cfg.get('final_stop_pct',3.0)):.2f}%")
                     s1,s2,s3=st.columns(3)
-                    s1.metric("1차 손절",format(stage1,'.10g'))
-                    s2.metric("본절보호가",format(be,'.10g'))
-                    s3.metric("예상 순손익",f"{net:+.2f} USDT",delta=f"예상 수수료 {est_fees:.2f}")
+                    s1.metric("1차 손절",format(stage1,'.10g'),delta=f"-{float(bs_cfg.get('stage1_stop_pct',1.5)):.2f}%")
+                    s2.metric("본절보호가",format(be,'.10g'),delta=f"-{float(bs_cfg.get('breakeven_stop_pct',0.1)):.2f}%")
+                    s3.metric("현재 예상 순손익",f"{net:+.2f} USDT",delta=f"예상 수수료 {est_fees:.2f}")
+                    position_value = avg * qty
+                    half_value = position_value * 0.5
+                    tp1_gross = half_value * float(bs_cfg.get('tp1_pct',1.5)) / 100
+                    tp2_total_gross = tp1_gross + half_value * float(bs_cfg.get('tp2_pct',3.0)) / 100
+                    full_fee = position_value * fee_rate * 2
+                    stage1_loss = half_value * float(bs_cfg.get('stage1_stop_pct',1.5)) / 100
+                    final_loss = half_value * float(bs_cfg.get('final_stop_pct',2.3)) / 100
+                    o1,o2,o3=st.columns(3)
+                    o1.metric("TP1 후 본절 예상",f"{tp1_gross-full_fee:+.2f} USDT")
+                    o2.metric("TP2까지 예상",f"{tp2_total_gross-full_fee:+.2f} USDT")
+                    o3.metric("완전손절 예상",f"{-(stage1_loss+final_loss+full_fee):.2f} USDT")
                     st.caption(f"물타기/순환 {int(row['dca_count'] or 0)}회 · 현재 수량 {qty:.8g} · 총 증거금 {float(row['total_margin'] or 0):.2f} USDT · 격리 {bs_cfg.get('leverage',5)}배")
                     pending_raw=_bs_state_get('manual_exit_request','')
                     pending_symbol=''
                     try: pending_symbol=str(json.loads(pending_raw).get('symbol') or '') if pending_raw else ''
                     except Exception: pending_symbol=''
                     confirm=st.checkbox(f"{symbol} 수동 종료 확인",key=f"manual_confirm_{symbol}")
-                    if st.button("🚪 현재 포지션 수동 종료",use_container_width=True,key=f"manual_exit_{symbol}",disabled=(not confirm) or pending_symbol==symbol):
+                    if st.button("🚪 수동 종료 요청",use_container_width=True,key=f"manual_exit_{symbol}",disabled=(not confirm) or pending_symbol==symbol):
                         _bs_state_set('manual_exit_request',json.dumps({'symbol':symbol,'requested_at':datetime.now(timezone.utc).isoformat(),'reason':'MANUAL_EXIT_CHART_OR_UPDATE'},ensure_ascii=False))
                         st.warning(f"{symbol} 수동 종료 요청 전송됨 · 봇의 다음 관리 주기에 시장가로 종료합니다.")
                         st.rerun()
@@ -1735,7 +1751,7 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
             except Exception:
                 pass
 
-            st.markdown("### 📒 Bybit Swing PAPER 매매기록")
+            st.markdown("### 📒 매매기록")
 
             # 전체 이벤트를 분석용 CSV/JSON으로 내려받는다. 시간은 한국시간으로 변환한다.
             export_rows=[]
@@ -1837,4 +1853,4 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
     else:
         st.info("run_bybit_swing_bot.py를 한 번 실행하면 Bybit Swing 상태가 표시됩니다.")
 
-st.caption("Bybit 실제 포지션이 원본입니다. 외부 진입 포지션에는 프로그램이 TP·SL을 임의 설정하지 않습니다.")
+st.caption("Bybit Swing PAPER · 포지션 카드에서 TP·손절·평단·수동 종료를 확인합니다.")
