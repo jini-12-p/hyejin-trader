@@ -28,6 +28,9 @@ from bybit import (
 from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, analyze_position_health
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
+
+st.success("✅ 현재 적용 버전: EMERGENCY-v4.2.4-runtime-fix")
+st.caption("이 문구가 보이면 app.py 업로드와 Streamlit 재시작이 정상 반영된 상태입니다.")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
 APP_VERSION = "v3.6.0"
 TOP_GAINER_LIMIT = 30
