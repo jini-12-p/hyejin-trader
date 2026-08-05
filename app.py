@@ -483,9 +483,10 @@ require_password()
 st.title("📈 HJ Trader")
 st.caption(f"{APP_VERSION} · BUY TOP10 · Bybit 실제 포지션 자동 동기화")
 
-# v4.0.13 UI: 현재 사용하는 Bybit Swing PAPER 화면만 표시한다.
-# 기존 Bybit 단타/OKX 코드는 삭제하지 않고 화면에서만 숨긴다.
-view_mode = "Bybit Swing PAPER만 보기"
+view_mode = st.radio(
+    "화면 선택", ["둘 다 보기", "Bybit만 보기", "OKX PAPER만 보기", "Bybit Swing PAPER만 보기"],
+    horizontal=True, key="main_view_mode"
+)
 
 min_score = float(get_setting("min_score", 5.0))
 show_only_buy = bool(get_setting("show_only_buy", False))
@@ -1589,7 +1590,7 @@ if view_mode not in {"Bybit만 보기", "Bybit Swing PAPER만 보기"}:
 
 if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
     st.divider()
-    st.subheader("🤖 Bybit 상승상위 눌림 확인 PAPER 봇 v4.0.0")
+    st.subheader("🤖 Bybit 상승상위 눌림 확인 PAPER 봇")
     st.caption("Bybit USDT 무기한선물 · 한국시간 오전 9시 거래일 리셋 · 동시 최대 2종목")
     BYBIT_SWING_DB = Path(__file__).with_name("bybit_swing") / "bybit_swing_bot.db"
     BYBIT_SWING_CONFIG = Path(__file__).with_name("bybit_swing") / "config.json"
@@ -1651,13 +1652,27 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 history = conn.execute("SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' ORDER BY id DESC LIMIT 500").fetchall()
                 today = conn.execute("SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(ts,1,10)=date('now')").fetchone()
                 cumulative = conn.execute("SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0) FROM bot_events").fetchone()
-                try:
-                    stop_reviews = conn.execute("SELECT * FROM stop_reviews ORDER BY id DESC").fetchall()
-                except sqlite3.OperationalError:
-                    stop_reviews = []
 
             paused = _bs_state_get("pause_new_entries", "0") == "1"
             shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
+            runtime_version = _bs_state_get("runtime_version", "미확인")
+            runtime_started_at = _bs_state_get("runtime_started_at", "")
+            configured_version = str(bs_cfg.get("strategy_version", "미확인"))
+            if runtime_started_at:
+                runtime_started_text = _kst_time(runtime_started_at)
+            else:
+                runtime_started_text = "미확인"
+            if runtime_version == configured_version:
+                st.success(f"✅ 실제 실행 버전: {runtime_version} · 재시작 {runtime_started_text} KST")
+            else:
+                st.error(
+                    f"⚠️ 버전 불일치 · 실제 실행: {runtime_version} · 설정파일: {configured_version} · "
+                    f"재시작 {runtime_started_text} KST"
+                )
+            st.caption(
+                f"신규진입 실제 DB값: {'0 · 허용' if not paused else '1 · 정지'} · "
+                f"봇 상태: {_bs_state_get('bot_process_status', '미확인')}"
+            )
             st.markdown("### 🛠️ Bybit Swing 봇 제어")
             st.success("신규 진입 허용" if not paused else "신규 진입 중지")
             b1,b2,b3=st.columns(3)
@@ -1751,133 +1766,6 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                     )
                 else:
                     st.caption("SCAN CSV file not found.")
-
-                # 종료 거래를 1행으로 합친 분석 CSV
-                trade_map = {}
-                for row in export_rows:
-                    tid = row.get("trade_id") or f"legacy-{row.get('symbol')}"
-                    item = trade_map.setdefault(tid, {
-                        "trade_id": tid,
-                        "symbol": row.get("symbol", ""),
-                        "strategy": row.get("strategy", ""),
-                        "entry_time_kst": "",
-                        "entry_price": "",
-                        "exit_time_kst": "",
-                        "exit_reason": "",
-                        "realized_pnl_usdt": 0.0,
-                    })
-                    if row.get("event") == "ENTRY":
-                        item["entry_time_kst"] = row.get("time_kst", "")
-                        item["entry_price"] = row.get("price", "")
-                        item["strategy"] = row.get("strategy", "")
-                    if row.get("event") in {
-                        "TP2", "STOP", "FINAL_STOP", "BE_EXIT",
-                        "RECOVERY_EXIT", "FLAT_EXIT_75M", "TIME_EXIT"
-                    }:
-                        item["exit_time_kst"] = row.get("time_kst", "")
-                        item["exit_reason"] = row.get("event", "")
-                    item["realized_pnl_usdt"] += float(row.get("realized_pnl_usdt") or 0)
-
-                closed_trade_rows = [x for x in trade_map.values() if x["exit_reason"]]
-                if closed_trade_rows:
-                    closed_out = io.StringIO()
-                    closed_writer = csv.DictWriter(closed_out, fieldnames=list(closed_trade_rows[0].keys()))
-                    closed_writer.writeheader()
-                    closed_writer.writerows(closed_trade_rows)
-                    st.download_button(
-                        "📥 종료거래 요약 CSV",
-                        closed_out.getvalue().encode("utf-8-sig"),
-                        file_name=f"bybit_closed_trades_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                        key="bs_closed_trade_download",
-                    )
-
-                    strategy_map = {}
-                    for item in closed_trade_rows:
-                        strategy = item.get("strategy") or "미분류"
-                        s = strategy_map.setdefault(strategy, {
-                            "strategy": strategy,
-                            "closed_trades": 0,
-                            "wins": 0,
-                            "losses": 0,
-                            "flat_or_zero": 0,
-                            "win_rate_pct": 0.0,
-                            "total_realized_pnl_usdt": 0.0,
-                            "avg_pnl_usdt": 0.0,
-                        })
-                        pnl = float(item.get("realized_pnl_usdt") or 0)
-                        s["closed_trades"] += 1
-                        s["total_realized_pnl_usdt"] += pnl
-                        if pnl > 0:
-                            s["wins"] += 1
-                        elif pnl < 0:
-                            s["losses"] += 1
-                        else:
-                            s["flat_or_zero"] += 1
-
-                    strategy_rows = []
-                    for s in strategy_map.values():
-                        n = max(1, int(s["closed_trades"]))
-                        s["win_rate_pct"] = round(s["wins"] / n * 100, 2)
-                        s["total_realized_pnl_usdt"] = round(s["total_realized_pnl_usdt"], 4)
-                        s["avg_pnl_usdt"] = round(s["total_realized_pnl_usdt"] / n, 4)
-                        strategy_rows.append(s)
-                    strategy_rows.sort(key=lambda x: x["total_realized_pnl_usdt"], reverse=True)
-
-                    strategy_out = io.StringIO()
-                    strategy_writer = csv.DictWriter(strategy_out, fieldnames=list(strategy_rows[0].keys()))
-                    strategy_writer.writeheader()
-                    strategy_writer.writerows(strategy_rows)
-                    st.download_button(
-                        "📥 전략별 성적 CSV",
-                        strategy_out.getvalue().encode("utf-8-sig"),
-                        file_name=f"bybit_strategy_summary_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                        key="bs_strategy_summary_download",
-                    )
-
-                if stop_reviews:
-                    stop_rows = []
-                    for r in reversed(list(stop_reviews)):
-                        stop_rows.append({
-                            "stop_time_kst": _kst_time(r["stop_ts"]),
-                            "trade_id": r["trade_id"],
-                            "symbol": r["symbol"],
-                            "strategy": r["strategy"] or "",
-                            "stop_event": r["stop_event"],
-                            "entry_price": r["entry_price"],
-                            "stop_price": r["stop_price"],
-                            "pnl_at_stop_pct": r["pnl_at_stop_pct"],
-                            "price_15m": r["price_15m"],
-                            "pct_vs_stop_15m": r["pct_15m"],
-                            "price_30m": r["price_30m"],
-                            "pct_vs_stop_30m": r["pct_30m"],
-                            "price_60m": r["price_60m"],
-                            "pct_vs_stop_60m": r["pct_60m"],
-                            "price_120m": r["price_120m"],
-                            "pct_vs_stop_120m": r["pct_120m"],
-                            "price_180m": r["price_180m"],
-                            "pct_vs_stop_180m": r["pct_180m"],
-                            "review_label": r["review_label"] or "추적 중",
-                            "completed": int(r["completed"] or 0),
-                        })
-                    stop_out = io.StringIO()
-                    stop_writer = csv.DictWriter(stop_out, fieldnames=list(stop_rows[0].keys()))
-                    stop_writer.writeheader()
-                    stop_writer.writerows(stop_rows)
-                    st.download_button(
-                        "📥 손절 리뷰 CSV",
-                        stop_out.getvalue().encode("utf-8-sig"),
-                        file_name=f"bybit_stop_review_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                        key="bs_stop_review_download",
-                    )
-                    st.caption("손절 뒤 15·30·60·120·180분 가격과 좋은 손절/아까운 손절 분류가 포함됩니다.")
-                else:
-                    st.caption("손절 리뷰 데이터는 새 버전 적용 후 발생한 손절부터 자동 생성됩니다.")
 
             grouped={}
             for e in reversed(list(history)):
