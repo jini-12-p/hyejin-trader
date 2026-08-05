@@ -28,11 +28,8 @@ from bybit import (
 from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, analyze_position_health
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
-
-st.success("✅ 현재 적용 버전: EMERGENCY-v4.2.4-runtime-fix")
-st.caption("이 문구가 보이면 app.py 업로드와 Streamlit 재시작이 정상 반영된 상태입니다.")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "v3.6.0"
+APP_VERSION = "STABLE-v4.2.10-DataUI-StatusFix"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -1552,13 +1549,14 @@ if view_mode not in {"Bybit만 보기", "Bybit Swing PAPER만 보기"}:
                 event_names = {
                     "ENTRY": "최초 진입", "REBOUND_ADD": "순환추가",
                     "CYCLE_REDUCE": "추가분 회수", "TP1": "TP1 익절", "TP2": "TP2 익절",
-                    "STOP": "손절", "BE_EXIT": "본절 보호 종료",
-                    "FLAT_EXIT_75M": "정체 종료", "TIME_EXIT": "시간 종료"
+                    "STOP": "손절", "STOP_HALF": "1차 손절", "FINAL_STOP": "최종 손절",
+                    "RECOVERY_EXIT": "회복 종료", "MANUAL_EXIT": "수동 종료",
+                    "BE_EXIT": "본절 보호 종료", "FLAT_EXIT_75M": "정체 종료", "TIME_EXIT": "시간 종료"
                 }
                 for tid, events in list(reversed(list(grouped.items())))[:12]:
                     first = events[0]
                     total_pnl = sum(float(x["realized_pnl"] or 0) for x in events)
-                    closed = any(x["event"] in {"TP2","STOP","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT"} for x in events)
+                    closed = any(x["event"] in {"TP2","STOP","FINAL_STOP","RECOVERY_EXIT","MANUAL_EXIT","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT"} for x in events)
                     status = "종료" if closed else "진행 중"
                     with st.expander(f"{first['symbol']} · {status} · 누적 {total_pnl:+.2f} USDT", expanded=False):
                         for e in events:
@@ -1593,7 +1591,7 @@ if view_mode not in {"Bybit만 보기", "Bybit Swing PAPER만 보기"}:
 
 if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
     st.divider()
-    st.subheader("🤖 Bybit 상승상위 눌림 확인 PAPER 봇")
+    st.subheader("🤖 Bybit Swing · STABLE-v4.2.10-DataUI-StatusFix")
     st.caption("Bybit USDT 무기한선물 · 한국시간 오전 9시 거래일 리셋 · 동시 최대 2종목")
     BYBIT_SWING_DB = Path(__file__).with_name("bybit_swing") / "bybit_swing_bot.db"
     BYBIT_SWING_CONFIG = Path(__file__).with_name("bybit_swing") / "config.json"
@@ -1658,24 +1656,6 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
 
             paused = _bs_state_get("pause_new_entries", "0") == "1"
             shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
-            runtime_version = _bs_state_get("runtime_version", "미확인")
-            runtime_started_at = _bs_state_get("runtime_started_at", "")
-            configured_version = str(bs_cfg.get("strategy_version", "미확인"))
-            if runtime_started_at:
-                runtime_started_text = _kst_time(runtime_started_at)
-            else:
-                runtime_started_text = "미확인"
-            if runtime_version == configured_version:
-                st.success(f"✅ 실제 실행 버전: {runtime_version} · 재시작 {runtime_started_text} KST")
-            else:
-                st.error(
-                    f"⚠️ 버전 불일치 · 실제 실행: {runtime_version} · 설정파일: {configured_version} · "
-                    f"재시작 {runtime_started_text} KST"
-                )
-            st.caption(
-                f"신규진입 실제 DB값: {'0 · 허용' if not paused else '1 · 정지'} · "
-                f"봇 상태: {_bs_state_get('bot_process_status', '미확인')}"
-            )
             st.markdown("### 🛠️ Bybit Swing 봇 제어")
             st.success("신규 진입 허용" if not paused else "신규 진입 중지")
             b1,b2,b3=st.columns(3)
@@ -1694,14 +1674,66 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
 
             for row in positions:
                 with st.container(border=True):
-                    st.markdown(f"### {row['symbol']} · {row['strategy'] or 'P'}형 · {row['note'] or '관리 중'}")
-                    st.caption(f"진입시간(KST) {_kst_time(row['opened_at'])}")
+                    symbol = str(row['symbol'])
+                    avg = float(row['avg_price'])
+                    base = float(row['base_entry_price'] or avg) if 'base_entry_price' in row.keys() else avg
+                    last = float(row['last_price'] or avg)
+                    qty = float(row['total_qty'] or 0)
+                    tp1 = base * (1 + float(bs_cfg.get('tp1_pct',1.5))/100)
+                    tp2 = base * (1 + float(bs_cfg.get('tp2_pct',3.0))/100)
+                    stage1 = base * (1 - float(bs_cfg.get('stage1_stop_pct',1.5))/100)
+                    final_stop = base * (1 - float(bs_cfg.get('final_stop_pct',3.0))/100)
+                    be = base * (1 - float(bs_cfg.get('breakeven_stop_pct',0.05))/100)
+                    fee_rate = float(bs_cfg.get('taker_fee_rate',0.00055))
+                    gross = (last-avg)*qty
+                    est_fees = (avg*qty + last*qty)*fee_rate
+                    net = gross-est_fees
+                    opened = datetime.fromisoformat(str(row['opened_at']).replace('Z','+00:00'))
+                    if opened.tzinfo is None: opened=opened.replace(tzinfo=timezone.utc)
+                    held_min=max(0,int((datetime.now(timezone.utc)-opened).total_seconds()/60))
+                    max_min=int(float(bs_cfg.get('max_hold_hours',3))*60)
+                    st.markdown(f"### {symbol} · {row['strategy'] or 'P'}형 · {row['note'] or '관리 중'}")
+                    st.caption(f"진입시간(KST) {_kst_time(row['opened_at'])} · 보유 {held_min//60}시간 {held_min%60}분 · 시간종료까지 약 {max(0,max_min-held_min)}분")
                     a,b,c=st.columns(3)
-                    a.metric("평단",format(float(row['avg_price']),'.10g'))
-                    b.metric("현재가",'-' if row['last_price'] is None else format(float(row['last_price']),'.10g'))
-                    c.metric("가격 변동",'-' if row['unrealized_pct'] is None else f"{float(row['unrealized_pct']):+.2f}%")
+                    a.metric("최초 진입가",format(base,'.10g'))
+                    b.metric("현재 평단",format(avg,'.10g'), delta=(None if abs(avg-base)<1e-15 else f"{(avg/base-1)*100:+.2f}% 변경"))
+                    c.metric("현재가",format(last,'.10g'), delta=f"{(last/base-1)*100:+.2f}%")
+                    t1,t2,t3=st.columns(3)
+                    t1.metric("TP1",format(tp1,'.10g'),delta=f"+{float(bs_cfg.get('tp1_pct',1.5)):.2f}%")
+                    t2.metric("TP2",format(tp2,'.10g'),delta=f"+{float(bs_cfg.get('tp2_pct',3.0)):.2f}%")
+                    t3.metric("최종 손절",format(final_stop,'.10g'),delta=f"-{float(bs_cfg.get('final_stop_pct',3.0)):.2f}%")
+                    s1,s2,s3=st.columns(3)
+                    s1.metric("1차 손절",format(stage1,'.10g'))
+                    s2.metric("본절보호가",format(be,'.10g'))
+                    s3.metric("예상 순손익",f"{net:+.2f} USDT",delta=f"예상 수수료 {est_fees:.2f}")
+                    st.caption(f"물타기/순환 {int(row['dca_count'] or 0)}회 · 현재 수량 {qty:.8g} · 총 증거금 {float(row['total_margin'] or 0):.2f} USDT · 격리 {bs_cfg.get('leverage',5)}배")
+                    pending_raw=_bs_state_get('manual_exit_request','')
+                    pending_symbol=''
+                    try: pending_symbol=str(json.loads(pending_raw).get('symbol') or '') if pending_raw else ''
+                    except Exception: pending_symbol=''
+                    confirm=st.checkbox(f"{symbol} 수동 종료 확인",key=f"manual_confirm_{symbol}")
+                    if st.button("🚪 현재 포지션 수동 종료",use_container_width=True,key=f"manual_exit_{symbol}",disabled=(not confirm) or pending_symbol==symbol):
+                        _bs_state_set('manual_exit_request',json.dumps({'symbol':symbol,'requested_at':datetime.now(timezone.utc).isoformat(),'reason':'MANUAL_EXIT_CHART_OR_UPDATE'},ensure_ascii=False))
+                        st.warning(f"{symbol} 수동 종료 요청 전송됨 · 봇의 다음 관리 주기에 시장가로 종료합니다.")
+                        st.rerun()
+                    if pending_symbol==symbol:
+                        st.warning("수동 종료 요청 처리 대기 중입니다.")
             if not positions:
                 st.info("현재 Bybit Swing PAPER 보유 포지션이 없습니다.")
+
+            try:
+                with sqlite3.connect(BYBIT_SWING_DB) as review_conn:
+                    review_conn.row_factory=sqlite3.Row
+                    reviews=review_conn.execute("SELECT * FROM stop_reviews ORDER BY id DESC LIMIT 12").fetchall()
+                if reviews:
+                    with st.expander("🔎 종료 후 3시간 추적",expanded=False):
+                        for r in reviews:
+                            hit_tp1 = ''
+                            if r['entry_price'] and r['price_180m']:
+                                hit_tp1 = ' · 3시간 가격 기준 TP1 이상' if (float(r['price_180m'])/float(r['entry_price'])-1)*100 >= float(bs_cfg.get('tp1_pct',1.5)) else ''
+                            st.write(f"{r['symbol']} · {r['stop_event']} · 종료 {_kst_time(r['stop_ts'])} · 1h {('-' if r['pct_60m'] is None else f'{float(r["pct_60m"]):+.2f}%')} · 2h {('-' if r['pct_120m'] is None else f'{float(r["pct_120m"]):+.2f}%')} · 3h {('-' if r['pct_180m'] is None else f'{float(r["pct_180m"]):+.2f}%')}{hit_tp1}")
+            except Exception:
+                pass
 
             st.markdown("### 📒 Bybit Swing PAPER 매매기록")
 
@@ -1773,10 +1805,10 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
             grouped={}
             for e in reversed(list(history)):
                 grouped.setdefault(e['trade_id'] or f"legacy-{e['symbol']}",[]).append(e)
-            names={"ENTRY":"최초 진입","REBOUND_ADD":"순환추가","CYCLE_REDUCE":"추가분 회수","TP1":"TP1 익절","TP2":"TP2 익절","STOP":"손절","BE_EXIT":"본절 보호 종료","FLAT_EXIT_75M":"정체 종료","TIME_EXIT":"시간 종료"}
+            names={"ENTRY":"최초 진입","REBOUND_ADD":"순환추가","CYCLE_REDUCE":"추가분 회수","TP1":"TP1 익절","TP2":"TP2 익절","STOP":"손절","STOP_HALF":"1차 손절","FINAL_STOP":"최종 손절","RECOVERY_EXIT":"회복 종료","MANUAL_EXIT":"수동 종료","BE_EXIT":"본절 보호 종료","FLAT_EXIT_75M":"정체 종료","TIME_EXIT":"시간 종료"}
             for tid,events in list(reversed(list(grouped.items())))[:20]:
                 first=events[0]; total=sum(float(x['realized_pnl'] or 0) for x in events)
-                closed=any(x['event'] in {"TP2","STOP","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT"} for x in events)
+                closed=any(x['event'] in {"TP2","STOP","FINAL_STOP","RECOVERY_EXIT","MANUAL_EXIT","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT"} for x in events)
                 with st.expander(f"{first['symbol']} · {'종료' if closed else '진행 중'} · {total:+.2f} USDT",expanded=False):
                     for e in events:
                         try: d=json.loads(e['details'] or '{}')
