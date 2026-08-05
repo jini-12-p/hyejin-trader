@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "EMERGENCY-v4.2.6-meme-fix"
+BOT_RUNTIME_VERSION = "EMERGENCY-v4.2.7-qty-fix"
 
 
 @dataclass
@@ -680,6 +680,15 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
 
 # 위험그룹 목록이 정의되지 않아 SCAN_OK 직후 NameError가 발생하던 문제 수정
 MEME_SYMBOLS: set[str] = set()
+
+
+def qty_from_margin(price: float, margin_usdt: float, leverage: float) -> float:
+    """증거금과 레버리지로 주문 수량을 계산한다."""
+    price = float(price)
+    if price <= 0:
+        raise ValueError(f"invalid price: {price}")
+    return (float(margin_usdt) * float(leverage)) / price
+
 
 def same_risk_group(symbol: str, open_symbols: set[str]) -> bool:
     return symbol in MEME_SYMBOLS and any(s in MEME_SYMBOLS for s in open_symbols)
