@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "EMERGENCY-v4.2.5-direct-entry"
+BOT_RUNTIME_VERSION = "EMERGENCY-v4.2.6-meme-fix"
 
 
 @dataclass
@@ -677,6 +677,9 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     }
     return strategy, float(score), details
 
+
+# 위험그룹 목록이 정의되지 않아 SCAN_OK 직후 NameError가 발생하던 문제 수정
+MEME_SYMBOLS: set[str] = set()
 
 def same_risk_group(symbol: str, open_symbols: set[str]) -> bool:
     return symbol in MEME_SYMBOLS and any(s in MEME_SYMBOLS for s in open_symbols)
