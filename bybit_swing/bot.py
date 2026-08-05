@@ -687,6 +687,9 @@ class DailyBot:
         self.client = BybitSwingClient(demo=self.cfg.mode != "live")
         init_db()
         ensure_scan_rejected_csv()
+        state_set("runtime_version", BOT_RUNTIME_VERSION)
+        state_set("runtime_started_at", datetime.now(timezone.utc).isoformat())
+        state_set("runtime_bot_file", str(Path(__file__).resolve()))
 
     def _saved_active_symbols(self) -> list[str]:
         try:
@@ -1306,6 +1309,8 @@ class DailyBot:
 
     def run_forever(self) -> None:
         state_set("bot_process_status", "RUNNING")
+        state_set("runtime_version", BOT_RUNTIME_VERSION)
+        state_set("runtime_started_at", datetime.now(timezone.utc).isoformat())
         log_event("", "BOT_START", mode=self.cfg.mode, details=json.dumps(asdict(self.cfg), ensure_ascii=False))
         next_scan_at = 0.0
         while True:
