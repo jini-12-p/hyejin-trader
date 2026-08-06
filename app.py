@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import time
 import json
 import io
@@ -30,7 +31,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "RC-v4.3.8-HJStructureStop-LoginFix2"
+APP_VERSION = "RC-v4.3.8-HJStructureStop-LoginFix3"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -101,25 +102,39 @@ def auth_token(password: str) -> str:
 cookie_manager = stx.CookieManager(key="hj_cookie_manager")
 
 
+def _make_url_auth_token(password: str, expires_at: int) -> str:
+    payload = str(expires_at)
+    signature = hmac.new(
+        password.encode("utf-8"),
+        ("HJ-TRADER-URL-AUTH|" + payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def _valid_url_auth_token(password: str, value: str) -> bool:
+    try:
+        expires_text, signature = str(value).split(".", 1)
+        expires_at = int(expires_text)
+    except (TypeError, ValueError):
+        return False
+    if expires_at < int(time.time()):
+        return False
+    expected = _make_url_auth_token(password, expires_at).split(".", 1)[1]
+    return hmac.compare_digest(signature, expected)
+
+
 def require_password() -> None:
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("APP_PASSWORD가 설정되지 않았습니다.")
         st.stop()
 
-    token = auth_token(expected)
-
-    # CookieManager는 브라우저 쿠키를 비동기로 읽는다.
-    # get("hj_auth")만 바로 호출하면, 쿠키가 아직 도착하지 않은 순간을
-    # "로그인 쿠키 없음"으로 오인해 새로고침 때 로그인 화면이 먼저 뜰 수 있다.
-    # 먼저 전체 쿠키 응답이 준비될 때까지 기다린 뒤 인증 쿠키를 판정한다.
-    cookies = cookie_manager.get_all()
-    if cookies is None:
-        st.info("로그인 상태를 확인하는 중입니다…")
-        st.stop()
-
-    cookie_value = cookies.get("hj_auth") if isinstance(cookies, dict) else None
-    if st.session_state.get("authenticated") or cookie_value == token:
+    # 모바일 브라우저 + HTTP 접속에서는 CookieManager 쿠키가 새로고침 뒤
+    # 안정적으로 복원되지 않는 경우가 있어, 서명된 만료 토큰을 URL에 유지한다.
+    # 비밀번호 자체는 URL에 들어가지 않으며 토큰은 7일 뒤 자동 만료된다.
+    url_token = st.query_params.get("auth", "")
+    if st.session_state.get("authenticated") or _valid_url_auth_token(expected, url_token):
         st.session_state.authenticated = True
         return
 
@@ -130,14 +145,8 @@ def require_password() -> None:
         if password == expected:
             st.session_state.authenticated = True
             if keep:
-                cookie_manager.set(
-                    "hj_auth",
-                    token,
-                    max_age=7 * 24 * 60 * 60,
-                    key="set_auth",
-                )
-                # 쿠키 컴포넌트가 브라우저에 저장할 시간을 확보한다.
-                time.sleep(0.8)
+                expires_at = int(time.time()) + 7 * 24 * 60 * 60
+                st.query_params["auth"] = _make_url_auth_token(expected, expires_at)
             st.rerun()
         else:
             st.error("비밀번호가 맞지 않습니다.")
@@ -681,8 +690,8 @@ if view_mode not in {"OKX PAPER만 보기", "Bybit Swing PAPER만 보기"}:
         use_container_width=True,
     )
     if col_logout.button("로그아웃", use_container_width=True):
-        cookie_manager.delete("hj_auth", key="delete_auth")
         st.session_state.authenticated = False
+        st.query_params.clear()
         st.rerun()
 
     settings = StrategySettings(
