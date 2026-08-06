@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.8-HJStructureStop-LoginFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.9-HJReboundFirst"
 
 
 @dataclass
@@ -115,6 +115,8 @@ class DailyConfig:
     hj_rebound_arm_drawdown_pct: float = 1.2
     hj_rebound_add_margin_usdt: float = 18.0
     hj_max_loss_usdt: float = 4.5
+    hj_emergency_loss_usdt: float = 7.0
+    hj_rebound_wait_minutes: int = 20
     hj_structure_stop_enabled: bool = True
     hj_structure_break_buffer_pct: float = 0.15
     rebound_exit_buffer_pct: float = 0.10
@@ -792,8 +794,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
 MEME_SYMBOLS: set[str] = set()
 
 
-def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
-    """15분 구조와 거래량이 함께 회복될 때만 반등 추가한다."""
+def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig, strategy: str = "P") -> tuple[bool, dict[str, Any]]:
+    """확정 5분봉 반등을 확인해 순환 추가한다. HJ는 정상 눌림을 살리도록 완화한다."""
     m5 = confirmed(indicators(client.candles(symbol, "5m", 140)))
     m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
     if len(m5) < 50 or len(m15) < 30:
@@ -802,20 +804,38 @@ def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) 
     row15, prev15 = m15.iloc[-1], m15.iloc[-2]
     recent_low = float(m5.tail(12).low.min())
     rebound_pct = (float(row5.close) / recent_low - 1) * 100 if recent_low > 0 else 0.0
-    vol_ratio = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
+    vol_ratio15 = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
+    vol_ratio5 = float(row5.volume / row5.vol_avg) if pd.notna(row5.vol_avg) and row5.vol_avg > 0 else 0.0
     prior_15m_high = float(m15.iloc[-4:-1].high.max())
+    rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
+
+    if str(strategy).upper() == "HJ":
+        # 떨어지는 중 물타기는 금지하고, 확정 5분 양봉이 직전 종가를 회복했을 때만 추가한다.
+        bullish5 = bool(row5.close > row5.open and row5.close > prev5.close)
+        micro_break = bool(row5.close > prev5.high or (row5.low > prev5.low and row5.close >= prev5.close))
+        trend_alive = bool(row15.close >= row15.ema20 * 0.995 and row15.ema20 >= row15.ema60)
+        rsi_ok = bool(row15.rsi >= 42.0 and row15.rsi >= prev15.rsi - 2.0)
+        volume_ok = bool(vol_ratio5 >= 0.55 or vol_ratio15 >= 0.60)
+        ok = bool(bullish5 and micro_break and trend_alive and rsi_ok and volume_ok and rebound_ok)
+        return ok, {
+            "price": float(row5.close), "bullish5": bullish5, "micro_break": micro_break,
+            "trend_alive": trend_alive, "rsi_ok": rsi_ok, "volume_ok": volume_ok,
+            "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
+            "volume_ratio_5m": round(vol_ratio5, 2), "volume_ratio_15m": round(vol_ratio15, 2),
+            "rebound_pct": round(rebound_pct, 2),
+        }
+
     bullish = bool(row5.close > row5.open and row15.close > row15.open)
     break_structure = bool(row15.close > prior_15m_high and row5.close > prev5.high)
     rsi_ok = bool(row15.rsi >= cfg.rebound_min_rsi and row15.rsi > prev15.rsi)
     ema_ok = bool(row15.close >= row15.ema9 and row15.ema9 >= row15.ema20)
-    volume_ok = bool(vol_ratio >= cfg.rebound_min_volume_ratio)
-    rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
+    volume_ok = bool(vol_ratio15 >= cfg.rebound_min_volume_ratio)
     ok = bool(bullish and break_structure and rsi_ok and ema_ok and volume_ok and rebound_ok)
     return ok, {
         "price": float(row5.close), "bullish": bullish, "break_structure": break_structure,
         "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
         "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
-        "volume_ratio": round(vol_ratio, 2), "rebound_pct": round(rebound_pct, 2),
+        "volume_ratio": round(vol_ratio15, 2), "rebound_pct": round(rebound_pct, 2),
     }
 
 
@@ -1354,7 +1374,7 @@ class DailyBot:
                 arm_pct = self.cfg.hj_rebound_arm_drawdown_pct if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_arm_drawdown_pct
                 if drawdown_pct <= -abs(arm_pct):
                     try:
-                        ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
+                        ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg, str(row["strategy"] or "P"))
                         if ok:
                             self._rebound_add(row, float(details.get("price") or price))
                             continue
@@ -1384,20 +1404,41 @@ class DailyBot:
                 continue
 
             if strategy == "HJ":
-                if unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
-                    self._close(row, paper_fill(hj_loss_trigger), 1.0, "HJ_MAX_LOSS", price, hj_loss_trigger)
+                # HJ는 -4.5 USDT를 즉시손절선이 아니라 반등 대기 경계로 사용한다.
+                # 한 봉 흔들림으로 물타기 기회가 사라지지 않도록 최소 대기시간을 보장하고,
+                # -7 USDT 비상손절 또는 확정 구조이탈에서만 전량 종료한다.
+                emergency_trigger = avg - (abs(self.cfg.hj_emergency_loss_usdt) / total_qty) if total_qty > 0 else price
+                if unrealized_usdt <= -abs(self.cfg.hj_emergency_loss_usdt):
+                    self._close(row, paper_fill(emergency_trigger), 1.0, "HJ_EMERGENCY_STOP", price, emergency_trigger)
                     continue
+
+                broken, structure = False, {}
                 if self.cfg.hj_structure_stop_enabled:
                     try:
                         broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
                     except Exception as exc:
-                        broken, structure = False, {"error": str(exc)}
                         log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
                                   strategy=strategy, trade_id=row["trade_id"] or "")
-                    if broken:
-                        trigger = float(structure.get("price") or price)
-                        self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
-                        continue
+
+                wait_minutes = max(0, int(self.cfg.hj_rebound_wait_minutes))
+                grace_done = age_h * 60 >= wait_minutes
+                if broken and (grace_done or unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt)):
+                    trigger = float(structure.get("price") or price)
+                    self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
+                    continue
+
+                if unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
+                    log_event(
+                        row["symbol"], "HJ_REBOUND_WAIT", price, mode=self.cfg.mode,
+                        details=json.dumps({
+                            "unrealized_usdt": round(unrealized_usdt, 4),
+                            "boundary_usdt": -abs(self.cfg.hj_max_loss_usdt),
+                            "age_minutes": round(age_h * 60, 1),
+                            "grace_minutes": wait_minutes,
+                            "structure_broken": broken,
+                        }, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or "",
+                    )
             else:
                 if self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
                     trigger = base_price * (1 - self.cfg.stage1_stop_pct / 100)
