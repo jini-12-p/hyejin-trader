@@ -199,7 +199,7 @@
   "stage1_stop_fraction": 0.5,
   "final_stop_pct": 2.3,
   "recovery_exit_loss_pct": 0.3,
-  "strategy_version": "STABLE-v4.3.6-RSI90-BBChase-VolGuard",
+  "strategy_version": "RC-v4.3.8-HJStructureStop-LoginFix",
   "max_ema9_distance_pct": 1.0,
   "late_rise_streak_bars": 3,
   "late_rise_streak_max_ema9_distance_pct": 0.55,
@@ -216,5 +216,11 @@
   "bb_chase_soft_rsi": 85.0,
   "bb_chase_soft_candle_gain_pct": 2.0,
   "bb_chase_soft_candle_range_pct": 3.0,
-  "bb_chase_soft_volume_ratio": 2.0
+  "bb_chase_soft_volume_ratio": 2.0,
+  "hj_position_margin_usdt": 36.0,
+  "hj_rebound_arm_drawdown_pct": 1.2,
+  "hj_rebound_add_margin_usdt": 18.0,
+  "hj_max_loss_usdt": 4.5,
+  "hj_structure_stop_enabled": true,
+  "hj_structure_break_buffer_pct": 0.15
 }

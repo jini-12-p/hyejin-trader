@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "STABLE-v4.3.6-RSI90-BBChase-VolGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.8-HJStructureStop-LoginFix"
 
 
 @dataclass
@@ -81,6 +81,7 @@ class DailyConfig:
     max_positions: int = 2
     max_daily_entries: int = 0  # 0이면 PAPER 데이터 수집 중 횟수 제한 없음
     position_margin_usdt: float = 54.0
+    hj_position_margin_usdt: float = 36.0
     tp1_pct: float = 1.5
     tp2_pct: float = 3.0
     hard_stop_pct: float = 1.5
@@ -111,6 +112,11 @@ class DailyConfig:
     rebound_add_enabled: bool = True
     rebound_arm_drawdown_pct: float = 0.6
     rebound_add_margin_usdt: float = 27.0
+    hj_rebound_arm_drawdown_pct: float = 1.2
+    hj_rebound_add_margin_usdt: float = 18.0
+    hj_max_loss_usdt: float = 4.5
+    hj_structure_stop_enabled: bool = True
+    hj_structure_break_buffer_pct: float = 0.15
     rebound_exit_buffer_pct: float = 0.10
     max_cycle_adds: int = 2
     flat_exit_minutes: int = 60
@@ -786,6 +792,53 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
 MEME_SYMBOLS: set[str] = set()
 
 
+def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
+    """15분 구조와 거래량이 함께 회복될 때만 반등 추가한다."""
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 140)))
+    m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
+    if len(m5) < 50 or len(m15) < 30:
+        return False, {"reason": "반등 캔들 부족"}
+    row5, prev5 = m5.iloc[-1], m5.iloc[-2]
+    row15, prev15 = m15.iloc[-1], m15.iloc[-2]
+    recent_low = float(m5.tail(12).low.min())
+    rebound_pct = (float(row5.close) / recent_low - 1) * 100 if recent_low > 0 else 0.0
+    vol_ratio = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
+    prior_15m_high = float(m15.iloc[-4:-1].high.max())
+    bullish = bool(row5.close > row5.open and row15.close > row15.open)
+    break_structure = bool(row15.close > prior_15m_high and row5.close > prev5.high)
+    rsi_ok = bool(row15.rsi >= cfg.rebound_min_rsi and row15.rsi > prev15.rsi)
+    ema_ok = bool(row15.close >= row15.ema9 and row15.ema9 >= row15.ema20)
+    volume_ok = bool(vol_ratio >= cfg.rebound_min_volume_ratio)
+    rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
+    ok = bool(bullish and break_structure and rsi_ok and ema_ok and volume_ok and rebound_ok)
+    return ok, {
+        "price": float(row5.close), "bullish": bullish, "break_structure": break_structure,
+        "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
+        "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
+        "volume_ratio": round(vol_ratio, 2), "rebound_pct": round(rebound_pct, 2),
+    }
+
+
+def hj_structure_broken(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
+    """확정 15분봉 두 개가 EMA20 아래에 있고 최근 저점을 재이탈할 때 HJ 구조 이탈로 본다."""
+    m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
+    if len(m15) < 25:
+        return False, {"reason": "구조 캔들 부족"}
+    last, prev = m15.iloc[-1], m15.iloc[-2]
+    buffer = abs(float(cfg.hj_structure_break_buffer_pct)) / 100
+    two_closes_below = bool(last.close < last.ema20 and prev.close < prev.ema20)
+    ema20_falling = bool(last.ema20 <= prev.ema20)
+    lower_low_break = bool(last.close < float(prev.low) * (1 - buffer))
+    broken = bool(two_closes_below and ema20_falling and lower_low_break)
+    return broken, {
+        "price": float(last.close),
+        "two_closes_below_ema20": two_closes_below,
+        "ema20_falling": ema20_falling,
+        "lower_low_break": lower_low_break,
+        "ema20": float(last.ema20),
+        "previous_low": float(prev.low),
+    }
+
 def qty_from_margin(price: float, margin_usdt: float, leverage: float) -> float:
     """증거금과 레버리지로 주문 수량을 계산한다."""
     price = float(price)
@@ -1034,7 +1087,8 @@ class DailyBot:
         )
 
     def _open(self, symbol: str, price: float, strategy: str, score: float, signal_details: dict[str, Any] | None = None) -> None:
-        qty = qty_from_margin(price, self.cfg.position_margin_usdt, self.cfg.leverage)
+        entry_margin = self.cfg.hj_position_margin_usdt if strategy == "HJ" else self.cfg.position_margin_usdt
+        qty = qty_from_margin(price, entry_margin, self.cfg.leverage)
         self._execute(symbol, "buy", qty)
         trade_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
         with db() as conn:
@@ -1045,13 +1099,13 @@ class DailyBot:
                     last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
                     base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id,stop_stage1_done
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (symbol, "OPEN", utc_now(), utc_now(), price, qty, self.cfg.position_margin_usdt, 0, 0,
+                (symbol, "OPEN", utc_now(), utc_now(), price, qty, entry_margin, 0, 0,
                  price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
                  price, qty, 0.0, 0.0, price, price, price, trade_id, 0),
             )
         signal_details = signal_details or {}
         details = json.dumps({
-            "entry_price": price, "margin_usdt": self.cfg.position_margin_usdt,
+            "entry_price": price, "margin_usdt": entry_margin,
             "leverage": self.cfg.leverage, "qty": qty, "score": round(score, 2),
             "strategy": strategy,
             "rsi": signal_details.get("rsi"),
@@ -1073,7 +1127,8 @@ class DailyBot:
         log_event(symbol, "ENTRY", price, qty, self.cfg.mode, details, strategy, trade_id=trade_id)
 
     def _rebound_add(self, row: sqlite3.Row, price: float) -> None:
-        add_qty = qty_from_margin(price, self.cfg.rebound_add_margin_usdt, self.cfg.leverage)
+        add_margin = self.cfg.hj_rebound_add_margin_usdt if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_add_margin_usdt
+        add_qty = qty_from_margin(price, add_margin, self.cfg.leverage)
         if add_qty <= 0:
             return
         self._execute(row["symbol"], "buy", add_qty)
@@ -1085,11 +1140,11 @@ class DailyBot:
             conn.execute(
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,dca_count=?,
                    add_qty=?,add_price=?,updated_at=?,last_price=?,note=? WHERE symbol=?""",
-                (new_avg, new_qty, float(row["total_margin"]) + self.cfg.rebound_add_margin_usdt,
+                (new_avg, new_qty, float(row["total_margin"]) + add_margin,
                  int(row["dca_count"] or 0) + 1, add_qty, price, utc_now(), price,
                  "반등 확인 후 순환 추가진입", row["symbol"]),
             )
-        details = json.dumps({"add_price": price, "add_margin_usdt": self.cfg.rebound_add_margin_usdt,
+        details = json.dumps({"add_price": price, "add_margin_usdt": add_margin,
                               "add_qty": add_qty, "previous_avg": old_avg, "new_avg": new_avg,
                               "cycle_no": int(row["dca_count"] or 0) + 1}, ensure_ascii=False)
         log_event(row["symbol"], "REBOUND_ADD", price, add_qty, self.cfg.mode,
@@ -1108,7 +1163,7 @@ class DailyBot:
             conn.execute(
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,add_qty=0,add_price=0,
                    updated_at=?,last_price=?,note=?,realized_pnl=?,lowest_price=?,highest_price=?,cycle_anchor_price=? WHERE symbol=?""",
-                (base_price, remaining, max(0.0, float(row["total_margin"]) - self.cfg.rebound_add_margin_usdt),
+                (base_price, remaining, max(0.0, float(row["total_margin"]) - (self.cfg.hj_rebound_add_margin_usdt if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_add_margin_usdt)),
                  utc_now(), price, "순환 추가분 정리 · 최초 물량 유지", total_realized,
                  price, price, price, row["symbol"]),
             )
@@ -1296,7 +1351,8 @@ class DailyBot:
                     and int(row["stop_stage1_done"] or 0) == 0):
                 anchor = float(row["cycle_anchor_price"] or base_price)
                 drawdown_pct = (lowest / anchor - 1) * 100
-                if drawdown_pct <= -abs(self.cfg.rebound_arm_drawdown_pct):
+                arm_pct = self.cfg.hj_rebound_arm_drawdown_pct if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_arm_drawdown_pct
+                if drawdown_pct <= -abs(arm_pct):
                     try:
                         ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
                         if ok:
@@ -1314,20 +1370,37 @@ class DailyBot:
                 return price
 
             stop_stage1_done = int(row["stop_stage1_done"] or 0)
+            strategy = str(row["strategy"] or "P")
+            total_qty = float(row["total_qty"] or 0)
+            unrealized_usdt = (price - avg) * total_qty
+            hj_loss_trigger = avg - (self.cfg.hj_max_loss_usdt / total_qty) if total_qty > 0 else price
+
             if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
                 trigger = base_price * (1 - self.cfg.breakeven_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
-            elif self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
+            elif strategy == "HJ" and unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
+                self._close(row, paper_fill(hj_loss_trigger), 1.0, "HJ_MAX_LOSS", price, hj_loss_trigger)
+            elif strategy == "HJ" and self.cfg.hj_structure_stop_enabled:
+                try:
+                    broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
+                except Exception as exc:
+                    broken, structure = False, {"error": str(exc)}
+                    log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
+                              strategy=strategy, trade_id=row["trade_id"] or "")
+                if broken:
+                    trigger = float(structure.get("price") or price)
+                    self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
+                    continue
+            elif strategy != "HJ" and self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
                 trigger = base_price * (1 - self.cfg.stage1_stop_pct / 100)
                 self._close(row, paper_fill(trigger), self.cfg.stage1_stop_fraction, "STOP_HALF", price, trigger)
-            elif self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct <= -self.cfg.final_stop_pct:
+            elif strategy != "HJ" and self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct <= -self.cfg.final_stop_pct:
                 trigger = base_price * (1 - self.cfg.final_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "FINAL_STOP", price, trigger)
-            elif self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct >= -self.cfg.recovery_exit_loss_pct:
-                # 1차 손절 뒤 본절권으로 회복하면 남은 물량을 실제 감지가격에 정리한다.
+            elif strategy != "HJ" and self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct >= -self.cfg.recovery_exit_loss_pct:
                 trigger = base_price * (1 - self.cfg.recovery_exit_loss_pct / 100)
                 self._close(row, price, 1.0, "RECOVERY_EXIT", price, trigger)
-            elif (not self.cfg.staged_stop_enabled) and base_pnl_pct <= -self.cfg.hard_stop_pct:
+            elif strategy != "HJ" and (not self.cfg.staged_stop_enabled) and base_pnl_pct <= -self.cfg.hard_stop_pct:
                 trigger = base_price * (1 - self.cfg.hard_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "STOP", price, trigger)
             elif (age_h * 60 >= self.cfg.flat_exit_minutes
