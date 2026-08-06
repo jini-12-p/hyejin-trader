@@ -1375,36 +1375,50 @@ class DailyBot:
             unrealized_usdt = (price - avg) * total_qty
             hj_loss_trigger = avg - (self.cfg.hj_max_loss_usdt / total_qty) if total_qty > 0 else price
 
+            # 종료 조건은 HJ/P별 손절을 먼저 확인한 뒤, 공통 TP/시간 종료를 반드시 확인한다.
+            # 이전 코드는 HJ 구조손절이 활성화된 것만으로 elif 체인이 소진되어,
+            # 구조가 유지 중인 HJ 포지션의 TP1/TP2 검사가 건너뛰어지는 문제가 있었다.
             if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
                 trigger = base_price * (1 - self.cfg.breakeven_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
-            elif strategy == "HJ" and unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
-                self._close(row, paper_fill(hj_loss_trigger), 1.0, "HJ_MAX_LOSS", price, hj_loss_trigger)
-            elif strategy == "HJ" and self.cfg.hj_structure_stop_enabled:
-                try:
-                    broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
-                except Exception as exc:
-                    broken, structure = False, {"error": str(exc)}
-                    log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
-                              strategy=strategy, trade_id=row["trade_id"] or "")
-                if broken:
-                    trigger = float(structure.get("price") or price)
-                    self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
+                continue
+
+            if strategy == "HJ":
+                if unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
+                    self._close(row, paper_fill(hj_loss_trigger), 1.0, "HJ_MAX_LOSS", price, hj_loss_trigger)
                     continue
-            elif strategy != "HJ" and self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
-                trigger = base_price * (1 - self.cfg.stage1_stop_pct / 100)
-                self._close(row, paper_fill(trigger), self.cfg.stage1_stop_fraction, "STOP_HALF", price, trigger)
-            elif strategy != "HJ" and self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct <= -self.cfg.final_stop_pct:
-                trigger = base_price * (1 - self.cfg.final_stop_pct / 100)
-                self._close(row, paper_fill(trigger), 1.0, "FINAL_STOP", price, trigger)
-            elif strategy != "HJ" and self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct >= -self.cfg.recovery_exit_loss_pct:
-                trigger = base_price * (1 - self.cfg.recovery_exit_loss_pct / 100)
-                self._close(row, price, 1.0, "RECOVERY_EXIT", price, trigger)
-            elif strategy != "HJ" and (not self.cfg.staged_stop_enabled) and base_pnl_pct <= -self.cfg.hard_stop_pct:
-                trigger = base_price * (1 - self.cfg.hard_stop_pct / 100)
-                self._close(row, paper_fill(trigger), 1.0, "STOP", price, trigger)
-            elif (age_h * 60 >= self.cfg.flat_exit_minutes
-                  and (highest / base_price - 1) * 100 < self.cfg.flat_min_favorable_pct):
+                if self.cfg.hj_structure_stop_enabled:
+                    try:
+                        broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
+                    except Exception as exc:
+                        broken, structure = False, {"error": str(exc)}
+                        log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
+                                  strategy=strategy, trade_id=row["trade_id"] or "")
+                    if broken:
+                        trigger = float(structure.get("price") or price)
+                        self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
+                        continue
+            else:
+                if self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
+                    trigger = base_price * (1 - self.cfg.stage1_stop_pct / 100)
+                    self._close(row, paper_fill(trigger), self.cfg.stage1_stop_fraction, "STOP_HALF", price, trigger)
+                    continue
+                if self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct <= -self.cfg.final_stop_pct:
+                    trigger = base_price * (1 - self.cfg.final_stop_pct / 100)
+                    self._close(row, paper_fill(trigger), 1.0, "FINAL_STOP", price, trigger)
+                    continue
+                if self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct >= -self.cfg.recovery_exit_loss_pct:
+                    trigger = base_price * (1 - self.cfg.recovery_exit_loss_pct / 100)
+                    self._close(row, price, 1.0, "RECOVERY_EXIT", price, trigger)
+                    continue
+                if (not self.cfg.staged_stop_enabled) and base_pnl_pct <= -self.cfg.hard_stop_pct:
+                    trigger = base_price * (1 - self.cfg.hard_stop_pct / 100)
+                    self._close(row, paper_fill(trigger), 1.0, "STOP", price, trigger)
+                    continue
+
+            # HJ/P 공통 종료: 위 손절 조건에 걸리지 않았다면 TP와 시간 종료를 검사한다.
+            if (age_h * 60 >= self.cfg.flat_exit_minutes
+                    and (highest / base_price - 1) * 100 < self.cfg.flat_min_favorable_pct):
                 self._close(row, price, 1.0, "FLAT_EXIT_75M", price, None)
             elif age_h >= self.cfg.max_hold_hours:
                 self._close(row, price, 1.0, "TIME_EXIT", price, None)
