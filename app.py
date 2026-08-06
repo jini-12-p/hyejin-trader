@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import json
 import io
 import csv
@@ -29,7 +30,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.6-RSI90-BBChase-VolGuard"
+APP_VERSION = "RC-v4.3.8-HJStructureStop-LoginFix"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -106,7 +107,13 @@ def require_password() -> None:
         st.error("APP_PASSWORD가 설정되지 않았습니다.")
         st.stop()
     token = auth_token(expected)
-    if st.session_state.get("authenticated") or cookie_manager.get("hj_auth") == token:
+    cookie_value = cookie_manager.get("hj_auth")
+    # CookieManager 컴포넌트가 첫 실행에서 쿠키를 늦게 돌려주는 경우 한 번만 재확인한다.
+    if cookie_value is None and not st.session_state.get("hj_cookie_checked_once"):
+        st.session_state.hj_cookie_checked_once = True
+        time.sleep(0.35)
+        st.rerun()
+    if st.session_state.get("authenticated") or cookie_value == token:
         st.session_state.authenticated = True
         return
     st.title("🔒 HJ Trader")
