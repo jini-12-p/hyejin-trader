@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.9-ReboundBelowAvg"
+BOT_RUNTIME_VERSION = "RC-v4.3.11-PStructureStop"
 
 
 @dataclass
@@ -112,7 +112,6 @@ class DailyConfig:
     rebound_add_enabled: bool = True
     rebound_add_margin_usdt: float = 27.0
     hj_rebound_add_margin_usdt: float = 18.0
-    hj_max_loss_usdt: float = 4.5
     hj_structure_stop_enabled: bool = True
     hj_structure_break_buffer_pct: float = 0.15
     rebound_exit_buffer_pct: float = 0.10
@@ -1374,7 +1373,6 @@ class DailyBot:
             strategy = str(row["strategy"] or "P")
             total_qty = float(row["total_qty"] or 0)
             unrealized_usdt = (price - avg) * total_qty
-            hj_loss_trigger = avg - (self.cfg.hj_max_loss_usdt / total_qty) if total_qty > 0 else price
 
             # 종료 조건은 HJ/P별 손절을 먼저 확인한 뒤, 공통 TP/시간 종료를 반드시 확인한다.
             # 이전 코드는 HJ 구조손절이 활성화된 것만으로 elif 체인이 소진되어,
@@ -1384,37 +1382,19 @@ class DailyBot:
                 self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
                 continue
 
-            if strategy == "HJ":
-                if unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
-                    self._close(row, paper_fill(hj_loss_trigger), 1.0, "HJ_MAX_LOSS", price, hj_loss_trigger)
-                    continue
-                if self.cfg.hj_structure_stop_enabled:
-                    try:
-                        broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
-                    except Exception as exc:
-                        broken, structure = False, {"error": str(exc)}
-                        log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
-                                  strategy=strategy, trade_id=row["trade_id"] or "")
-                    if broken:
-                        trigger = float(structure.get("price") or price)
-                        self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
-                        continue
-            else:
-                if self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
-                    trigger = base_price * (1 - self.cfg.stage1_stop_pct / 100)
-                    self._close(row, paper_fill(trigger), self.cfg.stage1_stop_fraction, "STOP_HALF", price, trigger)
-                    continue
-                if self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct <= -self.cfg.final_stop_pct:
-                    trigger = base_price * (1 - self.cfg.final_stop_pct / 100)
-                    self._close(row, paper_fill(trigger), 1.0, "FINAL_STOP", price, trigger)
-                    continue
-                if self.cfg.staged_stop_enabled and stop_stage1_done == 1 and base_pnl_pct >= -self.cfg.recovery_exit_loss_pct:
-                    trigger = base_price * (1 - self.cfg.recovery_exit_loss_pct / 100)
-                    self._close(row, price, 1.0, "RECOVERY_EXIT", price, trigger)
-                    continue
-                if (not self.cfg.staged_stop_enabled) and base_pnl_pct <= -self.cfg.hard_stop_pct:
-                    trigger = base_price * (1 - self.cfg.hard_stop_pct / 100)
-                    self._close(row, paper_fill(trigger), 1.0, "STOP", price, trigger)
+            # HJ/P 공통 구조손절:
+            # 확정 15분봉 2개가 EMA20 아래 + EMA20 하락 + 직전 저점 재이탈 시 전량 종료한다.
+            if self.cfg.hj_structure_stop_enabled:
+                try:
+                    broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
+                except Exception as exc:
+                    broken, structure = False, {"error": str(exc)}
+                    log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
+                              strategy=strategy, trade_id=row["trade_id"] or "")
+                if broken:
+                    trigger = float(structure.get("price") or price)
+                    reason = "HJ_STRUCTURE_STOP" if strategy == "HJ" else "STOP"
+                    self._close(row, price, 1.0, reason, price, trigger)
                     continue
 
             # HJ/P 공통 종료: 위 손절 조건에 걸리지 않았다면 TP와 시간 종료를 검사한다.
