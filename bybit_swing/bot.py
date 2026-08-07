@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.8-HJStructureStop-LoginFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.9-ReboundBelowAvg"
 
 
 @dataclass
@@ -110,9 +110,7 @@ class DailyConfig:
     telegram_notify_exit: bool = True
     telegram_notify_error: bool = True
     rebound_add_enabled: bool = True
-    rebound_arm_drawdown_pct: float = 0.6
     rebound_add_margin_usdt: float = 27.0
-    hj_rebound_arm_drawdown_pct: float = 1.2
     hj_rebound_add_margin_usdt: float = 18.0
     hj_max_loss_usdt: float = 4.5
     hj_structure_stop_enabled: bool = True
@@ -1127,13 +1125,16 @@ class DailyBot:
         log_event(symbol, "ENTRY", price, qty, self.cfg.mode, details, strategy, trade_id=trade_id)
 
     def _rebound_add(self, row: sqlite3.Row, price: float) -> None:
+        old_avg = float(row["avg_price"])
+        # HJ/P 공통 안전장치: 반등이 확인되어도 현재 평단 이상에서는 절대 추가하지 않는다.
+        if float(price) >= old_avg:
+            return
         add_margin = self.cfg.hj_rebound_add_margin_usdt if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_add_margin_usdt
         add_qty = qty_from_margin(price, add_margin, self.cfg.leverage)
         if add_qty <= 0:
             return
         self._execute(row["symbol"], "buy", add_qty)
         old_qty = float(row["total_qty"])
-        old_avg = float(row["avg_price"])
         new_qty = old_qty + add_qty
         new_avg = (old_avg * old_qty + price * add_qty) / new_qty
         with db() as conn:
@@ -1344,22 +1345,22 @@ class DailyBot:
                     self._cycle_reduce(row, price)
                     continue
 
-            # 순환 추가분을 이미 회수했다면 다시 밀린 뒤 새 반등이 확인될 때 최대 설정 횟수까지 반복한다.
+            # 순환 추가분을 이미 회수했다면, 고정 하락률(-0.6%/-1.2%) 없이
+            # 마감된 5분/15분봉 반등 신호가 확인될 때만 추가를 검토한다.
+            # 실제 추가는 _rebound_add()에서 반드시 현재 평단 아래일 때만 허용한다.
             if (self.cfg.rebound_add_enabled and float(row["add_qty"] or 0) <= 0
                     and int(row["dca_count"] or 0) < self.cfg.max_cycle_adds
                     and int(row["tp1_done"] or 0) == 0
                     and int(row["stop_stage1_done"] or 0) == 0):
-                anchor = float(row["cycle_anchor_price"] or base_price)
-                drawdown_pct = (lowest / anchor - 1) * 100
-                arm_pct = self.cfg.hj_rebound_arm_drawdown_pct if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_arm_drawdown_pct
-                if drawdown_pct <= -abs(arm_pct):
-                    try:
-                        ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
-                        if ok:
-                            self._rebound_add(row, float(details.get("price") or price))
+                try:
+                    ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
+                    if ok:
+                        add_price = float(details.get("price") or price)
+                        if add_price < avg:
+                            self._rebound_add(row, add_price)
                             continue
-                    except Exception as exc:
-                        log_event(row["symbol"], "REBOUND_CHECK_ERROR", mode=self.cfg.mode, details=str(exc))
+                except Exception as exc:
+                    log_event(row["symbol"], "REBOUND_CHECK_ERROR", mode=self.cfg.mode, details=str(exc))
 
             # 손절과 목표가는 최초 진입가 기준으로 관리한다.
             # PAPER에서는 조회 주기 사이 급변으로 계획 손절폭을 초과해 기록하지 않도록
