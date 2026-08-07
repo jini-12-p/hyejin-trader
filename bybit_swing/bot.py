@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.11-PStructureStop"
+BOT_RUNTIME_VERSION = "RC-v4.3.12-ReboundTimingGuard"
 
 
 @dataclass
@@ -116,6 +116,7 @@ class DailyConfig:
     hj_structure_break_buffer_pct: float = 0.15
     rebound_exit_buffer_pct: float = 0.10
     max_cycle_adds: int = 2
+    rebound_min_drawdown_pct: float = 1.5  # 이보다 얕은 구간에서는 물타기 금지(arm 트리거가 아님)
     flat_exit_minutes: int = 60
     flat_min_favorable_pct: float = 0.40
     min_pullback_from_high_pct: float = 0.30
@@ -353,6 +354,7 @@ def init_db() -> None:
         _ensure_column(conn, "bot_positions", "cycle_anchor_price", "REAL")
         _ensure_column(conn, "bot_positions", "trade_id", "TEXT")
         _ensure_column(conn, "bot_positions", "stop_stage1_done", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "bot_positions", "last_add_15m_bucket", "TEXT")
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_events", "trade_id", "TEXT")
@@ -801,7 +803,13 @@ def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) 
     rebound_pct = (float(row5.close) / recent_low - 1) * 100 if recent_low > 0 else 0.0
     vol_ratio = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
     prior_15m_high = float(m15.iloc[-4:-1].high.max())
-    bullish = bool(row5.close > row5.open and row15.close > row15.open)
+    # 단일 양봉 하나를 반등으로 보지 않는다: 마감된 5분봉 2개가 연속 양봉이어야 한다.
+    two_bullish_5m = bool(
+        prev5.close > prev5.open
+        and row5.close > row5.open
+        and row5.close >= prev5.close
+    )
+    bullish = bool(two_bullish_5m and row15.close > row15.open)
     break_structure = bool(row15.close > prior_15m_high and row5.close > prev5.high)
     rsi_ok = bool(row15.rsi >= cfg.rebound_min_rsi and row15.rsi > prev15.rsi)
     ema_ok = bool(row15.close >= row15.ema9 and row15.ema9 >= row15.ema20)
@@ -809,8 +817,8 @@ def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) 
     rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
     ok = bool(bullish and break_structure and rsi_ok and ema_ok and volume_ok and rebound_ok)
     return ok, {
-        "price": float(row5.close), "bullish": bullish, "break_structure": break_structure,
-        "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
+        "price": float(row5.close), "bullish": bullish, "two_bullish_5m": two_bullish_5m,
+        "break_structure": break_structure, "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
         "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
         "volume_ratio": round(vol_ratio, 2), "rebound_pct": round(rebound_pct, 2),
     }
@@ -1136,13 +1144,15 @@ class DailyBot:
         old_qty = float(row["total_qty"])
         new_qty = old_qty + add_qty
         new_avg = (old_avg * old_qty + price * add_qty) / new_qty
+        now = datetime.now(timezone.utc)
+        add_bucket = str(int(now.timestamp()) // 900)
         with db() as conn:
             conn.execute(
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,dca_count=?,
-                   add_qty=?,add_price=?,updated_at=?,last_price=?,note=? WHERE symbol=?""",
+                   add_qty=?,add_price=?,updated_at=?,last_price=?,note=?,last_add_15m_bucket=? WHERE symbol=?""",
                 (new_avg, new_qty, float(row["total_margin"]) + add_margin,
                  int(row["dca_count"] or 0) + 1, add_qty, price, utc_now(), price,
-                 "반등 확인 후 순환 추가진입", row["symbol"]),
+                 "반등 확인 후 순환 추가진입", add_bucket, row["symbol"]),
             )
         details = json.dumps({"add_price": price, "add_margin_usdt": add_margin,
                               "add_qty": add_qty, "previous_avg": old_avg, "new_avg": new_avg,
@@ -1344,20 +1354,44 @@ class DailyBot:
                     self._cycle_reduce(row, price)
                     continue
 
-            # 순환 추가분을 이미 회수했다면, 고정 하락률(-0.6%/-1.2%) 없이
-            # 마감된 5분/15분봉 반등 신호가 확인될 때만 추가를 검토한다.
-            # 실제 추가는 _rebound_add()에서 반드시 현재 평단 아래일 때만 허용한다.
+            # 물타기 시간/깊이 안전장치
+            # 1) 진입한 15분봉에서는 물타기 금지
+            # 2) 같은 15분봉에서는 최대 1회만 허용
+            # 3) 현재 가격이 최초 평단 대비 -1.5%보다 얕으면 무조건 금지
+            #    (-1.5% 도달 자체가 물타기 트리거는 아니며, 이후 반등 조건을 별도로 모두 통과해야 한다.)
+            # 4) 마감된 5분봉 2개 연속 양봉 + 기존 15분 구조/RSI/EMA/거래량 반등 조건 유지
             if (self.cfg.rebound_add_enabled and float(row["add_qty"] or 0) <= 0
                     and int(row["dca_count"] or 0) < self.cfg.max_cycle_adds
                     and int(row["tp1_done"] or 0) == 0
                     and int(row["stop_stage1_done"] or 0) == 0):
                 try:
-                    ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
-                    if ok:
-                        add_price = float(details.get("price") or price)
-                        if add_price < avg:
-                            self._rebound_add(row, add_price)
-                            continue
+                    now = datetime.now(timezone.utc)
+                    current_15m_bucket = str(int(now.timestamp()) // 900)
+                    opened_at = datetime.fromisoformat(row["opened_at"])
+                    if opened_at.tzinfo is None:
+                        opened_at = opened_at.replace(tzinfo=timezone.utc)
+                    entry_15m_bucket = str(int(opened_at.timestamp()) // 900)
+                    last_add_15m_bucket = str(row["last_add_15m_bucket"] or "")
+
+                    # 진입봉 및 같은 15분봉 재물타기 차단
+                    timing_ok = (
+                        current_15m_bucket != entry_15m_bucket
+                        and current_15m_bucket != last_add_15m_bucket
+                    )
+
+                    # 현재 가격 기준 최소 눌림폭. 이 수치 도달은 'arm'이 아니라 단순 금지선이다.
+                    current_drawdown_pct = (price / base_price - 1) * 100
+                    deep_enough_now = current_drawdown_pct <= -abs(self.cfg.rebound_min_drawdown_pct)
+
+                    if timing_ok and deep_enough_now:
+                        ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
+                        if ok:
+                            add_price = float(details.get("price") or price)
+                            add_drawdown_pct = (add_price / base_price - 1) * 100
+                            if (add_price < avg
+                                    and add_drawdown_pct <= -abs(self.cfg.rebound_min_drawdown_pct)):
+                                self._rebound_add(row, add_price)
+                                continue
                 except Exception as exc:
                     log_event(row["symbol"], "REBOUND_CHECK_ERROR", mode=self.cfg.mode, details=str(exc))
 
