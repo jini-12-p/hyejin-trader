@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.4.0-HJSafeCycle"
+BOT_RUNTIME_VERSION = "RC-v4.3.8-HJStructureStop-LoginFix"
 
 
 @dataclass
@@ -112,16 +112,9 @@ class DailyConfig:
     rebound_add_enabled: bool = True
     rebound_arm_drawdown_pct: float = 0.6
     rebound_add_margin_usdt: float = 27.0
-    hj_rebound_arm_drawdown_pct: float = 1.2  # legacy fallback
-    hj_rebound_arm_min_pct: float = 1.50
-    hj_rebound_arm_max_pct: float = 3.00
-    hj_rebound_arm_range_mult: float = 0.80
-    hj_rebound_min_add_discount_pct: float = 0.50
-    hj_rebound_min_wait_minutes: int = 5
+    hj_rebound_arm_drawdown_pct: float = 1.2
     hj_rebound_add_margin_usdt: float = 18.0
     hj_max_loss_usdt: float = 4.5
-    hj_emergency_loss_usdt: float = 7.0
-    hj_rebound_wait_minutes: int = 20
     hj_structure_stop_enabled: bool = True
     hj_structure_break_buffer_pct: float = 0.15
     rebound_exit_buffer_pct: float = 0.10
@@ -363,8 +356,6 @@ def init_db() -> None:
         _ensure_column(conn, "bot_positions", "cycle_anchor_price", "REAL")
         _ensure_column(conn, "bot_positions", "trade_id", "TEXT")
         _ensure_column(conn, "bot_positions", "stop_stage1_done", "INTEGER DEFAULT 0")
-        _ensure_column(conn, "bot_positions", "rebound_armed_at", "TEXT")
-        _ensure_column(conn, "bot_positions", "rebound_armed_low", "REAL")
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_events", "trade_id", "TEXT")
@@ -488,11 +479,8 @@ def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: s
 
 def indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["ema5"] = out["close"].ewm(span=5, adjust=False).mean()
     out["ema9"] = out["close"].ewm(span=9, adjust=False).mean()
-    out["ema10"] = out["close"].ewm(span=10, adjust=False).mean()
     out["ema20"] = out["close"].ewm(span=20, adjust=False).mean()
-    out["ema50"] = out["close"].ewm(span=50, adjust=False).mean()
     out["ema60"] = out["close"].ewm(span=60, adjust=False).mean()
     delta = out["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
@@ -620,14 +608,6 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     live_rsi = float(live.rsi)
     hj_rsi_ok = bool(48.0 <= live_rsi <= cfg.hj_max_rsi)
 
-    # 혜진형은 현재봉에서 막 정배열이 생긴 종목이 아니라,
-    # 직전 확정봉들부터 EMA5>10>20>50 정배열이 유지된 종목만 허용한다.
-    hj_live_full_order = bool(live.ema5 > live.ema10 > live.ema20 > live.ema50)
-    hj_last_full_order = bool(last.ema5 > last.ema10 > last.ema20 > last.ema50)
-    hj_before_full_order = bool(before.ema5 > before.ema10 > before.ema20 > before.ema50)
-    hj_order_maintained = bool(hj_live_full_order and hj_last_full_order and hj_before_full_order)
-    hj_slow_ema_rising = bool(live.ema20 >= last.ema20 >= before.ema20 and live.ema50 >= last.ema50)
-
     # 볼린저 상단 과돌파 추격 방지:
     # 1% 이상은 무조건 차단, 0.5~1%는 RSI/봉크기/거래량 과열이 동반될 때 차단한다.
     live_bb_upper = float(live.bb_upper) if pd.notna(live.bb_upper) else 0.0
@@ -689,8 +669,6 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and hj_ema20_above_ema60
         and hj_ema20_rising_3
         and hj_rsi_ok
-        and hj_order_maintained
-        and hj_slow_ema_rising
         and not last_large_bearish
     )
     hj_ok = bool(
@@ -751,10 +729,6 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_ema20_not_rising")
             if not hj_rsi_ok:
                 rejected.append("hj_rsi_out_of_range")
-            if not hj_order_maintained:
-                rejected.append("hj_ema_order_not_maintained")
-            if not hj_slow_ema_rising:
-                rejected.append("hj_slow_ema_not_rising")
             if not hj_bb_chase_ok:
                 rejected.append("hj_bb_upper_chase")
             if not hj_volatility_ok:
@@ -800,11 +774,6 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_ema20_above_ema60": hj_ema20_above_ema60,
         "hj_ema20_rising_3": hj_ema20_rising_3,
         "hj_rsi_ok": hj_rsi_ok,
-        "hj_order_maintained": hj_order_maintained,
-        "hj_live_full_order": hj_live_full_order,
-        "hj_last_full_order": hj_last_full_order,
-        "hj_before_full_order": hj_before_full_order,
-        "hj_slow_ema_rising": hj_slow_ema_rising,
         "hj_max_rsi": cfg.hj_max_rsi,
         "bb_upper": round(live_bb_upper, 10) if live_bb_upper > 0 else None,
         "bb_upper_excess_pct": round(bb_upper_excess_pct, 2),
@@ -823,73 +792,30 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
 MEME_SYMBOLS: set[str] = set()
 
 
-def dynamic_hj_rebound_arm_pct(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> float:
-    """최근 확정 15분봉 변동폭에 맞춰 HJ 물타기 감시 시작 깊이를 정한다."""
-    m15 = confirmed(indicators(client.candles(symbol, "15m", 80)))
-    if len(m15) < 20:
-        return max(float(cfg.hj_rebound_arm_min_pct), float(cfg.hj_rebound_arm_drawdown_pct))
-    ranges = ((m15.tail(20).high / m15.tail(20).low) - 1) * 100
-    median_range = float(ranges.median()) if len(ranges) else 0.0
-    dynamic = median_range * float(cfg.hj_rebound_arm_range_mult)
-    return max(float(cfg.hj_rebound_arm_min_pct), min(float(cfg.hj_rebound_arm_max_pct), dynamic))
-
-
-def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig, strategy: str = "P",
-                       armed_at: str | None = None, armed_low: float | None = None) -> tuple[bool, dict[str, Any]]:
-    """눌림이 무장된 뒤 새로 마감된 5분봉 반등만 순환추가 신호로 인정한다."""
+def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
+    """15분 구조와 거래량이 함께 회복될 때만 반등 추가한다."""
     m5 = confirmed(indicators(client.candles(symbol, "5m", 140)))
     m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
     if len(m5) < 50 or len(m15) < 30:
         return False, {"reason": "반등 캔들 부족"}
     row5, prev5 = m5.iloc[-1], m5.iloc[-2]
     row15, prev15 = m15.iloc[-1], m15.iloc[-2]
-    recent_low = float(armed_low or m5.tail(12).low.min())
+    recent_low = float(m5.tail(12).low.min())
     rebound_pct = (float(row5.close) / recent_low - 1) * 100 if recent_low > 0 else 0.0
-    vol_ratio15 = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
-    vol_ratio5 = float(row5.volume / row5.vol_avg) if pd.notna(row5.vol_avg) and row5.vol_avg > 0 else 0.0
+    vol_ratio = float(row15.volume / row15.vol_avg) if pd.notna(row15.vol_avg) and row15.vol_avg > 0 else 0.0
     prior_15m_high = float(m15.iloc[-4:-1].high.max())
-    rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
-
-    candle_after_arm = True
-    if armed_at:
-        try:
-            arm_dt = datetime.fromisoformat(armed_at)
-            if arm_dt.tzinfo is None:
-                arm_dt = arm_dt.replace(tzinfo=timezone.utc)
-            candle_after_arm = bool(pd.Timestamp(row5.start_time).to_pydatetime() >= arm_dt)
-        except Exception:
-            candle_after_arm = False
-
-    if str(strategy).upper() == "HJ":
-        bullish5 = bool(row5.close > row5.open and row5.close > prev5.close)
-        micro_break = bool(row5.close > prev5.high and row5.low >= recent_low)
-        higher_low = bool(row5.low > prev5.low)
-        trend_alive = bool(row15.close >= row15.ema20 * 0.995 and row15.ema20 >= row15.ema50)
-        rsi_ok = bool(row15.rsi >= 42.0 and row15.rsi >= prev15.rsi - 1.0)
-        volume_ok = bool(vol_ratio5 >= 0.55 or vol_ratio15 >= 0.60)
-        ok = bool(candle_after_arm and bullish5 and (micro_break or higher_low) and trend_alive and rsi_ok and volume_ok and rebound_ok)
-        return ok, {
-            "price": float(row5.close), "candle_after_arm": candle_after_arm,
-            "bullish5": bullish5, "micro_break": micro_break, "higher_low": higher_low,
-            "trend_alive": trend_alive, "rsi_ok": rsi_ok, "volume_ok": volume_ok,
-            "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
-            "volume_ratio_5m": round(vol_ratio5, 2), "volume_ratio_15m": round(vol_ratio15, 2),
-            "rebound_pct": round(rebound_pct, 2), "armed_low": recent_low,
-            "signal_candle_start": str(row5.start_time),
-        }
-
     bullish = bool(row5.close > row5.open and row15.close > row15.open)
     break_structure = bool(row15.close > prior_15m_high and row5.close > prev5.high)
     rsi_ok = bool(row15.rsi >= cfg.rebound_min_rsi and row15.rsi > prev15.rsi)
     ema_ok = bool(row15.close >= row15.ema9 and row15.ema9 >= row15.ema20)
-    volume_ok = bool(vol_ratio15 >= cfg.rebound_min_volume_ratio)
-    ok = bool(candle_after_arm and bullish and break_structure and rsi_ok and ema_ok and volume_ok and rebound_ok)
+    volume_ok = bool(vol_ratio >= cfg.rebound_min_volume_ratio)
+    rebound_ok = bool(rebound_pct >= cfg.min_rebound_from_low_pct)
+    ok = bool(bullish and break_structure and rsi_ok and ema_ok and volume_ok and rebound_ok)
     return ok, {
-        "price": float(row5.close), "candle_after_arm": candle_after_arm,
-        "bullish": bullish, "break_structure": break_structure,
+        "price": float(row5.close), "bullish": bullish, "break_structure": break_structure,
         "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
         "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
-        "volume_ratio": round(vol_ratio15, 2), "rebound_pct": round(rebound_pct, 2),
+        "volume_ratio": round(vol_ratio, 2), "rebound_pct": round(rebound_pct, 2),
     }
 
 
@@ -1171,12 +1097,11 @@ class DailyBot:
                 """INSERT INTO bot_positions(
                     symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,
                     last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
-                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id,stop_stage1_done,
-                    rebound_armed_at,rebound_armed_low
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id,stop_stage1_done
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, "OPEN", utc_now(), utc_now(), price, qty, entry_margin, 0, 0,
                  price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
-                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0, None, None),
+                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0),
             )
         signal_details = signal_details or {}
         details = json.dumps({
@@ -1203,29 +1128,21 @@ class DailyBot:
 
     def _rebound_add(self, row: sqlite3.Row, price: float) -> None:
         add_margin = self.cfg.hj_rebound_add_margin_usdt if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_add_margin_usdt
-        old_avg = float(row["avg_price"])
-        if str(row["strategy"] or "") == "HJ":
-            max_add_price = old_avg * (1 - abs(self.cfg.hj_rebound_min_add_discount_pct) / 100)
-            if price > max_add_price:
-                log_event(row["symbol"], "REBOUND_ADD_BLOCKED", price, mode=self.cfg.mode,
-                          details=json.dumps({"reason": "평단보다 충분히 낮지 않음", "avg": old_avg,
-                                              "max_add_price": max_add_price}, ensure_ascii=False),
-                          strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
-                return
         add_qty = qty_from_margin(price, add_margin, self.cfg.leverage)
         if add_qty <= 0:
             return
         self._execute(row["symbol"], "buy", add_qty)
         old_qty = float(row["total_qty"])
+        old_avg = float(row["avg_price"])
         new_qty = old_qty + add_qty
         new_avg = (old_avg * old_qty + price * add_qty) / new_qty
         with db() as conn:
             conn.execute(
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,dca_count=?,
-                   add_qty=?,add_price=?,updated_at=?,last_price=?,note=?,rebound_armed_at=NULL,rebound_armed_low=NULL WHERE symbol=?""",
+                   add_qty=?,add_price=?,updated_at=?,last_price=?,note=? WHERE symbol=?""",
                 (new_avg, new_qty, float(row["total_margin"]) + add_margin,
                  int(row["dca_count"] or 0) + 1, add_qty, price, utc_now(), price,
-                 "새 눌림 뒤 확정 반등 순환추가", row["symbol"]),
+                 "반등 확인 후 순환 추가진입", row["symbol"]),
             )
         details = json.dumps({"add_price": price, "add_margin_usdt": add_margin,
                               "add_qty": add_qty, "previous_avg": old_avg, "new_avg": new_avg,
@@ -1238,29 +1155,22 @@ class DailyBot:
         if add_qty <= 0:
             return
         self._execute(row["symbol"], "sell", add_qty, reduce_only=True)
-        # 평균가 방식: 부분청산 뒤 남은 포지션의 유효평단은 혼합평단을 그대로 유지한다.
-        effective_avg = float(row["avg_price"])
-        pnl_usdt = (price - effective_avg) * add_qty
+        pnl_usdt = (price - float(row["add_price"] or row["avg_price"])) * add_qty
         remaining = max(0.0, float(row["total_qty"]) - add_qty)
+        base_price = float(row["base_entry_price"] or row["avg_price"])
         total_realized = float(row["realized_pnl"] or 0) + pnl_usdt
-        remaining_margin = max(0.0, float(row["total_margin"]) - (
-            self.cfg.hj_rebound_add_margin_usdt if str(row["strategy"] or "") == "HJ"
-            else self.cfg.rebound_add_margin_usdt
-        ))
         with db() as conn:
             conn.execute(
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,add_qty=0,add_price=0,
-                   updated_at=?,last_price=?,note=?,realized_pnl=?,lowest_price=?,highest_price=?,cycle_anchor_price=?,
-                   rebound_armed_at=NULL,rebound_armed_low=NULL WHERE symbol=?""",
-                (effective_avg, remaining, remaining_margin, utc_now(), price,
-                 "순환 추가분 정리 · 낮아진 유효평단 유지", total_realized,
+                   updated_at=?,last_price=?,note=?,realized_pnl=?,lowest_price=?,highest_price=?,cycle_anchor_price=? WHERE symbol=?""",
+                (base_price, remaining, max(0.0, float(row["total_margin"]) - (self.cfg.hj_rebound_add_margin_usdt if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_add_margin_usdt)),
+                 utc_now(), price, "순환 추가분 정리 · 최초 물량 유지", total_realized,
                  price, price, price, row["symbol"]),
             )
-        details = json.dumps({
-            "add_entry_price": float(row["add_price"] or 0), "reduce_price": price,
-            "reduced_qty": add_qty, "effective_avg_kept": effective_avg,
-            "remaining_qty": remaining, "cycle_realized_pnl": pnl_usdt,
-        }, ensure_ascii=False)
+        details = json.dumps({"add_entry_price": float(row["add_price"] or 0), "reduce_price": price,
+                              "reduced_qty": add_qty, "avg_before_reduce": float(row["avg_price"]),
+                              "restored_base_avg": base_price, "remaining_qty": remaining,
+                              "cycle_realized_pnl": pnl_usdt}, ensure_ascii=False)
         log_event(row["symbol"], "CYCLE_REDUCE", price, add_qty, self.cfg.mode,
                   details=details, strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
                   trade_id=row["trade_id"] or "")
@@ -1434,69 +1344,24 @@ class DailyBot:
                     self._cycle_reduce(row, price)
                     continue
 
-            # 새 눌림을 먼저 무장하고, 무장 이후 마감된 새 5분봉 반등에서만 추가한다.
+            # 순환 추가분을 이미 회수했다면 다시 밀린 뒤 새 반등이 확인될 때 최대 설정 횟수까지 반복한다.
             if (self.cfg.rebound_add_enabled and float(row["add_qty"] or 0) <= 0
                     and int(row["dca_count"] or 0) < self.cfg.max_cycle_adds
                     and int(row["tp1_done"] or 0) == 0
                     and int(row["stop_stage1_done"] or 0) == 0):
-                strategy_name = str(row["strategy"] or "P")
-                anchor = float(row["cycle_anchor_price"] or avg)
-                drawdown_pct = (price / anchor - 1) * 100
-                armed_at = str(row["rebound_armed_at"] or "")
-                armed_low = float(row["rebound_armed_low"] or 0)
-                try:
-                    arm_pct = (dynamic_hj_rebound_arm_pct(self.client, row["symbol"], self.cfg)
-                               if strategy_name == "HJ" else self.cfg.rebound_arm_drawdown_pct)
-                except Exception:
-                    arm_pct = (max(self.cfg.hj_rebound_arm_min_pct, self.cfg.hj_rebound_arm_drawdown_pct)
-                               if strategy_name == "HJ" else self.cfg.rebound_arm_drawdown_pct)
-
-                # HJ는 현재 유효평단보다 충분히 낮은 가격에서만 물타기 감시를 시작한다.
-                discount_ok = True
-                if strategy_name == "HJ":
-                    discount_ok = bool(price <= avg * (1 - abs(self.cfg.hj_rebound_min_add_discount_pct) / 100))
-
-                if not armed_at and drawdown_pct <= -abs(arm_pct) and discount_ok:
-                    armed_at = utc_now()
-                    armed_low = price
-                    with db() as conn:
-                        conn.execute(
-                            "UPDATE bot_positions SET rebound_armed_at=?,rebound_armed_low=?,lowest_price=?,note=? WHERE symbol=?",
-                            (armed_at, armed_low, price, f"물타기 반등 대기 · 기준 {arm_pct:.2f}%", row["symbol"]),
-                        )
-                    log_event(row["symbol"], "REBOUND_ARMED", price, mode=self.cfg.mode,
-                              details=json.dumps({"arm_pct": round(arm_pct, 3), "avg": avg,
-                                                  "anchor": anchor, "armed_low": armed_low}, ensure_ascii=False),
-                              strategy=strategy_name, trade_id=row["trade_id"] or "")
-                elif armed_at:
-                    if armed_low <= 0 or price < armed_low:
-                        armed_low = price
-                        with db() as conn:
-                            conn.execute("UPDATE bot_positions SET rebound_armed_low=? WHERE symbol=?",
-                                         (armed_low, row["symbol"]))
+                anchor = float(row["cycle_anchor_price"] or base_price)
+                drawdown_pct = (lowest / anchor - 1) * 100
+                arm_pct = self.cfg.hj_rebound_arm_drawdown_pct if str(row["strategy"] or "") == "HJ" else self.cfg.rebound_arm_drawdown_pct
+                if drawdown_pct <= -abs(arm_pct):
                     try:
-                        arm_dt = datetime.fromisoformat(armed_at)
-                        if arm_dt.tzinfo is None:
-                            arm_dt = arm_dt.replace(tzinfo=timezone.utc)
-                        waited_minutes = (datetime.now(timezone.utc) - arm_dt).total_seconds() / 60
-                    except Exception:
-                        waited_minutes = 0.0
-                    min_wait = self.cfg.hj_rebound_min_wait_minutes if strategy_name == "HJ" else 5
-                    if waited_minutes >= min_wait:
-                        try:
-                            ok, details = rebound_add_signal(
-                                self.client, row["symbol"], self.cfg, strategy_name, armed_at, armed_low
-                            )
-                            add_price = float(details.get("price") or price)
-                            price_guard = (strategy_name != "HJ" or
-                                           add_price <= avg * (1 - abs(self.cfg.hj_rebound_min_add_discount_pct) / 100))
-                            if ok and price_guard:
-                                self._rebound_add(row, add_price)
-                                continue
-                        except Exception as exc:
-                            log_event(row["symbol"], "REBOUND_CHECK_ERROR", mode=self.cfg.mode, details=str(exc))
+                        ok, details = rebound_add_signal(self.client, row["symbol"], self.cfg)
+                        if ok:
+                            self._rebound_add(row, float(details.get("price") or price))
+                            continue
+                    except Exception as exc:
+                        log_event(row["symbol"], "REBOUND_CHECK_ERROR", mode=self.cfg.mode, details=str(exc))
 
-            # 손절·TP·본절은 현재 유효평단 기준으로 관리한다.
+            # 손절과 목표가는 최초 진입가 기준으로 관리한다.
             # PAPER에서는 조회 주기 사이 급변으로 계획 손절폭을 초과해 기록하지 않도록
             # 최초 터치 가격(설정 트리거가)을 체결가로 사용하고, 감지 당시 시장가는 별도 기록한다.
             def paper_fill(trigger: float) -> float:
@@ -1513,47 +1378,26 @@ class DailyBot:
             # 종료 조건은 HJ/P별 손절을 먼저 확인한 뒤, 공통 TP/시간 종료를 반드시 확인한다.
             # 이전 코드는 HJ 구조손절이 활성화된 것만으로 elif 체인이 소진되어,
             # 구조가 유지 중인 HJ 포지션의 TP1/TP2 검사가 건너뛰어지는 문제가 있었다.
-            if int(row["tp1_done"]) == 1 and pnl_pct <= -self.cfg.breakeven_stop_pct:
-                trigger = avg * (1 - self.cfg.breakeven_stop_pct / 100)
+            if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
+                trigger = base_price * (1 - self.cfg.breakeven_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
                 continue
 
             if strategy == "HJ":
-                # HJ는 -4.5 USDT를 즉시손절선이 아니라 반등 대기 경계로 사용한다.
-                # 한 봉 흔들림으로 물타기 기회가 사라지지 않도록 최소 대기시간을 보장하고,
-                # -7 USDT 비상손절 또는 확정 구조이탈에서만 전량 종료한다.
-                emergency_trigger = avg - (abs(self.cfg.hj_emergency_loss_usdt) / total_qty) if total_qty > 0 else price
-                if unrealized_usdt <= -abs(self.cfg.hj_emergency_loss_usdt):
-                    self._close(row, paper_fill(emergency_trigger), 1.0, "HJ_EMERGENCY_STOP", price, emergency_trigger)
+                if unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
+                    self._close(row, paper_fill(hj_loss_trigger), 1.0, "HJ_MAX_LOSS", price, hj_loss_trigger)
                     continue
-
-                broken, structure = False, {}
                 if self.cfg.hj_structure_stop_enabled:
                     try:
                         broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
                     except Exception as exc:
+                        broken, structure = False, {"error": str(exc)}
                         log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
                                   strategy=strategy, trade_id=row["trade_id"] or "")
-
-                wait_minutes = max(0, int(self.cfg.hj_rebound_wait_minutes))
-                grace_done = age_h * 60 >= wait_minutes
-                if broken and (grace_done or unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt)):
-                    trigger = float(structure.get("price") or price)
-                    self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
-                    continue
-
-                if unrealized_usdt <= -abs(self.cfg.hj_max_loss_usdt):
-                    log_event(
-                        row["symbol"], "HJ_REBOUND_WAIT", price, mode=self.cfg.mode,
-                        details=json.dumps({
-                            "unrealized_usdt": round(unrealized_usdt, 4),
-                            "boundary_usdt": -abs(self.cfg.hj_max_loss_usdt),
-                            "age_minutes": round(age_h * 60, 1),
-                            "grace_minutes": wait_minutes,
-                            "structure_broken": broken,
-                        }, ensure_ascii=False),
-                        strategy=strategy, trade_id=row["trade_id"] or "",
-                    )
+                    if broken:
+                        trigger = float(structure.get("price") or price)
+                        self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, trigger)
+                        continue
             else:
                 if self.cfg.staged_stop_enabled and stop_stage1_done == 0 and base_pnl_pct <= -self.cfg.stage1_stop_pct:
                     trigger = base_price * (1 - self.cfg.stage1_stop_pct / 100)
@@ -1574,15 +1418,15 @@ class DailyBot:
 
             # HJ/P 공통 종료: 위 손절 조건에 걸리지 않았다면 TP와 시간 종료를 검사한다.
             if (age_h * 60 >= self.cfg.flat_exit_minutes
-                    and (highest / avg - 1) * 100 < self.cfg.flat_min_favorable_pct):
+                    and (highest / base_price - 1) * 100 < self.cfg.flat_min_favorable_pct):
                 self._close(row, price, 1.0, "FLAT_EXIT_75M", price, None)
             elif age_h >= self.cfg.max_hold_hours:
                 self._close(row, price, 1.0, "TIME_EXIT", price, None)
-            elif int(row["tp1_done"]) == 0 and pnl_pct >= self.cfg.tp1_pct:
-                trigger = avg * (1 + self.cfg.tp1_pct / 100)
+            elif int(row["tp1_done"]) == 0 and base_pnl_pct >= self.cfg.tp1_pct:
+                trigger = base_price * (1 + self.cfg.tp1_pct / 100)
                 self._close(row, paper_fill(trigger), 0.5, "TP1", price, trigger)
-            elif int(row["tp1_done"]) == 1 and pnl_pct >= self.cfg.tp2_pct:
-                trigger = avg * (1 + self.cfg.tp2_pct / 100)
+            elif int(row["tp1_done"]) == 1 and base_pnl_pct >= self.cfg.tp2_pct:
+                trigger = base_price * (1 + self.cfg.tp2_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "TP2", price, trigger)
 
     def scan_entries(self) -> None:
