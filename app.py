@@ -1677,7 +1677,17 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 conn.row_factory = sqlite3.Row
                 positions = conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
                 recent_events = conn.execute("SELECT * FROM bot_events ORDER BY id DESC LIMIT 60").fetchall()
-                history = conn.execute("SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' ORDER BY id DESC LIMIT 500").fetchall()
+                trade_event_names = (
+                    "ENTRY","REBOUND_ADD","CYCLE_REDUCE","TP1","TP2",
+                    "STOP_HALF","FINAL_STOP","STOP","HJ_STRUCTURE_STOP",
+                    "BE_EXIT","FLAT_EXIT_75M","TIME_EXIT","MANUAL_EXIT"
+                )
+                placeholders = ",".join("?" for _ in trade_event_names)
+                history = conn.execute(
+                    f"SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' "
+                    f"AND event IN ({placeholders}) ORDER BY id DESC LIMIT 2000",
+                    trade_event_names,
+                ).fetchall()
                 today = conn.execute("SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(ts,1,10)=date('now')").fetchone()
                 cumulative = conn.execute("SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0) FROM bot_events").fetchone()
 
@@ -1853,10 +1863,10 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
             grouped={}
             for e in reversed(list(history)):
                 grouped.setdefault(e['trade_id'] or f"legacy-{e['symbol']}",[]).append(e)
-            names={"ENTRY":"최초 진입","REBOUND_ADD":"순환추가","CYCLE_REDUCE":"추가분 회수","TP1":"TP1 익절","TP2":"TP2 익절","STOP_HALF":"1차 손절","FINAL_STOP":"최종 손절","STOP":"손절","BE_EXIT":"본절 보호 종료","FLAT_EXIT_75M":"정체 종료","TIME_EXIT":"시간 종료","MANUAL_EXIT":"수동 종료"}
+            names={"ENTRY":"최초 진입","REBOUND_ADD":"순환추가","CYCLE_REDUCE":"추가분 회수","TP1":"TP1 익절","TP2":"TP2 익절","STOP_HALF":"1차 손절","FINAL_STOP":"최종 손절","STOP":"손절","HJ_STRUCTURE_STOP":"구조 손절","BE_EXIT":"본절 보호 종료","FLAT_EXIT_75M":"정체 종료","TIME_EXIT":"시간 종료","MANUAL_EXIT":"수동 종료"}
             for tid,events in list(reversed(list(grouped.items())))[:20]:
                 first=events[0]; total=sum(float(x['realized_pnl'] or 0) for x in events)
-                closed=any(x['event'] in {"TP2","FINAL_STOP","STOP","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT","MANUAL_EXIT"} for x in events)
+                closed=any(x['event'] in {"TP2","FINAL_STOP","STOP","HJ_STRUCTURE_STOP","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT","MANUAL_EXIT"} for x in events)
                 with st.expander(f"{first['symbol']} · {'종료' if closed else '진행 중'} · {total:+.2f} USDT",expanded=False):
                     for e in events:
                         try: d=json.loads(e['details'] or '{}')
