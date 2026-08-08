@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.15-StructureRedesign"
+BOT_RUNTIME_VERSION = "RC-v4.3.16-EarlyFailureGuard"
 
 
 @dataclass
@@ -123,6 +123,12 @@ class DailyConfig:
     structure_rsi_weak: float = 45.0
     structure_rsi_crash: float = 40.0
     structure_emergency_stop_pct: float = 8.0
+
+    # 진입 직후 실패판정: 첫 10~15분만 별도 감시
+    early_failure_enabled: bool = True
+    early_failure_window_minutes: int = 15
+    early_failure_min_age_minutes: int = 10
+    early_failure_ema_reclaim_buffer_pct: float = 0.10
     rebound_exit_buffer_pct: float = 0.10
     max_cycle_adds: int = 2
     rebound_min_drawdown_pct: float = 1.5  # 이보다 얕은 구간에서는 물타기 금지(arm 트리거가 아님)
@@ -837,6 +843,61 @@ def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) 
         "break_structure": break_structure, "rsi_ok": rsi_ok, "ema_ok": ema_ok, "volume_ok": volume_ok,
         "rebound_ok": rebound_ok, "rsi": round(float(row15.rsi), 2),
         "volume_ratio": round(vol_ratio, 2), "rebound_pct": round(rebound_pct, 2),
+    }
+
+
+
+def early_failure_signal(
+    client: BybitSwingClient,
+    symbol: str,
+    opened_at: str,
+    cfg: DailyConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """진입 후 첫 10~15분에 '정상 눌림'과 '초기 실패'를 구분한다."""
+    try:
+        opened = datetime.fromisoformat(opened_at)
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False, {"reason": "opened_at parse failed"}
+
+    age_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+    if age_min < cfg.early_failure_min_age_minutes:
+        return False, {"reason": "too_early", "age_min": round(age_min, 2)}
+    if age_min > cfg.early_failure_window_minutes:
+        return False, {"reason": "window_passed", "age_min": round(age_min, 2)}
+
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 60)))
+    if len(m5) < 5:
+        return False, {"reason": "5m candles insufficient"}
+
+    a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
+
+    lower_lows = bool(float(a.low) > float(b.low) > float(c.low))
+
+    buffer = abs(float(cfg.early_failure_ema_reclaim_buffer_pct)) / 100
+    fail_reclaim = bool(
+        float(b.close) < float(b.ema20) * (1 + buffer)
+        and float(c.close) < float(c.ema20) * (1 + buffer)
+    )
+
+    volume_fading = bool(float(c.volume) <= float(b.volume) <= float(a.volume))
+
+    bearish_pressure = bool(
+        float(b.close) < float(b.open) or float(c.close) < float(c.open)
+    )
+
+    ok = bool(lower_lows and fail_reclaim and volume_fading and bearish_pressure)
+
+    return ok, {
+        "age_min": round(age_min, 2),
+        "lower_lows": lower_lows,
+        "fail_reclaim_ema20": fail_reclaim,
+        "volume_fading": volume_fading,
+        "bearish_pressure": bearish_pressure,
+        "last_close": float(c.close),
+        "last_ema20": float(c.ema20),
+        "last_rsi": round(float(c.rsi), 2),
     }
 
 
@@ -1587,8 +1648,34 @@ class DailyBot:
                 continue
 
             # TP가 터치되지 않았을 때만 BE/구조손절/시간종료를 확인한다.
-            # 이전 코드는 HJ 구조손절이 활성화된 것만으로 elif 체인이 소진되어,
-            # 구조가 유지 중인 HJ 포지션의 TP1/TP2 검사가 건너뛰어지는 문제가 있었다.
+
+            # 진입 직후 10~15분 실패판정:
+            # 5분봉 저점 연속 하락 + EMA20 회복 실패 + 거래량 감소 + 약세 압력이
+            # 모두 겹칠 때만 초기 실패로 종료한다. 단순 눌림은 건드리지 않는다.
+            if self.cfg.early_failure_enabled and int(row["tp1_done"] or 0) == 0:
+                try:
+                    early_fail, early_details = early_failure_signal(
+                        self.client, row["symbol"], row["opened_at"], self.cfg
+                    )
+                except Exception as exc:
+                    early_fail, early_details = False, {"error": str(exc)}
+                    log_event(
+                        row["symbol"], "EARLY_FAILURE_CHECK_ERROR",
+                        mode=self.cfg.mode, details=str(exc),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+
+                if early_fail:
+                    log_event(
+                        row["symbol"], "EARLY_FAILURE_TRIGGER",
+                        price=price, mode=self.cfg.mode,
+                        details=json.dumps(early_details, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                    reason = "HJ_STRUCTURE_STOP" if strategy == "HJ" else "STOP"
+                    self._close(row, price, 1.0, reason, price, price)
+                    continue
+
             if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
                 trigger = base_price * (1 - self.cfg.breakeven_stop_pct / 100)
                 self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
