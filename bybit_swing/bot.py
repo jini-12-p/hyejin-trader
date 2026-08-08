@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.12-ReboundTimingGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.15-StructureRedesign"
 
 
 @dataclass
@@ -113,12 +113,28 @@ class DailyConfig:
     rebound_add_margin_usdt: float = 27.0
     hj_rebound_add_margin_usdt: float = 18.0
     hj_structure_stop_enabled: bool = True
-    hj_structure_break_buffer_pct: float = 0.15
+
+    # 구조손절 재설계:
+    # - 고정 USDT 손절은 사용하지 않는다.
+    # - 확정 15분봉 기준으로 "상승구조가 실제로 깨졌는지"를 본다.
+    # - 급락/추세붕괴는 1개 확정봉으로도 종료 가능.
+    # - 모든 구조 조건을 놓쳤을 때만 최종 재난손절을 사용한다.
+    structure_break_low_pct: float = 0.50
+    structure_rsi_weak: float = 45.0
+    structure_rsi_crash: float = 40.0
+    structure_emergency_stop_pct: float = 8.0
     rebound_exit_buffer_pct: float = 0.10
     max_cycle_adds: int = 2
     rebound_min_drawdown_pct: float = 1.5  # 이보다 얕은 구간에서는 물타기 금지(arm 트리거가 아님)
     flat_exit_minutes: int = 60
     flat_min_favorable_pct: float = 0.40
+    # 정체종료는 실제 횡보일 때만 허용한다.
+    # 진입가 대비 손실이 이보다 크면 정체가 아니라 하락 진행으로 보고 FLAT_EXIT를 금지한다.
+    flat_max_loss_pct: float = 1.5
+    flat_max_recent_range_pct: float = 3.0
+    flat_max_ema20_distance_pct: float = 1.0
+    flat_rsi_min: float = 40.0
+    flat_rsi_max: float = 60.0
     min_pullback_from_high_pct: float = 0.30
     max_pullback_from_high_pct: float = 6.00
     min_entry_candle_gain_pct: float = 0.15
@@ -824,25 +840,154 @@ def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) 
     }
 
 
-def hj_structure_broken(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
-    """확정 15분봉 두 개가 EMA20 아래에 있고 최근 저점을 재이탈할 때 HJ 구조 이탈로 본다."""
+def hj_structure_broken(
+    client: BybitSwingClient,
+    symbol: str,
+    cfg: DailyConfig,
+    base_price: float | None = None,
+    live_price: float | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """HJ/P 공통 구조손절 재설계.
+
+    목적:
+    - 단순 눌림은 버틴다.
+    - 차트가 실제 하락 추세로 전환되면 기존보다 빠르게 종료한다.
+    - 고정 USDT 손절은 쓰지 않는다.
+    - 최종 재난손절은 구조판단을 놓친 비정상 급락에서만 사용한다.
+
+    구조붕괴 판단은 확정 15분봉 기준:
+    1) 종가가 EMA20 아래
+    2) EMA9 < EMA20 또는 EMA9 하락
+    3) 직전 저점 의미 있게 이탈
+    4) RSI 약세 및 하락
+    5) 음봉 마감
+
+    강한 붕괴는 1개 확정봉에서 즉시 종료한다.
+    일반 붕괴는 위 조건 중 4개 이상이면 종료한다.
+    """
+    m15 = confirmed(indicators(client.candles(symbol, "15m", 120)))
+    if len(m15) < 30:
+        return False, {"reason": "구조 캔들 부족"}
+
+    last = m15.iloc[-1]
+    prev = m15.iloc[-2]
+
+    close = float(last.close)
+    open_ = float(last.open)
+    ema9 = float(last.ema9)
+    ema20 = float(last.ema20)
+    prev_ema9 = float(prev.ema9)
+    prev_low = float(prev.low)
+    rsi = float(last.rsi)
+    prev_rsi = float(prev.rsi)
+
+    below_ema20 = bool(close < ema20)
+    ema9_below_ema20 = bool(ema9 < ema20)
+    ema9_falling = bool(ema9 < prev_ema9)
+    bearish = bool(close < open_)
+    rsi_weak = bool(rsi <= float(cfg.structure_rsi_weak) and rsi < prev_rsi)
+
+    low_break_ratio = abs(float(cfg.structure_break_low_pct)) / 100
+    lower_low_break = bool(close < prev_low * (1 - low_break_ratio))
+
+    checks = {
+        "below_ema20": below_ema20,
+        "ema9_below_or_falling": bool(ema9_below_ema20 or ema9_falling),
+        "lower_low_break": lower_low_break,
+        "rsi_weak": rsi_weak,
+        "bearish": bearish,
+    }
+    score = sum(1 for v in checks.values() if v)
+
+    # 강한 붕괴: EMA20 아래 + 직전 저점 이탈 + RSI 40 이하 + 음봉
+    crash_break = bool(
+        below_ema20
+        and lower_low_break
+        and bearish
+        and rsi <= float(cfg.structure_rsi_crash)
+    )
+
+    # 일반 구조붕괴: 핵심 구조가 무너지면서 5개 중 4개 이상
+    normal_break = bool(
+        below_ema20
+        and lower_low_break
+        and score >= 4
+    )
+
+    # 최종 재난손절: 구조신호가 늦더라도 최초 진입가 대비 -8% 이상이면 종료
+    emergency_break = False
+    emergency_pnl_pct = None
+    if base_price and float(base_price) > 0:
+        mark = float(live_price if live_price is not None else close)
+        emergency_pnl_pct = (mark / float(base_price) - 1) * 100
+        emergency_break = bool(
+            emergency_pnl_pct <= -abs(float(cfg.structure_emergency_stop_pct))
+        )
+
+    broken = bool(crash_break or normal_break or emergency_break)
+    stop_type = (
+        "EMERGENCY" if emergency_break
+        else "CRASH" if crash_break
+        else "TREND_BREAK" if normal_break
+        else ""
+    )
+
+    return broken, {
+        "price": float(live_price if emergency_break and live_price is not None else close),
+        "stop_type": stop_type,
+        "structure_score": score,
+        "below_ema20": below_ema20,
+        "ema9_below_ema20": ema9_below_ema20,
+        "ema9_falling": ema9_falling,
+        "lower_low_break": lower_low_break,
+        "rsi_weak": rsi_weak,
+        "bearish": bearish,
+        "rsi": round(rsi, 2),
+        "ema9": ema9,
+        "ema20": ema20,
+        "previous_low": prev_low,
+        "emergency_pnl_pct": round(emergency_pnl_pct, 2) if emergency_pnl_pct is not None else None,
+    }
+
+
+
+def flat_exit_signal(client: BybitSwingClient, symbol: str, base_price: float, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
+    """정체 종료는 '손실 확대 중'이 아니라 실제 횡보일 때만 허용한다."""
     m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
     if len(m15) < 25:
-        return False, {"reason": "구조 캔들 부족"}
-    last, prev = m15.iloc[-1], m15.iloc[-2]
-    buffer = abs(float(cfg.hj_structure_break_buffer_pct)) / 100
-    two_closes_below = bool(last.close < last.ema20 and prev.close < prev.ema20)
-    ema20_falling = bool(last.ema20 <= prev.ema20)
-    lower_low_break = bool(last.close < float(prev.low) * (1 - buffer))
-    broken = bool(two_closes_below and ema20_falling and lower_low_break)
-    return broken, {
-        "price": float(last.close),
-        "two_closes_below_ema20": two_closes_below,
-        "ema20_falling": ema20_falling,
-        "lower_low_break": lower_low_break,
-        "ema20": float(last.ema20),
-        "previous_low": float(prev.low),
+        return False, {"reason": "정체 캔들 부족"}
+
+    last = m15.iloc[-1]
+    recent4 = m15.tail(4)
+
+    close = float(last.close)
+    ema20 = float(last.ema20)
+    rsi = float(last.rsi)
+
+    current_pnl_pct = (close / float(base_price) - 1) * 100 if float(base_price) > 0 else -99.0
+    recent_low = float(recent4.low.min())
+    recent_high = float(recent4.high.max())
+    recent_range_pct = (recent_high / recent_low - 1) * 100 if recent_low > 0 else 99.0
+    ema20_distance_pct = abs(close / ema20 - 1) * 100 if ema20 > 0 else 99.0
+
+    loss_ok = bool(current_pnl_pct >= -abs(cfg.flat_max_loss_pct))
+    range_ok = bool(recent_range_pct <= cfg.flat_max_recent_range_pct)
+    ema_near = bool(ema20_distance_pct <= cfg.flat_max_ema20_distance_pct)
+    rsi_mid = bool(cfg.flat_rsi_min <= rsi <= cfg.flat_rsi_max)
+
+    ok = bool(loss_ok and range_ok and ema_near and rsi_mid)
+    return ok, {
+        "price": close,
+        "current_pnl_pct": round(current_pnl_pct, 2),
+        "recent_range_pct": round(recent_range_pct, 2),
+        "ema20_distance_pct": round(ema20_distance_pct, 2),
+        "rsi": round(rsi, 2),
+        "loss_ok": loss_ok,
+        "range_ok": range_ok,
+        "ema_near": ema_near,
+        "rsi_mid": rsi_mid,
     }
+
 
 def qty_from_margin(price: float, margin_usdt: float, leverage: float) -> float:
     """증거금과 레버리지로 주문 수량을 계산한다."""
@@ -1408,7 +1553,40 @@ class DailyBot:
             total_qty = float(row["total_qty"] or 0)
             unrealized_usdt = (price - avg) * total_qty
 
-            # 종료 조건은 HJ/P별 손절을 먼저 확인한 뒤, 공통 TP/시간 종료를 반드시 확인한다.
+            # TP 터치 보강:
+            # 현재가만 보지 않고, 이미 저장된 최고가 + (진입 2분 경과 후) 최근 1분봉 high도 확인한다.
+            # TP를 한 번이라도 터치했다면 BE/구조손절/시간종료보다 TP를 먼저 처리한다.
+            # PAPER는 설정된 TP 가격으로 체결 처리하고,
+            # DEMO/LIVE는 터치가 뒤늦게 감지된 경우 현재 시장가로 즉시 reduce-only 청산한다.
+            tp_observed_high = max(price, highest)
+            try:
+                if age_h * 3600 >= 120:
+                    m1 = self.client.candles(row["symbol"], "1m", 3)
+                    if m1 is not None and len(m1) > 0 and "high" in m1.columns:
+                        tp_observed_high = max(
+                            tp_observed_high,
+                            float(pd.to_numeric(m1["high"], errors="coerce").dropna().tail(2).max())
+                        )
+            except Exception as exc:
+                log_event(
+                    row["symbol"], "TP_TOUCH_CHECK_ERROR", mode=self.cfg.mode,
+                    details=str(exc), strategy=strategy, trade_id=row["trade_id"] or ""
+                )
+
+            tp1_trigger = base_price * (1 + self.cfg.tp1_pct / 100)
+            tp2_trigger = base_price * (1 + self.cfg.tp2_pct / 100)
+
+            if int(row["tp1_done"]) == 0 and tp_observed_high >= tp1_trigger:
+                fill = paper_fill(tp1_trigger) if self.cfg.mode == "paper" else price
+                self._close(row, fill, 0.5, "TP1", price, tp1_trigger)
+                continue
+
+            if int(row["tp1_done"]) == 1 and tp_observed_high >= tp2_trigger:
+                fill = paper_fill(tp2_trigger) if self.cfg.mode == "paper" else price
+                self._close(row, fill, 1.0, "TP2", price, tp2_trigger)
+                continue
+
+            # TP가 터치되지 않았을 때만 BE/구조손절/시간종료를 확인한다.
             # 이전 코드는 HJ 구조손절이 활성화된 것만으로 elif 체인이 소진되어,
             # 구조가 유지 중인 HJ 포지션의 TP1/TP2 검사가 건너뛰어지는 문제가 있었다.
             if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
@@ -1420,29 +1598,62 @@ class DailyBot:
             # 확정 15분봉 2개가 EMA20 아래 + EMA20 하락 + 직전 저점 재이탈 시 전량 종료한다.
             if self.cfg.hj_structure_stop_enabled:
                 try:
-                    broken, structure = hj_structure_broken(self.client, row["symbol"], self.cfg)
+                    broken, structure = hj_structure_broken(
+                        self.client, row["symbol"], self.cfg,
+                        base_price=base_price, live_price=price
+                    )
                 except Exception as exc:
                     broken, structure = False, {"error": str(exc)}
                     log_event(row["symbol"], "HJ_STRUCTURE_CHECK_ERROR", mode=self.cfg.mode, details=str(exc),
                               strategy=strategy, trade_id=row["trade_id"] or "")
                 if broken:
                     trigger = float(structure.get("price") or price)
+                    stop_type = str(structure.get("stop_type") or "TREND_BREAK")
                     reason = "HJ_STRUCTURE_STOP" if strategy == "HJ" else "STOP"
+
+                    log_event(
+                        row["symbol"], f"STRUCTURE_{stop_type}_TRIGGER",
+                        price=price, mode=self.cfg.mode,
+                        details=json.dumps(structure, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+
                     self._close(row, price, 1.0, reason, price, trigger)
                     continue
 
-            # HJ/P 공통 종료: 위 손절 조건에 걸리지 않았다면 TP와 시간 종료를 검사한다.
-            if (age_h * 60 >= self.cfg.flat_exit_minutes
-                    and (highest / base_price - 1) * 100 < self.cfg.flat_min_favorable_pct):
-                self._close(row, price, 1.0, "FLAT_EXIT_75M", price, None)
-            elif age_h >= self.cfg.max_hold_hours:
+            # HJ/P 공통 종료:
+            # FLAT_EXIT는 실제 횡보일 때만 허용한다.
+            # C98처럼 이미 크게 하락한 포지션을 '정체 종료'로 처리하지 않는다.
+            flat_due = (
+                age_h * 60 >= self.cfg.flat_exit_minutes
+                and (highest / base_price - 1) * 100 < self.cfg.flat_min_favorable_pct
+            )
+            if flat_due:
+                try:
+                    flat_ok, flat_details = flat_exit_signal(
+                        self.client, row["symbol"], base_price, self.cfg
+                    )
+                except Exception as exc:
+                    flat_ok, flat_details = False, {"error": str(exc)}
+                    log_event(
+                        row["symbol"], "FLAT_EXIT_CHECK_ERROR", mode=self.cfg.mode,
+                        details=str(exc), strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+
+                if flat_ok:
+                    self._close(row, price, 1.0, "FLAT_EXIT_75M", price, None)
+                    continue
+                else:
+                    # 정체 조건이 아니면 종료하지 않고 구조손절/시간종료 관리로 계속 넘긴다.
+                    # 큰 손실을 FLAT_EXIT로 잘못 분류하는 문제를 막기 위한 차단 로그.
+                    log_event(
+                        row["symbol"], "FLAT_EXIT_BLOCKED", price=price, mode=self.cfg.mode,
+                        details=json.dumps(flat_details, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+
+            if age_h >= self.cfg.max_hold_hours:
                 self._close(row, price, 1.0, "TIME_EXIT", price, None)
-            elif int(row["tp1_done"]) == 0 and base_pnl_pct >= self.cfg.tp1_pct:
-                trigger = base_price * (1 + self.cfg.tp1_pct / 100)
-                self._close(row, paper_fill(trigger), 0.5, "TP1", price, trigger)
-            elif int(row["tp1_done"]) == 1 and base_pnl_pct >= self.cfg.tp2_pct:
-                trigger = base_price * (1 + self.cfg.tp2_pct / 100)
-                self._close(row, paper_fill(trigger), 1.0, "TP2", price, trigger)
 
     def scan_entries(self) -> None:
         """긴급복구: SCAN_OK가 나오면 같은 스캔 안에서 바로 진입한다.
