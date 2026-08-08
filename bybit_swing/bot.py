@@ -1437,7 +1437,7 @@ class DailyBot:
 
     def _register_stop_review(self, row: sqlite3.Row, stop_event: str, stop_price: float) -> None:
         """손절 발생 후 15·30·60·120·180분 가격을 자동 추적한다."""
-        if stop_event not in {"STOP_HALF", "FINAL_STOP", "STOP", "BE_EXIT", "FLAT_EXIT_75M", "TIME_EXIT", "MANUAL_EXIT"}:
+        if stop_event not in {"STOP_HALF", "FINAL_STOP", "STOP", "HJ_STRUCTURE_STOP", "BE_EXIT", "FLAT_EXIT_75M", "TIME_EXIT", "MANUAL_EXIT"}:
             return
         entry_price = float(row["base_entry_price"] or row["avg_price"] or 0)
         pnl_at_stop_pct = ((stop_price / entry_price) - 1) * 100 if entry_price > 0 else None
@@ -1732,12 +1732,18 @@ class DailyBot:
                     continue
                 else:
                     # 정체 조건이 아니면 종료하지 않고 구조손절/시간종료 관리로 계속 넘긴다.
-                    # 큰 손실을 FLAT_EXIT로 잘못 분류하는 문제를 막기 위한 차단 로그.
-                    log_event(
-                        row["symbol"], "FLAT_EXIT_BLOCKED", price=price, mode=self.cfg.mode,
-                        details=json.dumps(flat_details, ensure_ascii=False),
-                        strategy=strategy, trade_id=row["trade_id"] or ""
-                    )
+                    # FLAT_EXIT_BLOCKED는 관리 루프마다 DB에 쌓지 않고 trade_id별 15분에 1번만 기록한다.
+                    # 진단 이벤트가 실제 매매기록을 밀어내는 문제를 방지한다.
+                    now_dt = datetime.now(timezone.utc)
+                    flat_bucket = f"{now_dt:%Y%m%d%H}{now_dt.minute // 15}"
+                    flat_state_key = f"flat_exit_blocked_bucket:{row['trade_id'] or row['symbol']}"
+                    if state_get(flat_state_key, "") != flat_bucket:
+                        log_event(
+                            row["symbol"], "FLAT_EXIT_BLOCKED", price=price, mode=self.cfg.mode,
+                            details=json.dumps(flat_details, ensure_ascii=False),
+                            strategy=strategy, trade_id=row["trade_id"] or ""
+                        )
+                        state_set(flat_state_key, flat_bucket)
 
             if age_h >= self.cfg.max_hold_hours:
                 self._close(row, price, 1.0, "TIME_EXIT", price, None)
