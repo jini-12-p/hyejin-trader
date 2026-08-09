@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.17-LiveCandleQualityGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.18-LiveCandleQualityFix"
 
 
 @dataclass
@@ -603,9 +603,11 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # 강한 추세에서 긴 아래꼬리 음봉 뒤 양봉이 몸통을 회복하거나,
     # 연속 양봉 뒤 현재 장대양봉이 힘 있게 확장하는 경우를 별도로 잡는다.
     live = raw15.iloc[-1]
-    quality_ok, quality_details = live_candle_quality_ok(self.client, symbol, raw15, self.cfg)
+    quality_ok, quality_details = live_candle_quality_ok(client, symbol, raw15, cfg)
     if not quality_ok:
-        return None, "live_candle_quality", quality_details
+        quality_details = dict(quality_details)
+        quality_details["rejected_conditions"] = ["live_candle_quality"]
+        return None, 0.0, quality_details
 
     last = raw15.iloc[-2]
     before = raw15.iloc[-3]
@@ -832,10 +834,6 @@ def live_candle_quality_ok(client, symbol, raw15, cfg):
 
         prev = raw15.iloc[-2]
         live = raw15.iloc[-1]
-
-        quality_ok, quality_details = live_candle_quality_ok(self.client, symbol, raw15, self.cfg)
-        if not quality_ok:
-            return None, "live_candle_quality", quality_details
 
         o = float(live.open)
         c = float(live.close)
