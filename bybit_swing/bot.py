@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.16-EarlyFailureGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.17-LiveCandleQualityGuard"
 
 
 @dataclass
@@ -129,6 +129,12 @@ class DailyConfig:
     early_failure_window_minutes: int = 15
     early_failure_min_age_minutes: int = 10
     early_failure_ema_reclaim_buffer_pct: float = 0.10
+
+    # 진행 중 15분봉의 가짜 양봉 진입 차단
+    live_reversal_min_prev_body_recovery: float = 0.50
+    live_reversal_min_body_pct: float = 0.20
+    live_reversal_max_upper_wick_to_body: float = 1.50
+    live_reversal_require_5m_bullish: bool = True
     rebound_exit_buffer_pct: float = 0.10
     max_cycle_adds: int = 2
     rebound_min_drawdown_pct: float = 1.5  # 이보다 얕은 구간에서는 물타기 금지(arm 트리거가 아님)
@@ -597,6 +603,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # 강한 추세에서 긴 아래꼬리 음봉 뒤 양봉이 몸통을 회복하거나,
     # 연속 양봉 뒤 현재 장대양봉이 힘 있게 확장하는 경우를 별도로 잡는다.
     live = raw15.iloc[-1]
+    quality_ok, quality_details = live_candle_quality_ok(self.client, symbol, raw15, self.cfg)
+    if not quality_ok:
+        return None, "live_candle_quality", quality_details
+
     last = raw15.iloc[-2]
     before = raw15.iloc[-3]
     live_price = float(live.close)
@@ -811,6 +821,69 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
 
 # 위험그룹 목록이 정의되지 않아 SCAN_OK 직후 NameError가 발생하던 문제 수정
 MEME_SYMBOLS: set[str] = set()
+
+
+
+def live_candle_quality_ok(client, symbol, raw15, cfg):
+    """15분봉 마감 전 진입은 유지하되, 잠깐 양봉인 약한 반등은 차단."""
+    try:
+        if raw15 is None or len(raw15) < 3:
+            return False, {"reason": "15m_insufficient"}
+
+        prev = raw15.iloc[-2]
+        live = raw15.iloc[-1]
+
+        quality_ok, quality_details = live_candle_quality_ok(self.client, symbol, raw15, self.cfg)
+        if not quality_ok:
+            return None, "live_candle_quality", quality_details
+
+        o = float(live.open)
+        c = float(live.close)
+        h = float(live.high)
+
+        bullish = c > o
+        body = max(c - o, 0.0)
+        body_pct = (body / o) * 100.0 if o > 0 else 0.0
+        body_ok = body_pct >= float(cfg.live_reversal_min_body_pct)
+
+        upper_wick = max(h - max(o, c), 0.0)
+        wick_ratio = upper_wick / body if body > 0 else 999.0
+        wick_ok = wick_ratio <= float(cfg.live_reversal_max_upper_wick_to_body)
+
+        prev_o = float(prev.open)
+        prev_c = float(prev.close)
+        prev_bearish = prev_c < prev_o
+        recovery_ratio = 1.0
+        recovery_ok = True
+        if prev_bearish:
+            prev_body = prev_o - prev_c
+            recovered = max(c - prev_c, 0.0)
+            recovery_ratio = recovered / prev_body if prev_body > 0 else 1.0
+            recovery_ok = recovery_ratio >= float(cfg.live_reversal_min_prev_body_recovery)
+
+        five_ok = True
+        if bool(cfg.live_reversal_require_5m_bullish):
+            m5 = confirmed(indicators(client.candles(symbol, "5m", 20)))
+            if len(m5) < 1:
+                five_ok = False
+            else:
+                last5 = m5.iloc[-1]
+                five_ok = float(last5.close) > float(last5.open)
+
+        ok = bool(bullish and body_ok and wick_ok and recovery_ok and five_ok)
+        return ok, {
+            "bullish": bullish,
+            "body_pct": round(body_pct, 4),
+            "body_ok": body_ok,
+            "upper_wick_to_body": round(wick_ratio, 4),
+            "wick_ok": wick_ok,
+            "prev_bearish": prev_bearish,
+            "prev_body_recovery": round(recovery_ratio, 4),
+            "recovery_ok": recovery_ok,
+            "five_ok": five_ok,
+        }
+    except Exception as exc:
+        return False, {"reason": "quality_check_error", "error": str(exc)}
 
 
 def rebound_add_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) -> tuple[bool, dict[str, Any]]:
