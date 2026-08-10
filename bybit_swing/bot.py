@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.18-LiveCandleQualityFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.20-LiveHighZoneAndFastFailureFix"
 
 
 @dataclass
@@ -135,6 +135,30 @@ class DailyConfig:
     live_reversal_min_body_pct: float = 0.20
     live_reversal_max_upper_wick_to_body: float = 1.50
     live_reversal_require_5m_bullish: bool = True
+
+    # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
+    # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
+    hj_high_zone_max_distance_pct: float = 0.50
+    hj_high_zone_overheat_rsi: float = 75.0
+    hj_high_zone_min_bb_excess_pct: float = 0.25
+    hj_second_push_min_rebound_pct: float = 4.0
+    hj_second_push_min_live_gain_pct: float = 0.90
+
+    # P형은 약한/늦은 반등만 골라 차단한다. 강한 추세 자체(RSI 고점)는 허용한다.
+    p_require_ema_ordered: bool = True
+    p_near_high_weak_max_distance_pct: float = 1.00
+    p_near_high_weak_min_gain_pct: float = 0.60
+    p_near_high_weak_min_rsi: float = 65.0
+    p_faded_spike_min_pullback_pct: float = 2.00
+    p_faded_spike_min_rebound_pct: float = 5.00
+    p_faded_spike_min_gain_pct: float = 0.60
+
+    # Early Failure(10~15분) 이후 구조손절까지 비는 구간을 메우는 5분봉 빠른 실패판정.
+    # 고정 USDT 손절이 아니라, 실제 5분 구조 붕괴가 동반될 때만 동작한다.
+    fast_failure_window_minutes: int = 45
+    fast_failure_rsi_max: float = 48.0
+    fast_failure_low_break_pct: float = 0.30
+
     rebound_exit_buffer_pct: float = 0.10
     max_cycle_adds: int = 2
     rebound_min_drawdown_pct: float = 1.5  # 이보다 얕은 구간에서는 물타기 금지(arm 트리거가 아님)
@@ -584,6 +608,28 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         + (4 if higher_highs else 0)
     )
 
+    # P형 손실 패턴 보강:
+    # 1) EMA 정배열이 아닌 상태의 반등(1000NEIROCTO형)
+    # 2) 최근 고점 바로 아래에서 강한 양봉처럼 보이지만 새 고점은 못 만드는 재진입(PUMPFUN형)
+    # 3) 이미 급등 후 2%+ 밀린 뒤 5%+ 되돌림 끝자락에서 다시 강하게 들어가는 경우(ALT형)
+    p_ema_quality_ok = bool((not cfg.p_require_ema_ordered) or ema_ordered)
+    p_near_high_weak_reentry = bool(
+        distance_to_high <= cfg.p_near_high_weak_max_distance_pct
+        and not higher_highs
+        and entry_candle_gain >= cfg.p_near_high_weak_min_gain_pct
+        and float(row.rsi) >= cfg.p_near_high_weak_min_rsi
+    )
+    p_faded_spike_reentry = bool(
+        pullback_from_high >= cfg.p_faded_spike_min_pullback_pct
+        and rebound_from_low >= cfg.p_faded_spike_min_rebound_pct
+        and entry_candle_gain >= cfg.p_faded_spike_min_gain_pct
+    )
+    p_entry_quality_ok = bool(
+        p_ema_quality_ok
+        and not p_near_high_weak_reentry
+        and not p_faded_spike_reentry
+    )
+
     p_score = (
         (25 if h1_up else 0)
         + (25 if pullback_ok else 0)
@@ -596,6 +642,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     p_ok = bool(
         h1_up and pullback_ok and not_chasing and rebound and momentum_ok
         and volume_ok and volume_trend_ok and movement_ok and not_extreme
+        and p_entry_quality_ok
         and rebound_from_low >= cfg.min_rebound_from_low_pct and p_score >= 65
     )
 
@@ -659,6 +706,35 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     hj_bb_chase_ok = bool(not bb_hard_chase and not bb_soft_overheat)
     hj_volatility_ok = bool(one_hour_move < cfg.max_recent_1h_move_pct)
 
+    # HJ는 진행 중인 15분봉 가격 기준으로 고점권/2차 급등을 판단한다.
+    # P형용 확정봉 distance_to_high/rebound_from_low를 재사용하지 않는다.
+    live_recent_high = float(m15.tail(16).high.max())
+    live_recent_low = float(m15.tail(16).low.min())
+    live_distance_to_high = (live_recent_high / live_price - 1) * 100 if live_price > 0 else 99.0
+    live_rebound_from_low = (live_price / live_recent_low - 1) * 100 if live_recent_low > 0 else 0.0
+
+    # 직전 고점을 실제로 뚫고 강하게 확장 중이면 단순 고점권 재진입으로 보지 않는다.
+    # RSI 하나만으로 막지 않아 강한 신고점 추세를 보존한다.
+    hj_fresh_breakout = bool(
+        live_price > live_recent_high * 1.002
+        and float(live.high) > live_recent_high * 1.003
+        and live_bullish
+    )
+    hj_near_recent_high = bool(live_distance_to_high <= cfg.hj_high_zone_max_distance_pct)
+    hj_overheat_high_zone = bool(
+        hj_near_recent_high
+        and not hj_fresh_breakout
+        and live_rsi >= cfg.hj_high_zone_overheat_rsi
+        and bb_upper_excess_pct >= cfg.hj_high_zone_min_bb_excess_pct
+    )
+    hj_second_push_high_zone = bool(
+        hj_near_recent_high
+        and not hj_fresh_breakout
+        and live_rebound_from_low >= cfg.hj_second_push_min_rebound_pct
+        and live_gain >= cfg.hj_second_push_min_live_gain_pct
+    )
+    hj_high_zone_ok = bool(not hj_overheat_high_zone and not hj_second_push_high_zone)
+
     recent_bodies = raw15["close"].sub(raw15["open"]).abs().iloc[-12:-2]
     median_body = float(recent_bodies.median()) if len(recent_bodies) else 0.0
     last_large_bearish = bool(
@@ -713,6 +789,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and hj_trend_filter_ok
         and hj_bb_chase_ok
         and hj_volatility_ok
+        and hj_high_zone_ok
         and live_gain <= 8.0
     )
     hj_score = (
@@ -745,6 +822,12 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("h1_up")
             if not volume_ok:
                 rejected.append("volume_ok")
+            if not p_ema_quality_ok:
+                rejected.append("p_ema_not_ordered")
+            if p_near_high_weak_reentry:
+                rejected.append("p_near_high_weak_reentry")
+            if p_faded_spike_reentry:
+                rejected.append("p_faded_spike_reentry")
             if p_score < 65:
                 rejected.append("p_score")
         if not hj_ok:
@@ -766,6 +849,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_bb_upper_chase")
             if not hj_volatility_ok:
                 rejected.append("hj_extreme_1h_volatility")
+            if not hj_high_zone_ok:
+                rejected.append("hj_high_zone_reentry")
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
@@ -789,9 +874,9 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "rsi": round(float(live.rsi if strategy == "HJ" else row.rsi), 2),
         "volume_ratio": round(float(live_volume_ratio if strategy == "HJ" else volume_ratio), 2),
         "pullback_from_high_pct": round(pullback_from_high, 2),
-        "rebound_from_low_pct": round(rebound_from_low, 2),
+        "rebound_from_low_pct": round(float(live_rebound_from_low if strategy == "HJ" else rebound_from_low), 2),
         "entry_candle_gain_pct": round(float(live_gain if strategy == "HJ" else entry_candle_gain), 2),
-        "distance_to_recent_high_pct": round(distance_to_high, 2),
+        "distance_to_recent_high_pct": round(float(live_distance_to_high if strategy == "HJ" else distance_to_high), 2),
         "one_hour_move_pct": round(one_hour_move, 2),
         "volume_declining_3": volume_declining_3,
         "confirmation_hold": confirmation_hold,
@@ -799,6 +884,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "ema9_rising": ema9_rising,
         "higher_lows": higher_lows,
         "higher_highs": higher_highs,
+        "p_ema_quality_ok": p_ema_quality_ok,
+        "p_near_high_weak_reentry": p_near_high_weak_reentry,
+        "p_faded_spike_reentry": p_faded_spike_reentry,
+        "p_entry_quality_ok": p_entry_quality_ok,
         "hj_wick_reversal": wick_reversal,
         "hj_continuation_three_bulls": continuation_three_bulls,
         "hj_trend_score": hj_trend_score,
@@ -812,6 +901,13 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "bb_upper_excess_pct": round(bb_upper_excess_pct, 2),
         "hj_bb_chase_ok": hj_bb_chase_ok,
         "hj_volatility_ok": hj_volatility_ok,
+        "hj_near_recent_high": hj_near_recent_high,
+        "hj_overheat_high_zone": hj_overheat_high_zone,
+        "hj_second_push_high_zone": hj_second_push_high_zone,
+        "hj_high_zone_ok": hj_high_zone_ok,
+        "hj_fresh_breakout": hj_fresh_breakout,
+        "hj_live_distance_to_high_pct": round(live_distance_to_high, 2),
+        "hj_live_rebound_from_low_pct": round(live_rebound_from_low, 2),
         "live_candle_range_pct": round(live_candle_range_pct, 2),
         "hj_last_large_bearish": last_large_bearish,
         "hj_body_recovery_pct": round(body_recovery * 100, 2),
@@ -924,7 +1020,13 @@ def early_failure_signal(
     opened_at: str,
     cfg: DailyConfig,
 ) -> tuple[bool, dict[str, Any]]:
-    """진입 후 첫 10~15분에 '정상 눌림'과 '초기 실패'를 구분한다."""
+    """진입 후 10~45분의 실패를 5분봉 구조로 감시한다.
+
+    - 10~15분: 기존의 매우 엄격한 초기 실패 조건을 유지한다.
+    - 15~45분: BEAT처럼 Early Failure 창을 지나 구조손절까지 늦어지는 공백을 메운다.
+      고정 손실금액이 아니라 EMA20 회복 실패 + 연속 저점하락 + 실제 저점 이탈 + RSI 약화가
+      함께 나타날 때만 종료한다.
+    """
     try:
         opened = datetime.fromisoformat(opened_at)
         if opened.tzinfo is None:
@@ -935,14 +1037,15 @@ def early_failure_signal(
     age_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
     if age_min < cfg.early_failure_min_age_minutes:
         return False, {"reason": "too_early", "age_min": round(age_min, 2)}
-    if age_min > cfg.early_failure_window_minutes:
+    if age_min > cfg.fast_failure_window_minutes:
         return False, {"reason": "window_passed", "age_min": round(age_min, 2)}
 
-    m5 = confirmed(indicators(client.candles(symbol, "5m", 60)))
-    if len(m5) < 5:
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 80)))
+    if len(m5) < 6:
         return False, {"reason": "5m candles insufficient"}
 
     a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
+    prev4 = m5.iloc[-4]
 
     lower_lows = bool(float(a.low) > float(b.low) > float(c.low))
 
@@ -953,24 +1056,55 @@ def early_failure_signal(
     )
 
     volume_fading = bool(float(c.volume) <= float(b.volume) <= float(a.volume))
-
     bearish_pressure = bool(
         float(b.close) < float(b.open) or float(c.close) < float(c.open)
     )
 
-    ok = bool(lower_lows and fail_reclaim and volume_fading and bearish_pressure)
+    # 기존 10~15분 조건: 정상 눌림을 최대한 보호하기 위해 그대로 엄격하게 유지.
+    strict_early = bool(
+        age_min <= cfg.early_failure_window_minutes
+        and lower_lows and fail_reclaim and volume_fading and bearish_pressure
+    )
+
+    # 15~45분 빠른 실패: 거래량 감소를 필수로 두지 않는다.
+    # 실제 급락은 매도 거래량이 커질 수 있기 때문이다.
+    low_break_ratio = abs(float(cfg.fast_failure_low_break_pct)) / 100
+    prior_low = min(float(prev4.low), float(a.low))
+    meaningful_low_break = bool(float(c.close) < prior_low * (1 - low_break_ratio))
+    rsi_weak = bool(
+        float(c.rsi) <= float(cfg.fast_failure_rsi_max)
+        and float(c.rsi) < float(b.rsi)
+    )
+    ema9_bearish = bool(float(c.ema9) < float(c.ema20) or float(c.ema9) < float(b.ema9))
+
+    fast_failure = bool(
+        age_min > cfg.early_failure_window_minutes
+        and lower_lows
+        and fail_reclaim
+        and bearish_pressure
+        and meaningful_low_break
+        and rsi_weak
+        and ema9_bearish
+    )
+
+    ok = bool(strict_early or fast_failure)
+    failure_type = "EARLY_10_15" if strict_early else "FAST_15_45" if fast_failure else ""
 
     return ok, {
         "age_min": round(age_min, 2),
+        "failure_type": failure_type,
         "lower_lows": lower_lows,
         "fail_reclaim_ema20": fail_reclaim,
         "volume_fading": volume_fading,
         "bearish_pressure": bearish_pressure,
+        "meaningful_low_break": meaningful_low_break,
+        "rsi_weak": rsi_weak,
+        "ema9_bearish": ema9_bearish,
         "last_close": float(c.close),
         "last_ema20": float(c.ema20),
         "last_rsi": round(float(c.rsi), 2),
+        "prior_low": prior_low,
     }
-
 
 def hj_structure_broken(
     client: BybitSwingClient,
@@ -1720,9 +1854,9 @@ class DailyBot:
 
             # TP가 터치되지 않았을 때만 BE/구조손절/시간종료를 확인한다.
 
-            # 진입 직후 10~15분 실패판정:
-            # 5분봉 저점 연속 하락 + EMA20 회복 실패 + 거래량 감소 + 약세 압력이
-            # 모두 겹칠 때만 초기 실패로 종료한다. 단순 눌림은 건드리지 않는다.
+            # 진입 후 10~45분 실패판정:
+            # 10~15분은 기존 엄격조건, 15~45분은 5분 구조붕괴가 명확할 때만 빠르게 종료한다.
+            # 고정 USDT 손절은 사용하지 않는다.
             if self.cfg.early_failure_enabled and int(row["tp1_done"] or 0) == 0:
                 try:
                     early_fail, early_details = early_failure_signal(
@@ -1753,7 +1887,7 @@ class DailyBot:
                 continue
 
             # HJ/P 공통 구조손절:
-            # 확정 15분봉 2개가 EMA20 아래 + EMA20 하락 + 직전 저점 재이탈 시 전량 종료한다.
+            # 확정 15분봉의 EMA20/EMA9/저점/RSI/음봉 구조가 실제로 무너질 때 전량 종료한다.
             if self.cfg.hj_structure_stop_enabled:
                 try:
                     broken, structure = hj_structure_broken(
