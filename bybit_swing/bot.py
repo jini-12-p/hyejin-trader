@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.23-COOKIE-CYS-HighReentryGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.24-UBGuardAndLateTrendFailure"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -822,6 +822,18 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and live_rsi >= 62.0
         and live_volume_ratio < 0.90
     )
+
+    # UB형 고점권 소진 방어:
+    # 최근 고점 1% 이내인데 새 고점을 만들지 못하고(higher_highs=False),
+    # RSI는 과열권이며 continuation 패턴으로 다시 잡히는 경우 차단.
+    # 거래량이 강해도 신고점 확인이 없으면 진입하지 않는다.
+    hj_high_zone_exhaustion = bool(
+        continuation_three_bulls
+        and not hj_fresh_breakout
+        and live_distance_to_high <= 1.00
+        and live_rsi >= 70.0
+        and not higher_highs
+    )
     hj_trend_filter_ok = bool(
         hj_price_above_ema20
         and hj_ema20_above_ema60
@@ -840,6 +852,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and hj_volatility_ok
         and hj_high_zone_ok
         and not hj_weak_volume_high_reentry
+        and not hj_high_zone_exhaustion
         and live_gain <= 8.0
     )
     hj_score = (
@@ -903,6 +916,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_high_zone_reentry")
             if hj_weak_volume_high_reentry:
                 rejected.append("hj_weak_volume_high_reentry")
+            if hj_high_zone_exhaustion:
+                rejected.append("hj_high_zone_exhaustion")
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
@@ -961,6 +976,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_second_push_high_zone": hj_second_push_high_zone,
         "hj_high_zone_ok": hj_high_zone_ok,
         "hj_weak_volume_high_reentry": hj_weak_volume_high_reentry,
+        "hj_high_zone_exhaustion": hj_high_zone_exhaustion,
         "hj_fresh_breakout": hj_fresh_breakout,
         "hj_live_distance_to_high_pct": round(live_distance_to_high, 2),
         "hj_live_rebound_from_low_pct": round(live_rebound_from_low, 2),
@@ -1196,6 +1212,63 @@ def early_failure_signal(
         "last_rsi": round(float(c.rsi), 2),
         "prior_low": prior_low,
     }
+
+def late_trend_failure_signal(
+    client: BybitClient,
+    symbol: str,
+    entry_ts_ms: int,
+    tp1_done: bool,
+) -> tuple[bool, dict[str, Any]]:
+    """45분 이후 TP1 미체결 포지션의 추세실패를 기존 구조손절보다 앞서 감지."""
+    if tp1_done:
+        return False, {"reason": "tp1_done"}
+
+    now_ms = int(time.time() * 1000)
+    age_min = max(0.0, (now_ms - int(entry_ts_ms)) / 60000.0)
+    if age_min < 45.0:
+        return False, {"reason": "too_early", "age_min": round(age_min, 1)}
+
+    df15 = add_indicators(client.klines(symbol, "15", 80))
+    if len(df15) < 8:
+        return False, {"reason": "not_enough_15m", "age_min": round(age_min, 1)}
+
+    closed = df15.iloc[:-1].copy()
+    if len(closed) < 5:
+        return False, {"reason": "not_enough_closed_15m", "age_min": round(age_min, 1)}
+
+    c = closed.iloc[-1]
+    b = closed.iloc[-2]
+    recent = closed.iloc[-4:-1]
+
+    close_below_ema20 = bool(float(c.close) < float(c.ema20) * 0.999)
+    ema5_bearish = bool(float(c.ema5) < float(b.ema5))
+    ema10_bearish = bool(float(c.ema10) < float(b.ema10))
+    ema_fast_bearish = bool(ema5_bearish and ema10_bearish)
+    rsi_not_recovered = bool(float(c.rsi) <= 48.0 and float(c.rsi) <= float(b.rsi))
+    recent_low = float(recent.low.min()) if len(recent) else float(b.low)
+    low_rebreak = bool(float(c.close) < recent_low * 0.997)
+    bearish = bool(float(c.close) < float(c.open))
+
+    weakness_score = int(ema_fast_bearish) + int(rsi_not_recovered) + int(low_rebreak) + int(bearish)
+    ok = bool(close_below_ema20 and weakness_score >= 3)
+
+    details = {
+        "reason": "LATE_TREND_FAILURE_45M_PLUS" if ok else "late_trend_hold",
+        "age_min": round(age_min, 1),
+        "close_below_ema20": close_below_ema20,
+        "ema5_bearish": ema5_bearish,
+        "ema10_bearish": ema10_bearish,
+        "ema_fast_bearish": ema_fast_bearish,
+        "rsi_not_recovered": rsi_not_recovered,
+        "low_rebreak": low_rebreak,
+        "bearish": bearish,
+        "weakness_score": weakness_score,
+        "close": float(c.close),
+        "ema20": float(c.ema20),
+        "rsi": float(c.rsi),
+    }
+    return ok, details
+
 
 def hj_structure_broken(
     client: BybitSwingClient,
@@ -1975,6 +2048,26 @@ class DailyBot:
                         strategy=strategy, trade_id=row["trade_id"] or ""
                     )
                     # UI/기존 통계 호환을 위해 최종 종료 이벤트명은 유지한다.
+                    reason = "HJ_STRUCTURE_STOP" if strategy == "HJ" else "STOP"
+                    self._close(row, price, 1.0, reason, price, price)
+                    continue
+
+                # 45분 이후 전용 추세실패:
+                # UB/CYS형처럼 초반 45분을 버틴 뒤 TP1 없이 추세가 무너지는 거래를
+                # 기존 구조손절보다 먼저 종료한다.
+                late_fail, late_details = late_trend_failure_signal(
+                    self.client,
+                    row["symbol"],
+                    int(row["entry_ts_ms"] or 0),
+                    bool(row["tp1_done"]),
+                )
+                if late_fail:
+                    log_event(
+                        row["symbol"], "LATE_TREND_FAILURE_45M_TRIGGER",
+                        price=price, mode=self.cfg.mode,
+                        details=json.dumps(late_details, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
                     reason = "HJ_STRUCTURE_STOP" if strategy == "HJ" else "STOP"
                     self._close(row, price, 1.0, reason, price, price)
                     continue
