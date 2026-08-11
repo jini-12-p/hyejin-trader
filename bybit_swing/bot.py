@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.21-BreakoutConfirmAndFailureTune"
+BOT_RUNTIME_VERSION = "RC-v4.3.23-COOKIE-CYS-HighReentryGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -809,6 +809,19 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     hj_volume_ok = bool(hj_wick_volume_ok or hj_continuation_volume_ok)
     hj_momentum_ok = bool(48 <= live_rsi <= cfg.hj_max_rsi)
     hj_pattern_ok = bool(wick_reversal or continuation_three_bulls)
+
+    # COOKIE + CYS형 방어:
+    # 급등 뒤 최근 고점 부근에서 재진입하는데 거래량 확인이 약한 경우 차단한다.
+    # COOKIE는 wick_reversal, CYS는 continuation_three_bulls로 들어왔기 때문에
+    # 두 HJ 패턴 모두 검사한다.
+    # 단순 RSI 차단이 아니며, 30초 이상 확인된 강한 신고점 돌파(hj_fresh_breakout)는 예외로 살린다.
+    hj_weak_volume_high_reentry = bool(
+        (wick_reversal or continuation_three_bulls)
+        and not hj_fresh_breakout
+        and live_distance_to_high <= 2.00
+        and live_rsi >= 62.0
+        and live_volume_ratio < 0.90
+    )
     hj_trend_filter_ok = bool(
         hj_price_above_ema20
         and hj_ema20_above_ema60
@@ -826,6 +839,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and hj_bb_chase_ok
         and hj_volatility_ok
         and hj_high_zone_ok
+        and not hj_weak_volume_high_reentry
         and live_gain <= 8.0
     )
     hj_score = (
@@ -887,6 +901,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_extreme_1h_volatility")
             if not hj_high_zone_ok:
                 rejected.append("hj_high_zone_reentry")
+            if hj_weak_volume_high_reentry:
+                rejected.append("hj_weak_volume_high_reentry")
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
@@ -944,6 +960,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_overheat_high_zone": hj_overheat_high_zone,
         "hj_second_push_high_zone": hj_second_push_high_zone,
         "hj_high_zone_ok": hj_high_zone_ok,
+        "hj_weak_volume_high_reentry": hj_weak_volume_high_reentry,
         "hj_fresh_breakout": hj_fresh_breakout,
         "hj_live_distance_to_high_pct": round(live_distance_to_high, 2),
         "hj_live_rebound_from_low_pct": round(live_rebound_from_low, 2),
@@ -1139,8 +1156,26 @@ def early_failure_signal(
         and fast_weakness_score >= 2
     )
 
-    ok = bool(strict_early or fast_failure)
-    failure_type = "EARLY_10_15" if strict_early else "FAST_15_45" if fast_failure else ""
+    # COOKIE형 25~45분 지연 손절 보완:
+    # EMA20 아래에서 약세가 이어지고 RSI/EMA도 꺾였는데,
+    # 기존 meaningful_low_break 한 조건 때문에 구조손절까지 끌지 않도록 보조 경로를 둔다.
+    # 여전히 고정 손실금액 손절은 사용하지 않는다.
+    late_accelerated_failure = bool(
+        age_min >= 25.0
+        and fail_reclaim
+        and bearish_pressure
+        and ema9_bearish
+        and float(c.rsi) <= 48.0
+        and (meaningful_low_break or lower_lows or sell_volume_surge)
+    )
+
+    ok = bool(strict_early or fast_failure or late_accelerated_failure)
+    failure_type = (
+        "EARLY_10_15" if strict_early
+        else "FAST_15_45" if fast_failure
+        else "FAST_LATE_25_45" if late_accelerated_failure
+        else ""
+    )
 
     return ok, {
         "age_min": round(age_min, 2),
@@ -1155,6 +1190,7 @@ def early_failure_signal(
         "rsi_weak": rsi_weak,
         "ema9_bearish": ema9_bearish,
         "fast_weakness_score": fast_weakness_score,
+        "late_accelerated_failure": late_accelerated_failure,
         "last_close": float(c.close),
         "last_ema20": float(c.ema20),
         "last_rsi": round(float(c.rsi), 2),
@@ -1926,12 +1962,19 @@ class DailyBot:
                     )
 
                 if early_fail:
+                    failure_type = str(early_details.get("failure_type") or "UNKNOWN")
+                    audit_event = {
+                        "EARLY_10_15": "EARLY_FAILURE_10_15_TRIGGER",
+                        "FAST_15_45": "FAST_FAILURE_15_45_TRIGGER",
+                        "FAST_LATE_25_45": "FAST_FAILURE_LATE_25_45_TRIGGER",
+                    }.get(failure_type, "EARLY_FAILURE_TRIGGER")
                     log_event(
-                        row["symbol"], "EARLY_FAILURE_TRIGGER",
+                        row["symbol"], audit_event,
                         price=price, mode=self.cfg.mode,
                         details=json.dumps(early_details, ensure_ascii=False),
                         strategy=strategy, trade_id=row["trade_id"] or ""
                     )
+                    # UI/기존 통계 호환을 위해 최종 종료 이벤트명은 유지한다.
                     reason = "HJ_STRUCTURE_STOP" if strategy == "HJ" else "STOP"
                     self._close(row, price, 1.0, reason, price, price)
                     continue
