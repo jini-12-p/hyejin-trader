@@ -21,7 +21,12 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.20-LiveHighZoneAndFastFailureFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.21-BreakoutConfirmAndFailureTune"
+
+# HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
+# 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
+_HJ_BREAKOUT_CONFIRM: dict[str, dict[str, float]] = {}
+
 
 
 @dataclass
@@ -713,13 +718,44 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     live_distance_to_high = (live_recent_high / live_price - 1) * 100 if live_price > 0 else 99.0
     live_rebound_from_low = (live_price / live_recent_low - 1) * 100 if live_recent_low > 0 else 0.0
 
-    # 직전 고점을 실제로 뚫고 강하게 확장 중이면 단순 고점권 재진입으로 보지 않는다.
-    # RSI 하나만으로 막지 않아 강한 신고점 추세를 보존한다.
-    hj_fresh_breakout = bool(
+    # 직전 고점 돌파 예외는 "한 번 찍은 스파이크"로 열지 않는다.
+    # 첫 감지 후 다음 스캔(최소 30초 뒤)에서도 돌파 상태를 유지해야 확인된 돌파로 인정한다.
+    # 이렇게 하면 ACE형 순간 고점 찌르기는 줄이고, SQD형 지속 돌파는 살린다.
+    hj_breakout_raw = bool(
         live_price > live_recent_high * 1.002
         and float(live.high) > live_recent_high * 1.003
         and live_bullish
     )
+    now_mono = time.monotonic()
+    breakout_state = _HJ_BREAKOUT_CONFIRM.get(symbol)
+    hj_fresh_breakout = False
+    hj_breakout_confirm_age_sec = 0.0
+    if hj_breakout_raw:
+        if breakout_state is None:
+            _HJ_BREAKOUT_CONFIRM[symbol] = {
+                "first_seen": now_mono,
+                "last_seen": now_mono,
+                "count": 1.0,
+            }
+        else:
+            first_seen = float(breakout_state.get("first_seen", now_mono))
+            last_seen = float(breakout_state.get("last_seen", first_seen))
+            if now_mono - last_seen > 150.0:
+                first_seen = now_mono
+                breakout_state["count"] = 1.0
+            else:
+                breakout_state["count"] = float(breakout_state.get("count", 1.0)) + 1.0
+            breakout_state["first_seen"] = first_seen
+            breakout_state["last_seen"] = now_mono
+            _HJ_BREAKOUT_CONFIRM[symbol] = breakout_state
+            hj_breakout_confirm_age_sec = now_mono - first_seen
+            hj_fresh_breakout = bool(
+                float(breakout_state.get("count", 0.0)) >= 2.0
+                and hj_breakout_confirm_age_sec >= 30.0
+            )
+    else:
+        _HJ_BREAKOUT_CONFIRM.pop(symbol, None)
+
     hj_near_recent_high = bool(live_distance_to_high <= cfg.hj_high_zone_max_distance_pct)
     hj_overheat_high_zone = bool(
         hj_near_recent_high
@@ -877,6 +913,9 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "rebound_from_low_pct": round(float(live_rebound_from_low if strategy == "HJ" else rebound_from_low), 2),
         "entry_candle_gain_pct": round(float(live_gain if strategy == "HJ" else entry_candle_gain), 2),
         "distance_to_recent_high_pct": round(float(live_distance_to_high if strategy == "HJ" else distance_to_high), 2),
+        "hj_breakout_raw": bool(hj_breakout_raw),
+        "hj_fresh_breakout_confirmed": bool(hj_fresh_breakout),
+        "hj_breakout_confirm_age_sec": round(float(hj_breakout_confirm_age_sec), 1),
         "one_hour_move_pct": round(one_hour_move, 2),
         "volume_declining_3": volume_declining_3,
         "confirmation_hold": confirmation_hold,
@@ -1059,11 +1098,21 @@ def early_failure_signal(
     bearish_pressure = bool(
         float(b.close) < float(b.open) or float(c.close) < float(c.open)
     )
+    # ARIA형: 실패가 커질 때 거래량이 줄지 않고 오히려 매도 거래량이 급증할 수 있다.
+    # 거래량 감소 OR 강한 음봉 거래량 확대 중 하나를 실패 증거로 인정한다.
+    c_vol_avg = float(c.vol_avg) if pd.notna(c.vol_avg) and float(c.vol_avg) > 0 else 0.0
+    sell_volume_surge = bool(
+        float(c.close) < float(c.open)
+        and float(c.volume) >= float(b.volume) * 1.20
+        and (c_vol_avg <= 0 or float(c.volume) >= c_vol_avg * 1.10)
+    )
+    early_volume_failure = bool(volume_fading or sell_volume_surge)
 
-    # 기존 10~15분 조건: 정상 눌림을 최대한 보호하기 위해 그대로 엄격하게 유지.
+    # 10~15분: 정상 눌림 보호를 위해 구조 조건은 유지하되,
+    # 거래량은 "감소"뿐 아니라 "매도 급증"도 실패로 인정한다.
     strict_early = bool(
         age_min <= cfg.early_failure_window_minutes
-        and lower_lows and fail_reclaim and volume_fading and bearish_pressure
+        and lower_lows and fail_reclaim and early_volume_failure and bearish_pressure
     )
 
     # 15~45분 빠른 실패: 거래량 감소를 필수로 두지 않는다.
@@ -1077,14 +1126,17 @@ def early_failure_signal(
     )
     ema9_bearish = bool(float(c.ema9) < float(c.ema20) or float(c.ema9) < float(b.ema9))
 
+    # 15~45분: CAP형처럼 핵심 구조가 이미 무너졌는데 보조조건 하나 때문에
+    # 기존 구조손절까지 끌고 가지 않도록 한다.
+    # 핵심 3조건(EMA20 회복 실패 + 약세 압력 + 의미 있는 저점 이탈)은 필수,
+    # 보조 3조건(lower lows / RSI 약화 / EMA9 약화) 중 2개 이상이면 빠른 실패로 본다.
+    fast_weakness_score = int(lower_lows) + int(rsi_weak) + int(ema9_bearish)
     fast_failure = bool(
         age_min > cfg.early_failure_window_minutes
-        and lower_lows
         and fail_reclaim
         and bearish_pressure
         and meaningful_low_break
-        and rsi_weak
-        and ema9_bearish
+        and fast_weakness_score >= 2
     )
 
     ok = bool(strict_early or fast_failure)
@@ -1096,10 +1148,13 @@ def early_failure_signal(
         "lower_lows": lower_lows,
         "fail_reclaim_ema20": fail_reclaim,
         "volume_fading": volume_fading,
+        "sell_volume_surge": sell_volume_surge,
+        "early_volume_failure": early_volume_failure,
         "bearish_pressure": bearish_pressure,
         "meaningful_low_break": meaningful_low_break,
         "rsi_weak": rsi_weak,
         "ema9_bearish": ema9_bearish,
+        "fast_weakness_score": fast_weakness_score,
         "last_close": float(c.close),
         "last_ema20": float(c.ema20),
         "last_rsi": round(float(c.rsi), 2),
