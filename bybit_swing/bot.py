@@ -21,7 +21,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.25-WickReversalTrendGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.26-WickRangeNameFix"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -849,7 +849,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # CYS 사례 live_candle_range 약 5%를 기준으로 4% 이상은 과도 변동으로 본다.
     hj_wick_reversal_oversized_candle = bool(
         wick_reversal
-        and live_candle_range >= 4.0
+        and live_candle_range_pct >= 4.0
         and not hj_fresh_breakout
     )
 
