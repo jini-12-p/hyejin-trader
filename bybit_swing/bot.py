@@ -5,6 +5,7 @@ import json
 import math
 import sqlite3
 import time
+import threading
 import os
 import urllib.parse
 import urllib.request
@@ -21,7 +22,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.26-WickRangeNameFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.29-LoopIsolationFix"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -1934,9 +1935,31 @@ class DailyBot:
         manual_symbol = str(manual_payload.get("symbol") or "")
 
         for row in self.open_rows():
+            # 최우선 시간종료 판정은 어떤 신규 API 호출보다 먼저 한다.
+            # 3시간이 지난 PAPER 포지션은 DB에 저장된 마지막 가격으로 즉시 종료하여
+            # ticker/API 지연 때문에 TIME_EXIT 자체가 밀리지 않게 한다.
+            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(row["opened_at"])).total_seconds() / 3600
+            if age_h >= self.cfg.max_hold_hours and self.cfg.mode == "paper":
+                fallback_price = float(row["last_price"] or row["avg_price"] or row["base_entry_price"] or 0)
+                if fallback_price > 0:
+                    log_event(
+                        row["symbol"], "TIME_EXIT_DUE",
+                        price=fallback_price, mode=self.cfg.mode,
+                        details=json.dumps({
+                            "age_h": round(age_h, 4),
+                            "max_hold_hours": self.cfg.max_hold_hours,
+                            "price_source": "stored_last_price"
+                        }, ensure_ascii=False),
+                        strategy=row["strategy"] or "", trade_id=row["trade_id"] or ""
+                    )
+                    self._close(row, fallback_price, 1.0, "TIME_EXIT", fallback_price, None)
+                    continue
+
+            # 3시간 미만 PAPER 또는 DEMO/LIVE 관리부터는 최신 시세가 필요하므로 ticker 조회.
             price = float(self.client.ticker(row["symbol"]).get("last") or 0)
             if price <= 0:
                 continue
+
             if manual_symbol and str(row["symbol"]) == manual_symbol:
                 self._close(row, price, 1.0, "MANUAL_EXIT", price, None)
                 state_set("manual_exit_request", "")
@@ -1944,11 +1967,26 @@ class DailyBot:
                           details=json.dumps(manual_payload, ensure_ascii=False),
                           strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
                 continue
+
+            # DEMO/LIVE는 실제 최신가가 확보된 뒤 TIME_EXIT 처리.
+            if age_h >= self.cfg.max_hold_hours:
+                log_event(
+                    row["symbol"], "TIME_EXIT_DUE",
+                    price=price, mode=self.cfg.mode,
+                    details=json.dumps({
+                        "age_h": round(age_h, 4),
+                        "max_hold_hours": self.cfg.max_hold_hours,
+                        "price_source": "ticker"
+                    }, ensure_ascii=False),
+                    strategy=row["strategy"] or "", trade_id=row["trade_id"] or ""
+                )
+                self._close(row, price, 1.0, "TIME_EXIT", price, None)
+                continue
+
             avg = float(row["avg_price"])
             base_price = float(row["base_entry_price"] or avg)
             pnl_pct = (price / avg - 1) * 100
             base_pnl_pct = (price / base_price - 1) * 100
-            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(row["opened_at"])).total_seconds() / 3600
             lowest = min(float(row["lowest_price"] or price), price)
             highest = max(float(row["highest_price"] or price), price)
             with db() as conn:
@@ -2174,8 +2212,6 @@ class DailyBot:
                         )
                         state_set(flat_state_key, flat_bucket)
 
-            if age_h >= self.cfg.max_hold_hours:
-                self._close(row, price, 1.0, "TIME_EXIT", price, None)
 
     def scan_entries(self) -> None:
         """긴급복구: SCAN_OK가 나오면 같은 스캔 안에서 바로 진입한다.
@@ -2266,29 +2302,100 @@ class DailyBot:
         self.update_stop_reviews()
         self.scan_entries()
 
+    def _scan_entries_background(self) -> None:
+        """신규진입 스캔을 관리루프와 분리한다.
+
+        스캔/API 호출이 오래 걸려도 보유 포지션 manage()는 계속 돌 수 있게 한다.
+        동시에 두 개의 스캔이 겹치지 않도록 run_forever에서 단일 스레드만 허용한다.
+        """
+        try:
+            state_set("scan_worker_status", "RUNNING")
+            state_set("scan_worker_started_at", datetime.now(timezone.utc).isoformat())
+            self.scan_entries()
+            state_set("scan_worker_status", "IDLE")
+            state_set("scan_worker_finished_at", datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            state_set("scan_worker_status", "ERROR")
+            state_set("scan_worker_error", f"{type(exc).__name__}: {exc}")
+            log_event("", "SCAN_WORKER_ERROR", mode=self.cfg.mode,
+                      details=f"{type(exc).__name__}: {exc}")
+
+    def _stop_reviews_background(self) -> None:
+        """손절 리뷰를 메인 포지션 관리루프와 분리한다.
+
+        리뷰용 ticker/API가 느려져도 manage() / TIME_EXIT / TP·SL 관리는 계속 돌 수 있게 한다.
+        """
+        try:
+            state_set("stop_review_worker_status", "RUNNING")
+            state_set("stop_review_worker_started_at", datetime.now(timezone.utc).isoformat())
+            self.update_stop_reviews()
+            state_set("stop_review_worker_status", "IDLE")
+            state_set("stop_review_worker_finished_at", datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            state_set("stop_review_worker_status", "ERROR")
+            state_set("stop_review_worker_error", f"{type(exc).__name__}: {exc}")
+            log_event("", "STOP_REVIEW_WORKER_ERROR", mode=self.cfg.mode,
+                      details=f"{type(exc).__name__}: {exc}")
+
     def run_forever(self) -> None:
         state_set("bot_process_status", "RUNNING")
         state_set("runtime_version", BOT_RUNTIME_VERSION)
         state_set("runtime_started_at", datetime.now(timezone.utc).isoformat())
         log_event("", "BOT_START", mode=self.cfg.mode, details=json.dumps(asdict(self.cfg), ensure_ascii=False))
+
         next_scan_at = 0.0
+        next_review_at = 0.0
+        scan_thread: threading.Thread | None = None
+        review_thread: threading.Thread | None = None
+
         while True:
             loop_started = time.monotonic()
             try:
-                # 보유 포지션 TP/SL 관리는 1초 주기로, 신규 후보 스캔은 별도 주기로 분리한다.
+                # 보유 포지션 관리는 항상 메인 루프 최우선.
                 self.manage()
-                self.update_stop_reviews()
+
                 if state_flag("shutdown_when_flat", False) and not self.open_rows():
                     state_set("bot_process_status", "STOPPED")
                     state_set("shutdown_when_flat", "0")
                     log_event("", "BOT_SAFE_STOP", mode=self.cfg.mode, details="포지션 0 확인 후 안전 종료")
                     break
+
                 now_mono = time.monotonic()
+
+                # 손절 리뷰도 별도 daemon thread에서 실행.
+                # 리뷰 API가 느려져도 manage()는 계속 1초 주기로 돈다.
+                if now_mono >= next_review_at:
+                    if review_thread is None or not review_thread.is_alive():
+                        review_thread = threading.Thread(
+                            target=self._stop_reviews_background,
+                            name="bybit-stop-review",
+                            daemon=True,
+                        )
+                        review_thread.start()
+                        next_review_at = now_mono + 30.0
+                    else:
+                        # 기존 리뷰가 아직 끝나지 않았다면 중첩 실행하지 않는다.
+                        next_review_at = now_mono + 5.0
+
+                # 신규진입 스캔은 별도 daemon thread에서 실행.
+                # 스캔이 느려져도 manage() / TIME_EXIT은 계속 돈다.
                 if now_mono >= next_scan_at:
-                    self.scan_entries()
-                    next_scan_at = now_mono + max(30.0, float(self.cfg.scan_seconds))
+                    if scan_thread is None or not scan_thread.is_alive():
+                        scan_thread = threading.Thread(
+                            target=self._scan_entries_background,
+                            name="bybit-entry-scan",
+                            daemon=True,
+                        )
+                        scan_thread.start()
+                        next_scan_at = now_mono + max(30.0, float(self.cfg.scan_seconds))
+                    else:
+                        # 기존 스캔이 아직 끝나지 않았다면 겹쳐 실행하지 않는다.
+                        next_scan_at = now_mono + 5.0
+
             except Exception as exc:
-                log_event("", "ERROR", mode=self.cfg.mode, details=str(exc))
+                log_event("", "ERROR", mode=self.cfg.mode,
+                          details=f"{type(exc).__name__}: {exc}")
+
             elapsed = time.monotonic() - loop_started
             time.sleep(max(0.1, float(self.cfg.manage_seconds) - elapsed))
 
