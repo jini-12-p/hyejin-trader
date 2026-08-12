@@ -22,7 +22,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.29-LoopIsolationFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.31-EntryTimestampFix"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -413,6 +413,10 @@ def init_db() -> None:
         _ensure_column(conn, "bot_positions", "trade_id", "TEXT")
         _ensure_column(conn, "bot_positions", "stop_stage1_done", "INTEGER DEFAULT 0")
         _ensure_column(conn, "bot_positions", "last_add_15m_bucket", "TEXT")
+        # v4.3.31: 45분 이후 추세실패 판단에서 사용하는 진입시각(ms) 컬럼 보장.
+        # 기존 DB에는 이 컬럼이 없을 수 있어, 누락 시 sqlite.Row 접근에서
+        # IndexError: No item with that key 가 발생할 수 있었다.
+        _ensure_column(conn, "bot_positions", "entry_ts_ms", "INTEGER")
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_events", "trade_id", "TEXT")
@@ -1711,11 +1715,11 @@ class DailyBot:
                 """INSERT INTO bot_positions(
                     symbol,status,opened_at,updated_at,avg_price,total_qty,total_margin,dca_count,tp1_done,
                     last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
-                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id,stop_stage1_done
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id,stop_stage1_done,entry_ts_ms
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, "OPEN", utc_now(), utc_now(), price, qty, entry_margin, 0, 0,
                  price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
-                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0),
+                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0, int(time.time() * 1000)),
             )
         signal_details = signal_details or {}
         details = json.dumps({
@@ -2126,10 +2130,18 @@ class DailyBot:
                 # 45분 이후 전용 추세실패:
                 # UB/CYS형처럼 초반 45분을 버틴 뒤 TP1 없이 추세가 무너지는 거래를
                 # 기존 구조손절보다 먼저 종료한다.
+                entry_ts_ms = int(row["entry_ts_ms"] or 0)
+                if entry_ts_ms <= 0:
+                    # 마이그레이션 전에 열려 있던 포지션도 안전하게 처리.
+                    opened_dt = datetime.fromisoformat(row["opened_at"])
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    entry_ts_ms = int(opened_dt.timestamp() * 1000)
+
                 late_fail, late_details = late_trend_failure_signal(
                     self.client,
                     row["symbol"],
-                    int(row["entry_ts_ms"] or 0),
+                    entry_ts_ms,
                     bool(row["tp1_done"]),
                 )
                 if late_fail:
