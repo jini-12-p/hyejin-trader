@@ -22,7 +22,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.31-EntryTimestampFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.32-LateTrendFix"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -1252,7 +1252,7 @@ def early_failure_signal(
     }
 
 def late_trend_failure_signal(
-    client: BybitClient,
+    client: BybitSwingClient,
     symbol: str,
     entry_ts_ms: int,
     tp1_done: bool,
@@ -1266,7 +1266,12 @@ def late_trend_failure_signal(
     if age_min < 45.0:
         return False, {"reason": "too_early", "age_min": round(age_min, 1)}
 
-    df15 = add_indicators(client.klines(symbol, "15", 80))
+    # 현재 봇의 실제 Bybit 클라이언트/지표 함수명을 사용한다.
+    # 기존 45분 로직은 오래된 이름(add_indicators/klines)과 EMA5/EMA10 컬럼을
+    # 참조해 런타임 NameError/컬럼 오류가 발생할 수 있었다.
+    df15 = indicators(client.candles(symbol, "15m", 80))
+    df15["ema5"] = df15["close"].ewm(span=5, adjust=False).mean()
+    df15["ema10"] = df15["close"].ewm(span=10, adjust=False).mean()
     if len(df15) < 8:
         return False, {"reason": "not_enough_15m", "age_min": round(age_min, 1)}
 
