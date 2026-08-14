@@ -22,7 +22,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.32-LateTrendFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.33-GWEIWickGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -863,6 +863,35 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not hj_fresh_breakout
         and not hj_wick_reversal_trend_recovery
     )
+
+    # GWEI형 1차 방어:
+    # wick_reversal로 보이지만 실제 아래꼬리가 몸통보다도 짧고(비율 < 1),
+    # higher-low / higher-high / rebound 중 어느 구조회복도 없는 경우는
+    # 단순 흔들림을 반등으로 오인한 것으로 보고 차단한다.
+    hj_wick_reversal_weak_structure = bool(
+        wick_reversal
+        and not hj_fresh_breakout
+        and lower_wick_ratio < 1.00
+        and not rebound
+        and not higher_lows
+        and not higher_highs
+    )
+
+    # GWEI형 2차 재진입 방어:
+    # 거래량이 매우 약하고 감소 중이며 EMA 정렬까지 무너진 wick reversal은
+    # 가격 한 번 튄 것만으로 재진입하지 않는다.
+    # BTW/RE처럼 거래량비가 낮아도 volume trend 또는 EMA 구조가 살아있는 경우는 보존한다.
+    hj_wick_reversal_faded_reentry = bool(
+        wick_reversal
+        and not hj_fresh_breakout
+        and live_volume_ratio < 0.45
+        and volume_declining_3
+        and not volume_trend_ok
+        and not ema_ordered
+        and not rebound
+        and not higher_lows
+        and not higher_highs
+    )
     hj_trend_filter_ok = bool(
         hj_price_above_ema20
         and hj_ema20_above_ema60
@@ -884,6 +913,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not hj_high_zone_exhaustion
         and not hj_wick_reversal_trend_fail
         and not hj_wick_reversal_oversized_candle
+        and not hj_wick_reversal_weak_structure
+        and not hj_wick_reversal_faded_reentry
         and live_gain <= 8.0
     )
     hj_score = (
@@ -953,6 +984,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_wick_reversal_trend_fail")
             if hj_wick_reversal_oversized_candle:
                 rejected.append("hj_wick_reversal_oversized_candle")
+            if hj_wick_reversal_weak_structure:
+                rejected.append("hj_wick_reversal_weak_structure")
+            if hj_wick_reversal_faded_reentry:
+                rejected.append("hj_wick_reversal_faded_reentry")
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
@@ -1015,6 +1050,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_wick_reversal_trend_recovery": hj_wick_reversal_trend_recovery,
         "hj_wick_reversal_trend_fail": hj_wick_reversal_trend_fail,
         "hj_wick_reversal_oversized_candle": hj_wick_reversal_oversized_candle,
+        "hj_wick_reversal_weak_structure": hj_wick_reversal_weak_structure,
+        "hj_wick_reversal_faded_reentry": hj_wick_reversal_faded_reentry,
         "hj_fresh_breakout": hj_fresh_breakout,
         "hj_live_distance_to_high_pct": round(live_distance_to_high, 2),
         "hj_live_rebound_from_low_pct": round(live_rebound_from_low, 2),
