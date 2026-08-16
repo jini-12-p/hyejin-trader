@@ -23,7 +23,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.36-ApiHangGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.37-TailLossGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -995,6 +995,18 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not higher_lows
         and not higher_highs
     )
+    # v4.3.37 BICO형 고점 과확장 fresh-breakout 방어.
+    # 8/14~8/16 continuation 실거래 비교에서, 최근 저점 대비 10%+ 반등 후
+    # 고점 바로 위/근처를 저거래량(<1.0)·1시간 추세 약세 상태로 재돌파한 BICO 대손실만
+    # 추가로 걸리고 기존 수익 continuation은 보존되는 좁은 조건이다.
+    hj_continuation_overextended_fresh_breakout = bool(
+        continuation_three_bulls
+        and hj_fresh_breakout
+        and rebound_from_low >= 10.00
+        and distance_to_high <= 0.50
+        and live_volume_ratio < 1.00
+        and not h1_up
+    )
     # v4.3.35 P형 과확장 continuation 방어.
     # P는 확정 15분봉 기반 반등 전략이지만, 진입 시점의 진행봉까지 3연속 상승으로 이어지고
     # 최근 4시간 저점에서 이미 10% 이상 올라온 상태에서 최근 고점 0.5% 이내라면
@@ -1034,6 +1046,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not hj_continuation_weak_h1_near_high
         and not hj_continuation_oversized_low_volume
         and not hj_continuation_weak_fresh_breakout
+        and not hj_continuation_overextended_fresh_breakout
         and live_gain <= 8.0
     )
     hj_score = (
@@ -1117,6 +1130,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_continuation_oversized_low_volume")
             if hj_continuation_weak_fresh_breakout:
                 rejected.append("hj_continuation_weak_fresh_breakout")
+            if hj_continuation_overextended_fresh_breakout:
+                rejected.append("hj_continuation_overextended_fresh_breakout")
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
@@ -1186,6 +1201,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_continuation_weak_h1_near_high": hj_continuation_weak_h1_near_high,
         "hj_continuation_oversized_low_volume": hj_continuation_oversized_low_volume,
         "hj_continuation_weak_fresh_breakout": hj_continuation_weak_fresh_breakout,
+        "hj_continuation_overextended_fresh_breakout": hj_continuation_overextended_fresh_breakout,
         "hj_fresh_breakout": hj_fresh_breakout,
         "hj_live_distance_to_high_pct": round(live_distance_to_high, 2),
         "hj_live_rebound_from_low_pct": round(live_rebound_from_low, 2),
@@ -1480,6 +1496,74 @@ def p_catastrophic_failure_signal(
 
     return ok, {
         "reason": "P_CATASTROPHIC_FAILURE" if ok else "p_catastrophic_hold",
+        "age_min": round(age_min, 2),
+        "drawdown_pct": round(drawdown_pct, 3),
+        "two_below_ema9": two_below_ema9,
+        "close_below_ema20": close_below_ema20,
+        "ema9_falling": ema9_falling,
+        "lower_lows": lower_lows,
+        "bearish": bearish,
+        "rsi_weakening": rsi_weakening,
+        "structure_score": structure_score,
+        "last_close": float(c.close),
+        "last_ema9": float(c.ema9),
+        "last_ema20": float(c.ema20),
+        "last_rsi": round(float(c.rsi), 2),
+    }
+
+
+def hj_catastrophic_failure_signal(
+    client: BybitSwingClient,
+    symbol: str,
+    opened_at: str,
+    base_price: float,
+    live_price: float,
+) -> tuple[bool, dict[str, Any]]:
+    """HJ형 대손실 꼬리 백업 가드.
+
+    단순 -N% 고정손절이 아니라, 진입 15~90분 사이 최초 진입가 대비 -2.5% 이상 밀린 뒤
+    확정 5분봉에서 EMA9 2봉 이탈 + EMA9 하락 + 음봉이 확인되고,
+    EMA20 이탈/연속 저점하락/RSI 약화 중 하나 이상이 겹칠 때만 종료한다.
+    """
+    if base_price <= 0 or live_price <= 0:
+        return False, {"reason": "bad_price"}
+    try:
+        opened = datetime.fromisoformat(opened_at)
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False, {"reason": "opened_at parse failed"}
+
+    age_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+    if age_min < 15.0:
+        return False, {"reason": "too_early", "age_min": round(age_min, 2)}
+    if age_min > 90.0:
+        return False, {"reason": "window_passed", "age_min": round(age_min, 2)}
+
+    drawdown_pct = (live_price / base_price - 1.0) * 100.0
+    if drawdown_pct > -2.50:
+        return False, {
+            "reason": "drawdown_not_deep",
+            "age_min": round(age_min, 2),
+            "drawdown_pct": round(drawdown_pct, 3),
+        }
+
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 80)))
+    if len(m5) < 6:
+        return False, {"reason": "5m candles insufficient", "age_min": round(age_min, 2)}
+
+    a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
+    two_below_ema9 = bool(float(b.close) < float(b.ema9) and float(c.close) < float(c.ema9))
+    close_below_ema20 = bool(float(c.close) < float(c.ema20) * 0.998)
+    ema9_falling = bool(float(c.ema9) < float(b.ema9) < float(a.ema9))
+    lower_lows = bool(float(c.low) < float(b.low) <= float(a.low))
+    bearish = bool(float(c.close) < float(c.open))
+    rsi_weakening = bool(float(c.rsi) < float(b.rsi) and float(c.rsi) <= 50.0)
+    structure_score = int(close_below_ema20) + int(lower_lows) + int(rsi_weakening)
+    ok = bool(two_below_ema9 and ema9_falling and bearish and structure_score >= 1)
+
+    return ok, {
+        "reason": "HJ_CATASTROPHIC_FAILURE" if ok else "hj_catastrophic_hold",
         "age_min": round(age_min, 2),
         "drawdown_pct": round(drawdown_pct, 3),
         "two_below_ema9": two_below_ema9,
@@ -2366,6 +2450,30 @@ class DailyBot:
                         strategy=strategy, trade_id=row["trade_id"] or ""
                     )
                     self._close(row, price, 1.0, "STOP", price, price)
+                    continue
+
+            # v4.3.37 HJ형 대손실 꼬리 백업 가드.
+            # 단순 고정손절이 아니라 -2.5% 이상 + 확정 5분 구조붕괴가 동시에 확인될 때만 종료한다.
+            if strategy == "HJ" and int(row["tp1_done"] or 0) == 0:
+                try:
+                    hj_cat_fail, hj_cat_details = hj_catastrophic_failure_signal(
+                        self.client, row["symbol"], row["opened_at"], base_price, price
+                    )
+                except Exception as exc:
+                    hj_cat_fail, hj_cat_details = False, {"error": str(exc)}
+                    log_event(
+                        row["symbol"], "HJ_CATASTROPHIC_CHECK_ERROR",
+                        mode=self.cfg.mode, details=str(exc),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                if hj_cat_fail:
+                    log_event(
+                        row["symbol"], "HJ_CATASTROPHIC_FAILURE_TRIGGER",
+                        price=price, mode=self.cfg.mode,
+                        details=json.dumps(hj_cat_details, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                    self._close(row, price, 1.0, "HJ_STRUCTURE_STOP", price, price)
                     continue
 
             # 진입 후 10~45분 실패판정:
