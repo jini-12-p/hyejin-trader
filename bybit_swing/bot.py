@@ -22,7 +22,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.33-GWEIWickGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.34-ContinuationTailGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -892,6 +892,41 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not higher_lows
         and not higher_highs
     )
+
+    # v4.3.34 HJ continuation 대손실 꼬리 방어.
+    # 8/14~8/16 실제 continuation 진입을 대입해, 저거래량(<0.70)에서만
+    # 반복된 약한 구조/과확장/취약 fresh-breakout 패턴을 제한한다.
+    # 강한 거래량 continuation과 기존 수익 continuation은 그대로 보존한다.
+    hj_continuation_weak_structure = bool(
+        continuation_three_bulls
+        and live_volume_ratio < 0.70
+        and not hj_fresh_breakout
+        and not rebound
+        and not higher_lows
+        and not higher_highs
+    )
+    hj_continuation_weak_h1_near_high = bool(
+        continuation_three_bulls
+        and live_volume_ratio < 0.70
+        and not hj_fresh_breakout
+        and not h1_up
+        and live_distance_to_high <= 2.00
+    )
+    hj_continuation_oversized_low_volume = bool(
+        continuation_three_bulls
+        and live_volume_ratio < 0.70
+        and not hj_fresh_breakout
+        and h1_up
+        and live_candle_range_pct >= 4.00
+        and live_distance_to_high <= 4.00
+    )
+    hj_continuation_weak_fresh_breakout = bool(
+        continuation_three_bulls
+        and live_volume_ratio < 0.70
+        and hj_fresh_breakout
+        and not higher_lows
+        and not higher_highs
+    )
     hj_trend_filter_ok = bool(
         hj_price_above_ema20
         and hj_ema20_above_ema60
@@ -915,6 +950,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not hj_wick_reversal_oversized_candle
         and not hj_wick_reversal_weak_structure
         and not hj_wick_reversal_faded_reentry
+        and not hj_continuation_weak_structure
+        and not hj_continuation_weak_h1_near_high
+        and not hj_continuation_oversized_low_volume
+        and not hj_continuation_weak_fresh_breakout
         and live_gain <= 8.0
     )
     hj_score = (
@@ -988,6 +1027,14 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("hj_wick_reversal_weak_structure")
             if hj_wick_reversal_faded_reentry:
                 rejected.append("hj_wick_reversal_faded_reentry")
+            if hj_continuation_weak_structure:
+                rejected.append("hj_continuation_weak_structure")
+            if hj_continuation_weak_h1_near_high:
+                rejected.append("hj_continuation_weak_h1_near_high")
+            if hj_continuation_oversized_low_volume:
+                rejected.append("hj_continuation_oversized_low_volume")
+            if hj_continuation_weak_fresh_breakout:
+                rejected.append("hj_continuation_weak_fresh_breakout")
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
@@ -1052,6 +1099,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_wick_reversal_oversized_candle": hj_wick_reversal_oversized_candle,
         "hj_wick_reversal_weak_structure": hj_wick_reversal_weak_structure,
         "hj_wick_reversal_faded_reentry": hj_wick_reversal_faded_reentry,
+        "hj_continuation_weak_structure": hj_continuation_weak_structure,
+        "hj_continuation_weak_h1_near_high": hj_continuation_weak_h1_near_high,
+        "hj_continuation_oversized_low_volume": hj_continuation_oversized_low_volume,
+        "hj_continuation_weak_fresh_breakout": hj_continuation_weak_fresh_breakout,
         "hj_fresh_breakout": hj_fresh_breakout,
         "hj_live_distance_to_high_pct": round(live_distance_to_high, 2),
         "hj_live_rebound_from_low_pct": round(live_rebound_from_low, 2),
