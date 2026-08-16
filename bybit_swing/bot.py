@@ -22,7 +22,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.34-ContinuationTailGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.35-PTailRiskGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -158,6 +158,15 @@ class DailyConfig:
     p_faded_spike_min_pullback_pct: float = 2.00
     p_faded_spike_min_rebound_pct: float = 5.00
     p_faded_spike_min_gain_pct: float = 0.60
+    # v4.3.35 P형 과확장 진입 방어: 8/14~8/16 P형 실제 진입 비교에서
+    # AIO(-13.99)만 해당했던 "3연속 상승 + 저점대비 과확장 + 최근고점 코앞" 조합을 차단한다.
+    p_overextended_continuation_min_rebound_pct: float = 10.00
+    p_overextended_continuation_max_high_distance_pct: float = 0.50
+    # P형 대손실 백업 가드. 고정손절 단독이 아니라 5분 구조붕괴와 함께 쓴다.
+    p_catastrophic_guard_enabled: bool = True
+    p_catastrophic_guard_min_age_minutes: float = 15.0
+    p_catastrophic_guard_max_age_minutes: float = 45.0
+    p_catastrophic_guard_drawdown_pct: float = 2.50
 
     # Early Failure(10~15분) 이후 구조손절까지 비는 구간을 메우는 5분봉 빠른 실패판정.
     # 고정 USDT 손절이 아니라, 실제 5분 구조 붕괴가 동반될 때만 동작한다.
@@ -927,6 +936,18 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not higher_lows
         and not higher_highs
     )
+    # v4.3.35 P형 과확장 continuation 방어.
+    # P는 확정 15분봉 기반 반등 전략이지만, 진입 시점의 진행봉까지 3연속 상승으로 이어지고
+    # 최근 4시간 저점에서 이미 10% 이상 올라온 상태에서 최근 고점 0.5% 이내라면
+    # AIO처럼 상승 말단을 잡을 위험이 커서 P 진입만 차단한다.
+    p_overextended_continuation = bool(
+        continuation_three_bulls
+        and rebound_from_low >= cfg.p_overextended_continuation_min_rebound_pct
+        and distance_to_high <= cfg.p_overextended_continuation_max_high_distance_pct
+    )
+    if p_overextended_continuation:
+        p_ok = False
+
     hj_trend_filter_ok = bool(
         hj_price_above_ema20
         and hj_ema20_above_ema60
@@ -992,6 +1013,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("p_near_high_weak_reentry")
             if p_faded_spike_reentry:
                 rejected.append("p_faded_spike_reentry")
+            if p_overextended_continuation:
+                rejected.append("p_overextended_continuation")
             if p_score < 65:
                 rejected.append("p_score")
         if not hj_ok:
@@ -1074,6 +1097,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_ema_quality_ok": p_ema_quality_ok,
         "p_near_high_weak_reentry": p_near_high_weak_reentry,
         "p_faded_spike_reentry": p_faded_spike_reentry,
+        "p_overextended_continuation": p_overextended_continuation,
         "p_entry_quality_ok": p_entry_quality_ok,
         "hj_wick_reversal": wick_reversal,
         "hj_continuation_three_bulls": continuation_three_bulls,
@@ -1338,6 +1362,80 @@ def early_failure_signal(
         "last_rsi": round(float(c.rsi), 2),
         "prior_low": prior_low,
     }
+
+def p_catastrophic_failure_signal(
+    client: BybitSwingClient,
+    symbol: str,
+    opened_at: str,
+    base_price: float,
+    live_price: float,
+    cfg: DailyConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """P형 전용 대손실 백업 가드.
+
+    고정 -N USDT / 단순 -N% 손절로 정상 눌림을 자르지 않는다.
+    15~45분 구간에서 가격이 최초 진입가 대비 의미 있게 밀린 상태이고,
+    확정 5분봉에서 EMA9/EMA20 회복 실패 + EMA9 하락 + 약세봉/저점붕괴가
+    동시에 확인될 때만 종료한다.
+    """
+    if not cfg.p_catastrophic_guard_enabled or base_price <= 0 or live_price <= 0:
+        return False, {"reason": "disabled_or_bad_price"}
+    try:
+        opened = datetime.fromisoformat(opened_at)
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False, {"reason": "opened_at parse failed"}
+
+    age_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+    if age_min < cfg.p_catastrophic_guard_min_age_minutes:
+        return False, {"reason": "too_early", "age_min": round(age_min, 2)}
+    if age_min > cfg.p_catastrophic_guard_max_age_minutes:
+        return False, {"reason": "window_passed", "age_min": round(age_min, 2)}
+
+    drawdown_pct = (live_price / base_price - 1.0) * 100.0
+    if drawdown_pct > -abs(cfg.p_catastrophic_guard_drawdown_pct):
+        return False, {
+            "reason": "drawdown_not_deep",
+            "age_min": round(age_min, 2),
+            "drawdown_pct": round(drawdown_pct, 3),
+        }
+
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 80)))
+    if len(m5) < 6:
+        return False, {"reason": "5m candles insufficient", "age_min": round(age_min, 2)}
+
+    a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
+    two_below_ema9 = bool(float(b.close) < float(b.ema9) and float(c.close) < float(c.ema9))
+    close_below_ema20 = bool(float(c.close) < float(c.ema20) * 0.998)
+    ema9_falling = bool(float(c.ema9) < float(b.ema9) < float(a.ema9))
+    lower_lows = bool(float(c.low) < float(b.low) <= float(a.low))
+    bearish = bool(float(c.close) < float(c.open))
+    rsi_weakening = bool(float(c.rsi) < float(b.rsi) and float(c.rsi) <= 50.0)
+
+    # 가격 손실이 이미 2.5% 이상인 상태에서만 검사하므로,
+    # (EMA9 2봉 이탈 + EMA9 하락)은 필수. 여기에 EMA20 이탈/저점하락/RSI 약화 중
+    # 하나 이상과 현재 음봉을 요구해 단순 눌림과 구분한다.
+    structure_score = int(close_below_ema20) + int(lower_lows) + int(rsi_weakening)
+    ok = bool(two_below_ema9 and ema9_falling and bearish and structure_score >= 1)
+
+    return ok, {
+        "reason": "P_CATASTROPHIC_FAILURE" if ok else "p_catastrophic_hold",
+        "age_min": round(age_min, 2),
+        "drawdown_pct": round(drawdown_pct, 3),
+        "two_below_ema9": two_below_ema9,
+        "close_below_ema20": close_below_ema20,
+        "ema9_falling": ema9_falling,
+        "lower_lows": lower_lows,
+        "bearish": bearish,
+        "rsi_weakening": rsi_weakening,
+        "structure_score": structure_score,
+        "last_close": float(c.close),
+        "last_ema9": float(c.ema9),
+        "last_ema20": float(c.ema20),
+        "last_rsi": round(float(c.rsi), 2),
+    }
+
 
 def late_trend_failure_signal(
     client: BybitSwingClient,
@@ -2185,6 +2283,30 @@ class DailyBot:
                 continue
 
             # TP가 터치되지 않았을 때만 BE/구조손절/시간종료를 확인한다.
+
+            # v4.3.35 P형 전용 대손실 백업 가드.
+            # TP1 전 P 포지션만 대상으로 하며, 단순 손실률이 아니라 5분 구조붕괴가 함께 확인돼야 한다.
+            if strategy == "P" and int(row["tp1_done"] or 0) == 0:
+                try:
+                    p_cat_fail, p_cat_details = p_catastrophic_failure_signal(
+                        self.client, row["symbol"], row["opened_at"], base_price, price, self.cfg
+                    )
+                except Exception as exc:
+                    p_cat_fail, p_cat_details = False, {"error": str(exc)}
+                    log_event(
+                        row["symbol"], "P_CATASTROPHIC_CHECK_ERROR",
+                        mode=self.cfg.mode, details=str(exc),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                if p_cat_fail:
+                    log_event(
+                        row["symbol"], "P_CATASTROPHIC_FAILURE_TRIGGER",
+                        price=price, mode=self.cfg.mode,
+                        details=json.dumps(p_cat_details, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                    self._close(row, price, 1.0, "STOP", price, price)
+                    continue
 
             # 진입 후 10~45분 실패판정:
             # 10~15분은 기존 엄격조건, 15~45분은 5분 구조붕괴가 명확할 때만 빠르게 종료한다.
