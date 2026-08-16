@@ -6,6 +6,7 @@ import math
 import sqlite3
 import time
 import threading
+import queue
 import os
 import urllib.parse
 import urllib.request
@@ -22,12 +23,70 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.35-PTailRiskGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.36-ApiHangGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
 _HJ_BREAKOUT_CONFIRM: dict[str, dict[str, float]] = {}
 
+
+
+class _BoundedReadClient:
+    """Bybit read API calls get a hard wall-clock timeout.
+
+    A network/library call can occasionally stall longer than the HTTP timeout.
+    The trading loop must never wait forever for ticker/candle/universe reads.
+    Only read methods are wrapped; order/write methods are forwarded unchanged.
+    """
+
+    READ_METHODS = {"ticker", "tickers", "candles"}
+
+    def __init__(self, client: Any, timeout_seconds: float = 8.0):
+        self._client = client
+        self._timeout_seconds = float(timeout_seconds)
+        self._guard_lock = threading.Lock()
+        self._inflight: dict[str, threading.Thread] = {}
+
+    def _bounded(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        key = name + "|" + repr(args) + "|" + repr(sorted(kwargs.items()))
+        with self._guard_lock:
+            prior = self._inflight.get(key)
+            if prior is not None and prior.is_alive():
+                raise BybitSwingError(f"{name} previous call still running; skipped to protect main loop")
+
+        q: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                q.put((True, getattr(self._client, name)(*args, **kwargs)))
+            except BaseException as exc:
+                q.put((False, exc))
+
+        t = threading.Thread(target=worker, name=f"bybit-read-{name}", daemon=True)
+        with self._guard_lock:
+            self._inflight[key] = t
+        t.start()
+        t.join(self._timeout_seconds)
+        if t.is_alive():
+            raise BybitSwingError(f"{name} timed out after {self._timeout_seconds:.1f}s; main loop protected")
+
+        with self._guard_lock:
+            if self._inflight.get(key) is t:
+                self._inflight.pop(key, None)
+
+        try:
+            ok, payload = q.get_nowait()
+        except queue.Empty as exc:
+            raise BybitSwingError(f"{name} finished without a result") from exc
+        if ok:
+            return payload
+        raise payload
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._client, name)
+        if name in self.READ_METHODS and callable(attr):
+            return lambda *args, **kwargs: self._bounded(name, *args, **kwargs)
+        return attr
 
 
 @dataclass
@@ -1663,7 +1722,8 @@ def same_risk_group(symbol: str, open_symbols: set[str]) -> bool:
 class DailyBot:
     def __init__(self, config: DailyConfig | None = None):
         self.cfg = config or DailyConfig.load()
-        self.client = BybitSwingClient(demo=self.cfg.mode != "live")
+        self.raw_client = BybitSwingClient(demo=self.cfg.mode != "live")
+        self.client = _BoundedReadClient(self.raw_client, timeout_seconds=8.0)
         init_db()
         ensure_scan_rejected_csv()
         state_set("runtime_version", BOT_RUNTIME_VERSION)
@@ -2578,8 +2638,10 @@ class DailyBot:
         while True:
             loop_started = time.monotonic()
             try:
+                state_set("main_loop_heartbeat", datetime.now(timezone.utc).isoformat())
                 # 보유 포지션 관리는 항상 메인 루프 최우선.
                 self.manage()
+                state_set("manage_last_ok_at", datetime.now(timezone.utc).isoformat())
 
                 if state_flag("shutdown_when_flat", False) and not self.open_rows():
                     state_set("bot_process_status", "STOPPED")
