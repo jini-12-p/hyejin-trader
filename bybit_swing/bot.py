@@ -23,7 +23,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.37-TailLossGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.38-WickOnlyTrial"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -263,6 +263,8 @@ class DailyConfig:
     reject_three_bar_volume_decline: bool = True
     rebound_min_rsi: float = 44.0
     hj_pattern_enabled: bool = True
+    # v4.3.38 trial: HJ continuation은 일시 중지하고 HJ wick + P만 검증한다.
+    hj_continuation_enabled: bool = False
     hj_min_volume_ratio: float = 0.75
     hj_min_current_gain_pct: float = 0.45
     hj_min_body_recovery_pct: float = 0.55
@@ -881,7 +883,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     )
     hj_volume_ok = bool(hj_wick_volume_ok or hj_continuation_volume_ok)
     hj_momentum_ok = bool(48 <= live_rsi <= cfg.hj_max_rsi)
-    hj_pattern_ok = bool(wick_reversal or continuation_three_bulls)
+    hj_pattern_ok = bool(wick_reversal or (cfg.hj_continuation_enabled and continuation_three_bulls))
+    hj_continuation_disabled = bool(continuation_three_bulls and not wick_reversal and not cfg.hj_continuation_enabled)
 
     # COOKIE + CYS형 방어:
     # 급등 뒤 최근 고점 부근에서 재진입하는데 거래량 확인이 약한 경우 차단한다.
@@ -1090,7 +1093,9 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
             if p_score < 65:
                 rejected.append("p_score")
         if not hj_ok:
-            if not hj_pattern_ok:
+            if hj_continuation_disabled:
+                rejected.append("hj_continuation_disabled")
+            elif not hj_pattern_ok:
                 rejected.append("hj_pattern")
             if hj_trend_score < cfg.hj_min_trend_score:
                 rejected.append("hj_trend")
@@ -1175,6 +1180,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_entry_quality_ok": p_entry_quality_ok,
         "hj_wick_reversal": wick_reversal,
         "hj_continuation_three_bulls": continuation_three_bulls,
+        "hj_continuation_enabled": bool(cfg.hj_continuation_enabled),
+        "hj_continuation_disabled": hj_continuation_disabled,
         "hj_trend_score": hj_trend_score,
         "hj_trend_filter_ok": hj_trend_filter_ok,
         "hj_price_above_ema20": hj_price_above_ema20,
