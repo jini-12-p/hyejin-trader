@@ -23,7 +23,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.39-AdaptiveLossGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.40-AGradeContinuation"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -268,8 +268,10 @@ class DailyConfig:
     reject_three_bar_volume_decline: bool = True
     rebound_min_rsi: float = 44.0
     hj_pattern_enabled: bool = True
-    # v4.3.38 trial: HJ continuation은 일시 중지하고 HJ wick + P만 검증한다.
+    # v4.3.40: HJ continuation 전체는 계속 차단하되, A급 continuation만 제한적으로 허용한다.
+    # A급 기준은 진행 중 15분봉까지 3연속 양봉 + 거래량비 >= 1.0 + higher-low 유지.
     hj_continuation_enabled: bool = False
+    hj_a_continuation_min_volume_ratio: float = 1.00
     hj_min_volume_ratio: float = 0.75
     hj_min_current_gain_pct: float = 0.45
     hj_min_body_recovery_pct: float = 0.55
@@ -883,13 +885,33 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     ]
     hj_trend_score = sum(1 for x in hj_trend_checks if x)
     hj_wick_volume_ok = bool(wick_reversal and live_volume_ratio >= 0.35)
+
+    # v4.3.40 A급 continuation:
+    # continuation 전체를 다시 켜지 않고, 최근 비교에서 상대적으로 성적이 좋았던
+    # 강한 거래량 + higher-low 유지형만 제한적으로 허용한다.
+    hj_a_continuation = bool(
+        continuation_three_bulls
+        and live_volume_ratio >= cfg.hj_a_continuation_min_volume_ratio
+        and higher_lows
+    )
     hj_continuation_volume_ok = bool(
-        continuation_three_bulls and live_volume_ratio >= 0.60
+        continuation_three_bulls
+        and (cfg.hj_continuation_enabled or hj_a_continuation)
+        and live_volume_ratio >= 0.60
     )
     hj_volume_ok = bool(hj_wick_volume_ok or hj_continuation_volume_ok)
     hj_momentum_ok = bool(48 <= live_rsi <= cfg.hj_max_rsi)
-    hj_pattern_ok = bool(wick_reversal or (cfg.hj_continuation_enabled and continuation_three_bulls))
-    hj_continuation_disabled = bool(continuation_three_bulls and not wick_reversal and not cfg.hj_continuation_enabled)
+    hj_pattern_ok = bool(
+        wick_reversal
+        or (cfg.hj_continuation_enabled and continuation_three_bulls)
+        or hj_a_continuation
+    )
+    hj_continuation_disabled = bool(
+        continuation_three_bulls
+        and not wick_reversal
+        and not cfg.hj_continuation_enabled
+        and not hj_a_continuation
+    )
 
     # COOKIE + CYS형 방어:
     # 급등 뒤 최근 고점 부근에서 재진입하는데 거래량 확인이 약한 경우 차단한다.
@@ -1186,6 +1208,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_wick_reversal": wick_reversal,
         "hj_continuation_three_bulls": continuation_three_bulls,
         "hj_continuation_enabled": bool(cfg.hj_continuation_enabled),
+        "hj_a_continuation": hj_a_continuation,
+        "hj_a_continuation_min_volume_ratio": float(cfg.hj_a_continuation_min_volume_ratio),
         "hj_continuation_disabled": hj_continuation_disabled,
         "hj_trend_score": hj_trend_score,
         "hj_trend_filter_ok": hj_trend_filter_ok,
