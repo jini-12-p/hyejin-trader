@@ -23,7 +23,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.38-WickOnlyTrial"
+BOT_RUNTIME_VERSION = "RC-v4.3.39-AdaptiveLossGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -226,6 +226,11 @@ class DailyConfig:
     p_catastrophic_guard_min_age_minutes: float = 15.0
     p_catastrophic_guard_max_age_minutes: float = 45.0
     p_catastrophic_guard_drawdown_pct: float = 2.50
+    # v4.3.39: 손실이 깊어질수록 필요한 구조 확인을 단계적으로 완화한다.
+    # 정상 눌림을 고정손절로 자르지 않으면서 -6~-8 USDT 꼬리손실을 줄이기 위한 공통 기준.
+    adaptive_loss_tier1_pct: float = 1.50
+    adaptive_loss_tier2_pct: float = 2.00
+    adaptive_loss_tier3_pct: float = 2.50
 
     # Early Failure(10~15분) 이후 구조손절까지 비는 구간을 메우는 5분봉 빠른 실패판정.
     # 고정 USDT 손절이 아니라, 실제 5분 구조 붕괴가 동반될 때만 동작한다.
@@ -1445,6 +1450,68 @@ def early_failure_signal(
         "prior_low": prior_low,
     }
 
+def _adaptive_loss_structure(
+    m5: pd.DataFrame,
+    drawdown_pct: float,
+    tier1_pct: float = 1.50,
+    tier2_pct: float = 2.00,
+    tier3_pct: float = 2.50,
+) -> tuple[bool, dict[str, Any]]:
+    """확정 5분봉 기반 단계형 손실 가드.
+
+    손실이 얕을 때는 강한 구조붕괴를 요구하고, 손실이 깊어질수록 필요한
+    확인 개수를 줄인다. 단순 고정 -N% 손절은 사용하지 않는다.
+    """
+    if len(m5) < 6:
+        return False, {"reason": "5m candles insufficient"}
+
+    a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
+    two_below_ema9 = bool(float(b.close) < float(b.ema9) and float(c.close) < float(c.ema9))
+    close_below_ema20 = bool(float(c.close) < float(c.ema20) * 0.998)
+    ema9_falling = bool(float(c.ema9) < float(b.ema9) < float(a.ema9))
+    lower_lows = bool(float(c.low) < float(b.low) <= float(a.low))
+    bearish = bool(float(c.close) < float(c.open))
+    rsi_weakening = bool(float(c.rsi) < float(b.rsi) and float(c.rsi) <= 50.0)
+    structure_score = int(close_below_ema20) + int(lower_lows) + int(rsi_weakening)
+
+    dd = abs(min(0.0, float(drawdown_pct)))
+    tier = "NONE"
+    ok = False
+
+    if dd >= tier3_pct:
+        # 이미 깊게 밀렸다면 5분 구조가 두 축에서 무너진 것만 확인해 빠르게 종료.
+        tier = "TIER3_DEEP"
+        ok = bool(
+            (two_below_ema9 and ema9_falling)
+            or (close_below_ema20 and lower_lows)
+            or (ema9_falling and lower_lows and rsi_weakening)
+        )
+    elif dd >= tier2_pct:
+        # 중간 손실: EMA9 이탈/하락은 유지하되 현재봉 음봉까지 모두 기다리지는 않는다.
+        tier = "TIER2_MEDIUM"
+        ok = bool(two_below_ema9 and ema9_falling and structure_score >= 1)
+    elif dd >= tier1_pct:
+        # 얕은 손실: 정상 눌림 오판 방지를 위해 강한 구조붕괴만 종료.
+        tier = "TIER1_SHALLOW"
+        ok = bool(two_below_ema9 and ema9_falling and bearish and structure_score >= 2)
+
+    return ok, {
+        "tier": tier,
+        "drawdown_pct": round(float(drawdown_pct), 3),
+        "two_below_ema9": two_below_ema9,
+        "close_below_ema20": close_below_ema20,
+        "ema9_falling": ema9_falling,
+        "lower_lows": lower_lows,
+        "bearish": bearish,
+        "rsi_weakening": rsi_weakening,
+        "structure_score": structure_score,
+        "last_close": float(c.close),
+        "last_ema9": float(c.ema9),
+        "last_ema20": float(c.ema20),
+        "last_rsi": round(float(c.rsi), 2),
+    }
+
+
 def p_catastrophic_failure_signal(
     client: BybitSwingClient,
     symbol: str,
@@ -1453,12 +1520,10 @@ def p_catastrophic_failure_signal(
     live_price: float,
     cfg: DailyConfig,
 ) -> tuple[bool, dict[str, Any]]:
-    """P형 전용 대손실 백업 가드.
+    """P형 단계형 대손실 가드 (15~45분, TP1 이전).
 
-    고정 -N USDT / 단순 -N% 손절로 정상 눌림을 자르지 않는다.
-    15~45분 구간에서 가격이 최초 진입가 대비 의미 있게 밀린 상태이고,
-    확정 5분봉에서 EMA9/EMA20 회복 실패 + EMA9 하락 + 약세봉/저점붕괴가
-    동시에 확인될 때만 종료한다.
+    v4.3.39: -2.5%까지 무조건 기다리던 구조를 없애고, -1.5/-2.0/-2.5%
+    단계별로 구조 확인 강도를 조절한다. 고정손절 단독으로는 종료하지 않는다.
     """
     if not cfg.p_catastrophic_guard_enabled or base_price <= 0 or live_price <= 0:
         return False, {"reason": "disabled_or_bad_price"}
@@ -1476,7 +1541,7 @@ def p_catastrophic_failure_signal(
         return False, {"reason": "window_passed", "age_min": round(age_min, 2)}
 
     drawdown_pct = (live_price / base_price - 1.0) * 100.0
-    if drawdown_pct > -abs(cfg.p_catastrophic_guard_drawdown_pct):
+    if drawdown_pct > -abs(cfg.adaptive_loss_tier1_pct):
         return False, {
             "reason": "drawdown_not_deep",
             "age_min": round(age_min, 2),
@@ -1484,39 +1549,18 @@ def p_catastrophic_failure_signal(
         }
 
     m5 = confirmed(indicators(client.candles(symbol, "5m", 80)))
-    if len(m5) < 6:
-        return False, {"reason": "5m candles insufficient", "age_min": round(age_min, 2)}
-
-    a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
-    two_below_ema9 = bool(float(b.close) < float(b.ema9) and float(c.close) < float(c.ema9))
-    close_below_ema20 = bool(float(c.close) < float(c.ema20) * 0.998)
-    ema9_falling = bool(float(c.ema9) < float(b.ema9) < float(a.ema9))
-    lower_lows = bool(float(c.low) < float(b.low) <= float(a.low))
-    bearish = bool(float(c.close) < float(c.open))
-    rsi_weakening = bool(float(c.rsi) < float(b.rsi) and float(c.rsi) <= 50.0)
-
-    # 가격 손실이 이미 2.5% 이상인 상태에서만 검사하므로,
-    # (EMA9 2봉 이탈 + EMA9 하락)은 필수. 여기에 EMA20 이탈/저점하락/RSI 약화 중
-    # 하나 이상과 현재 음봉을 요구해 단순 눌림과 구분한다.
-    structure_score = int(close_below_ema20) + int(lower_lows) + int(rsi_weakening)
-    ok = bool(two_below_ema9 and ema9_falling and bearish and structure_score >= 1)
-
-    return ok, {
+    ok, details = _adaptive_loss_structure(
+        m5,
+        drawdown_pct,
+        cfg.adaptive_loss_tier1_pct,
+        cfg.adaptive_loss_tier2_pct,
+        cfg.adaptive_loss_tier3_pct,
+    )
+    details.update({
         "reason": "P_CATASTROPHIC_FAILURE" if ok else "p_catastrophic_hold",
         "age_min": round(age_min, 2),
-        "drawdown_pct": round(drawdown_pct, 3),
-        "two_below_ema9": two_below_ema9,
-        "close_below_ema20": close_below_ema20,
-        "ema9_falling": ema9_falling,
-        "lower_lows": lower_lows,
-        "bearish": bearish,
-        "rsi_weakening": rsi_weakening,
-        "structure_score": structure_score,
-        "last_close": float(c.close),
-        "last_ema9": float(c.ema9),
-        "last_ema20": float(c.ema20),
-        "last_rsi": round(float(c.rsi), 2),
-    }
+    })
+    return ok, details
 
 
 def hj_catastrophic_failure_signal(
@@ -1525,12 +1569,12 @@ def hj_catastrophic_failure_signal(
     opened_at: str,
     base_price: float,
     live_price: float,
+    cfg: DailyConfig,
 ) -> tuple[bool, dict[str, Any]]:
-    """HJ형 대손실 꼬리 백업 가드.
+    """HJ형 단계형 대손실 가드 (15~90분, TP1 이전).
 
-    단순 -N% 고정손절이 아니라, 진입 15~90분 사이 최초 진입가 대비 -2.5% 이상 밀린 뒤
-    확정 5분봉에서 EMA9 2봉 이탈 + EMA9 하락 + 음봉이 확인되고,
-    EMA20 이탈/연속 저점하락/RSI 약화 중 하나 이상이 겹칠 때만 종료한다.
+    v4.3.39: P형과 동일한 단계형 구조를 사용해 깊은 손실일수록 더 적은
+    구조 확인으로 종료한다. HJ continuation OFF 등 진입 로직은 변경하지 않는다.
     """
     if base_price <= 0 or live_price <= 0:
         return False, {"reason": "bad_price"}
@@ -1548,7 +1592,7 @@ def hj_catastrophic_failure_signal(
         return False, {"reason": "window_passed", "age_min": round(age_min, 2)}
 
     drawdown_pct = (live_price / base_price - 1.0) * 100.0
-    if drawdown_pct > -2.50:
+    if drawdown_pct > -abs(cfg.adaptive_loss_tier1_pct):
         return False, {
             "reason": "drawdown_not_deep",
             "age_min": round(age_min, 2),
@@ -1556,35 +1600,18 @@ def hj_catastrophic_failure_signal(
         }
 
     m5 = confirmed(indicators(client.candles(symbol, "5m", 80)))
-    if len(m5) < 6:
-        return False, {"reason": "5m candles insufficient", "age_min": round(age_min, 2)}
-
-    a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
-    two_below_ema9 = bool(float(b.close) < float(b.ema9) and float(c.close) < float(c.ema9))
-    close_below_ema20 = bool(float(c.close) < float(c.ema20) * 0.998)
-    ema9_falling = bool(float(c.ema9) < float(b.ema9) < float(a.ema9))
-    lower_lows = bool(float(c.low) < float(b.low) <= float(a.low))
-    bearish = bool(float(c.close) < float(c.open))
-    rsi_weakening = bool(float(c.rsi) < float(b.rsi) and float(c.rsi) <= 50.0)
-    structure_score = int(close_below_ema20) + int(lower_lows) + int(rsi_weakening)
-    ok = bool(two_below_ema9 and ema9_falling and bearish and structure_score >= 1)
-
-    return ok, {
+    ok, details = _adaptive_loss_structure(
+        m5,
+        drawdown_pct,
+        cfg.adaptive_loss_tier1_pct,
+        cfg.adaptive_loss_tier2_pct,
+        cfg.adaptive_loss_tier3_pct,
+    )
+    details.update({
         "reason": "HJ_CATASTROPHIC_FAILURE" if ok else "hj_catastrophic_hold",
         "age_min": round(age_min, 2),
-        "drawdown_pct": round(drawdown_pct, 3),
-        "two_below_ema9": two_below_ema9,
-        "close_below_ema20": close_below_ema20,
-        "ema9_falling": ema9_falling,
-        "lower_lows": lower_lows,
-        "bearish": bearish,
-        "rsi_weakening": rsi_weakening,
-        "structure_score": structure_score,
-        "last_close": float(c.close),
-        "last_ema9": float(c.ema9),
-        "last_ema20": float(c.ema20),
-        "last_rsi": round(float(c.rsi), 2),
-    }
+    })
+    return ok, details
 
 
 def late_trend_failure_signal(
@@ -2435,8 +2462,8 @@ class DailyBot:
 
             # TP가 터치되지 않았을 때만 BE/구조손절/시간종료를 확인한다.
 
-            # v4.3.35 P형 전용 대손실 백업 가드.
-            # TP1 전 P 포지션만 대상으로 하며, 단순 손실률이 아니라 5분 구조붕괴가 함께 확인돼야 한다.
+            # v4.3.39 P형 단계형 대손실 가드.
+            # TP1 전 P 포지션만 대상으로 하며, 손실이 깊어질수록 5분 구조 확인 강도를 완화한다.
             if strategy == "P" and int(row["tp1_done"] or 0) == 0:
                 try:
                     p_cat_fail, p_cat_details = p_catastrophic_failure_signal(
@@ -2459,12 +2486,12 @@ class DailyBot:
                     self._close(row, price, 1.0, "STOP", price, price)
                     continue
 
-            # v4.3.37 HJ형 대손실 꼬리 백업 가드.
-            # 단순 고정손절이 아니라 -2.5% 이상 + 확정 5분 구조붕괴가 동시에 확인될 때만 종료한다.
+            # v4.3.39 HJ형 단계형 대손실 가드.
+            # 단순 고정손절이 아니라 -1.5/-2.0/-2.5% 구간별로 확정 5분 구조 확인 강도를 조절한다.
             if strategy == "HJ" and int(row["tp1_done"] or 0) == 0:
                 try:
                     hj_cat_fail, hj_cat_details = hj_catastrophic_failure_signal(
-                        self.client, row["symbol"], row["opened_at"], base_price, price
+                        self.client, row["symbol"], row["opened_at"], base_price, price, self.cfg
                     )
                 except Exception as exc:
                     hj_cat_fail, hj_cat_details = False, {"error": str(exc)}
