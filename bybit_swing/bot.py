@@ -23,7 +23,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.40-AGradeContinuation"
+BOT_RUNTIME_VERSION = "RC-v4.3.41-EarlyCrash-AGradeTrend"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -232,6 +232,13 @@ class DailyConfig:
     adaptive_loss_tier2_pct: float = 2.00
     adaptive_loss_tier3_pct: float = 2.50
 
+    # v4.3.41: 진입 직후 3~15분 급락 전용 가드.
+    # 고정손절 단독이 아니라 -2.5% 이상 급락 + 확정 5분 구조 약화가 함께 있을 때만 종료한다.
+    early_crash_guard_enabled: bool = True
+    early_crash_min_age_minutes: float = 3.0
+    early_crash_max_age_minutes: float = 15.0
+    early_crash_drawdown_pct: float = 2.50
+
     # Early Failure(10~15분) 이후 구조손절까지 비는 구간을 메우는 5분봉 빠른 실패판정.
     # 고정 USDT 손절이 아니라, 실제 5분 구조 붕괴가 동반될 때만 동작한다.
     fast_failure_window_minutes: int = 45
@@ -268,8 +275,8 @@ class DailyConfig:
     reject_three_bar_volume_decline: bool = True
     rebound_min_rsi: float = 44.0
     hj_pattern_enabled: bool = True
-    # v4.3.40: HJ continuation 전체는 계속 차단하되, A급 continuation만 제한적으로 허용한다.
-    # A급 기준은 진행 중 15분봉까지 3연속 양봉 + 거래량비 >= 1.0 + higher-low 유지.
+    # v4.3.41: HJ continuation 전체는 계속 차단하되, A급 continuation만 제한적으로 허용한다.
+    # A급 기준: 3연속 양봉 + 거래량비 >= 1.0 + higher-low + 1시간 상승 + EMA 정배열.
     hj_continuation_enabled: bool = False
     hj_a_continuation_min_volume_ratio: float = 1.00
     hj_min_volume_ratio: float = 0.75
@@ -886,13 +893,15 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     hj_trend_score = sum(1 for x in hj_trend_checks if x)
     hj_wick_volume_ok = bool(wick_reversal and live_volume_ratio >= 0.35)
 
-    # v4.3.40 A급 continuation:
-    # continuation 전체를 다시 켜지 않고, 최근 비교에서 상대적으로 성적이 좋았던
-    # 강한 거래량 + higher-low 유지형만 제한적으로 허용한다.
+    # v4.3.41 A급 continuation 강화:
+    # 전체 continuation은 계속 OFF. 거래량/higher-low에 더해
+    # 1시간 상승 흐름과 현재 EMA 정배열이 모두 확인되는 경우만 제한적으로 허용한다.
     hj_a_continuation = bool(
         continuation_three_bulls
         and live_volume_ratio >= cfg.hj_a_continuation_min_volume_ratio
         and higher_lows
+        and h1_up
+        and live_ema_ordered
     )
     hj_continuation_volume_ok = bool(
         continuation_three_bulls
@@ -1210,6 +1219,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_continuation_enabled": bool(cfg.hj_continuation_enabled),
         "hj_a_continuation": hj_a_continuation,
         "hj_a_continuation_min_volume_ratio": float(cfg.hj_a_continuation_min_volume_ratio),
+        "hj_a_continuation_require_h1_up": True,
+        "hj_a_continuation_require_ema_ordered": True,
         "hj_continuation_disabled": hj_continuation_disabled,
         "hj_trend_score": hj_trend_score,
         "hj_trend_filter_ok": hj_trend_filter_ok,
@@ -1534,6 +1545,80 @@ def _adaptive_loss_structure(
         "last_ema20": float(c.ema20),
         "last_rsi": round(float(c.rsi), 2),
     }
+
+
+def early_crash_failure_signal(
+    client: BybitSwingClient,
+    symbol: str,
+    opened_at: str,
+    base_price: float,
+    live_price: float,
+    cfg: DailyConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """v4.3.41: 진입 후 3~15분 급락만 잡는 구조형 조기 종료.
+
+    -2.5% 이상 급락이 먼저 발생해야 하며, 확정 5분봉에서 최소 2개의
+    약세 구조가 함께 확인될 때만 종료한다. 정상적인 얕은 눌림은 대상이 아니다.
+    """
+    if not cfg.early_crash_guard_enabled or base_price <= 0 or live_price <= 0:
+        return False, {"reason": "disabled_or_bad_price"}
+    try:
+        opened = datetime.fromisoformat(opened_at)
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False, {"reason": "opened_at parse failed"}
+
+    age_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+    if age_min < cfg.early_crash_min_age_minutes:
+        return False, {"reason": "too_early", "age_min": round(age_min, 2)}
+    if age_min > cfg.early_crash_max_age_minutes:
+        return False, {"reason": "window_passed", "age_min": round(age_min, 2)}
+
+    drawdown_pct = (live_price / base_price - 1.0) * 100.0
+    if drawdown_pct > -abs(cfg.early_crash_drawdown_pct):
+        return False, {
+            "reason": "drawdown_not_deep",
+            "age_min": round(age_min, 2),
+            "drawdown_pct": round(drawdown_pct, 3),
+        }
+
+    m5 = confirmed(indicators(client.candles(symbol, "5m", 80)))
+    if len(m5) < 4:
+        return False, {"reason": "5m candles insufficient"}
+
+    a, b, c = m5.iloc[-3], m5.iloc[-2], m5.iloc[-1]
+    below_ema9 = bool(float(c.close) < float(c.ema9))
+    below_ema20 = bool(float(c.close) < float(c.ema20))
+    ema9_falling = bool(float(c.ema9) < float(b.ema9))
+    bearish = bool(float(c.close) < float(c.open))
+    lower_low = bool(float(c.low) < float(b.low))
+    rsi_weakening = bool(float(c.rsi) < float(b.rsi))
+
+    structure_score = sum(int(x) for x in (
+        below_ema9, below_ema20, ema9_falling, bearish, lower_low, rsi_weakening
+    ))
+    trend_break = bool(below_ema9 or below_ema20)
+    pressure = bool(bearish or lower_low or ema9_falling)
+    ok = bool(structure_score >= 2 and trend_break and pressure)
+
+    return ok, {
+        "reason": "EARLY_CRASH_FAILURE" if ok else "early_crash_hold",
+        "age_min": round(age_min, 2),
+        "drawdown_pct": round(drawdown_pct, 3),
+        "structure_score": structure_score,
+        "below_ema9": below_ema9,
+        "below_ema20": below_ema20,
+        "ema9_falling": ema9_falling,
+        "bearish": bearish,
+        "lower_low": lower_low,
+        "rsi_weakening": rsi_weakening,
+        "last_close": float(c.close),
+        "last_ema9": float(c.ema9),
+        "last_ema20": float(c.ema20),
+        "last_rsi": round(float(c.rsi), 2),
+    }
+
 
 
 def p_catastrophic_failure_signal(
@@ -2485,6 +2570,31 @@ class DailyBot:
                 continue
 
             # TP가 터치되지 않았을 때만 BE/구조손절/시간종료를 확인한다.
+
+            # v4.3.41 진입 직후 3~15분 급락 전용 Early Crash Guard.
+            # -2.5% 이상 급락 + 확정 5분 구조 약화가 함께 있을 때만 종료한다.
+            if int(row["tp1_done"] or 0) == 0:
+                try:
+                    early_crash, early_crash_details = early_crash_failure_signal(
+                        self.client, row["symbol"], row["opened_at"], base_price, price, self.cfg
+                    )
+                except Exception as exc:
+                    early_crash, early_crash_details = False, {"error": str(exc)}
+                    log_event(
+                        row["symbol"], "EARLY_CRASH_CHECK_ERROR",
+                        mode=self.cfg.mode, details=str(exc),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                if early_crash:
+                    log_event(
+                        row["symbol"], "EARLY_CRASH_3_15_TRIGGER",
+                        price=price, mode=self.cfg.mode,
+                        details=json.dumps(early_crash_details, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                    reason = "HJ_STRUCTURE_STOP" if strategy == "HJ" else "STOP"
+                    self._close(row, price, 1.0, reason, price, price)
+                    continue
 
             # v4.3.39 P형 단계형 대손실 가드.
             # TP1 전 P 포지션만 대상으로 하며, 손실이 깊어질수록 5분 구조 확인 강도를 완화한다.
