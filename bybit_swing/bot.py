@@ -23,7 +23,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.41-EarlyCrash-AGradeTrend"
+BOT_RUNTIME_VERSION = "RC-v4.3.42-HJWickOff"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -275,6 +275,8 @@ class DailyConfig:
     reject_three_bar_volume_decline: bool = True
     rebound_min_rsi: float = 44.0
     hj_pattern_enabled: bool = True
+    # v4.3.42: HJ wick reversal 진입은 OFF. P형과 HJ A급 continuation은 유지한다.
+    hj_wick_enabled: bool = False
     # v4.3.41: HJ continuation 전체는 계속 차단하되, A급 continuation만 제한적으로 허용한다.
     # A급 기준: 3연속 양봉 + 거래량비 >= 1.0 + higher-low + 1시간 상승 + EMA 정배열.
     hj_continuation_enabled: bool = False
@@ -891,7 +893,9 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         recent_low_holding,
     ]
     hj_trend_score = sum(1 for x in hj_trend_checks if x)
-    hj_wick_volume_ok = bool(wick_reversal and live_volume_ratio >= 0.35)
+    # v4.3.42: wick 패턴 자체는 진단용으로 계산하되 실제 진입 신호에서는 비활성화한다.
+    hj_wick_reversal_active = bool(cfg.hj_wick_enabled and wick_reversal)
+    hj_wick_volume_ok = bool(hj_wick_reversal_active and live_volume_ratio >= 0.35)
 
     # v4.3.41 A급 continuation 강화:
     # 전체 continuation은 계속 OFF. 거래량/higher-low에 더해
@@ -911,7 +915,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     hj_volume_ok = bool(hj_wick_volume_ok or hj_continuation_volume_ok)
     hj_momentum_ok = bool(48 <= live_rsi <= cfg.hj_max_rsi)
     hj_pattern_ok = bool(
-        wick_reversal
+        hj_wick_reversal_active
         or (cfg.hj_continuation_enabled and continuation_three_bulls)
         or hj_a_continuation
     )
@@ -959,13 +963,13 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
 
     # 급락-급반등 대형 변동봉에서는 wick_reversal 단독 신호를 차단.
     # CYS 사례 live_candle_range 약 5%를 기준으로 4% 이상은 과도 변동으로 본다.
-    hj_wick_reversal_oversized_candle = bool(
+    hj_hj_wick_reversal_active_oversized_candle = bool(
         wick_reversal
         and live_candle_range_pct >= 4.0
         and not hj_fresh_breakout
     )
 
-    hj_wick_reversal_trend_fail = bool(
+    hj_hj_wick_reversal_active_trend_fail = bool(
         wick_reversal
         and not hj_fresh_breakout
         and not hj_wick_reversal_trend_recovery
@@ -975,7 +979,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # wick_reversal로 보이지만 실제 아래꼬리가 몸통보다도 짧고(비율 < 1),
     # higher-low / higher-high / rebound 중 어느 구조회복도 없는 경우는
     # 단순 흔들림을 반등으로 오인한 것으로 보고 차단한다.
-    hj_wick_reversal_weak_structure = bool(
+    hj_hj_wick_reversal_active_weak_structure = bool(
         wick_reversal
         and not hj_fresh_breakout
         and lower_wick_ratio < 1.00
@@ -988,7 +992,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # 거래량이 매우 약하고 감소 중이며 EMA 정렬까지 무너진 wick reversal은
     # 가격 한 번 튄 것만으로 재진입하지 않는다.
     # BTW/RE처럼 거래량비가 낮아도 volume trend 또는 EMA 구조가 살아있는 경우는 보존한다.
-    hj_wick_reversal_faded_reentry = bool(
+    hj_hj_wick_reversal_active_faded_reentry = bool(
         wick_reversal
         and not hj_fresh_breakout
         and live_volume_ratio < 0.45
@@ -1090,7 +1094,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     )
     hj_score = (
         hj_trend_score * 10
-        + (20 if wick_reversal else 0)
+        + (20 if hj_wick_reversal_active else 0)
         + (20 if continuation_three_bulls else 0)
         + min(15, live_volume_ratio * 8)
         + min(10, max(0.0, live_gain) * 4)
@@ -1181,7 +1185,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "strategy": strategy,
         "score": round(float(score), 2),
         "entry_reason": (
-            "긴꼬리 음봉 후 양봉 몸통회복" if strategy == "HJ" and wick_reversal
+            "긴꼬리 음봉 후 양봉 몸통회복" if strategy == "HJ" and hj_wick_reversal_active
             else "연속 양봉 후 장대양봉 확장" if strategy == "HJ"
             else "기존 반등 확인" if strategy == "P"
             else ""
@@ -1215,6 +1219,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_overextended_continuation": p_overextended_continuation,
         "p_entry_quality_ok": p_entry_quality_ok,
         "hj_wick_reversal": wick_reversal,
+        "hj_wick_enabled": bool(cfg.hj_wick_enabled),
+        "hj_wick_reversal_active": hj_wick_reversal_active,
         "hj_continuation_three_bulls": continuation_three_bulls,
         "hj_continuation_enabled": bool(cfg.hj_continuation_enabled),
         "hj_a_continuation": hj_a_continuation,
