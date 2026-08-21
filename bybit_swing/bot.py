@@ -963,13 +963,13 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
 
     # 급락-급반등 대형 변동봉에서는 wick_reversal 단독 신호를 차단.
     # CYS 사례 live_candle_range 약 5%를 기준으로 4% 이상은 과도 변동으로 본다.
-    hj_hj_wick_reversal_active_oversized_candle = bool(
+    hj_wick_reversal_oversized_candle = bool(
         wick_reversal
         and live_candle_range_pct >= 4.0
         and not hj_fresh_breakout
     )
 
-    hj_hj_wick_reversal_active_trend_fail = bool(
+    hj_wick_reversal_trend_fail = bool(
         wick_reversal
         and not hj_fresh_breakout
         and not hj_wick_reversal_trend_recovery
@@ -979,7 +979,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # wick_reversal로 보이지만 실제 아래꼬리가 몸통보다도 짧고(비율 < 1),
     # higher-low / higher-high / rebound 중 어느 구조회복도 없는 경우는
     # 단순 흔들림을 반등으로 오인한 것으로 보고 차단한다.
-    hj_hj_wick_reversal_active_weak_structure = bool(
+    hj_wick_reversal_weak_structure = bool(
         wick_reversal
         and not hj_fresh_breakout
         and lower_wick_ratio < 1.00
@@ -992,7 +992,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # 거래량이 매우 약하고 감소 중이며 EMA 정렬까지 무너진 wick reversal은
     # 가격 한 번 튄 것만으로 재진입하지 않는다.
     # BTW/RE처럼 거래량비가 낮아도 volume trend 또는 EMA 구조가 살아있는 경우는 보존한다.
-    hj_hj_wick_reversal_active_faded_reentry = bool(
+    hj_wick_reversal_faded_reentry = bool(
         wick_reversal
         and not hj_fresh_breakout
         and live_volume_ratio < 0.45
