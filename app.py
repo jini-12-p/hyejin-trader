@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.8-LoginPersistFix"
+APP_VERSION = "STABLE-v4.3.9-LoginPersistNativeCookie"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -107,13 +107,20 @@ def require_password() -> None:
         st.stop()
     token = auth_token(expected)
 
-    # 새로고침 시 새 Streamlit 세션이 생겨도 브라우저 쿠키를 다시 읽어 로그인 상태를 복원한다.
+    # 새로고침 시에는 Streamlit이 최초 HTTP 요청에서 받은 브라우저 쿠키를
+    # 동기적으로 읽는다. extra_streamlit_components.get_all()의 렌더링 타이밍에
+    # 의존하지 않으므로 모바일 새로고침에서도 로그인 상태를 안정적으로 복원한다.
+    saved_token = None
     try:
-        cookies = cookie_manager.get_all(key="hj_auth_refresh")
+        saved_token = st.context.cookies.get("hj_auth")
     except Exception:
-        cookies = {}
+        # 구형 Streamlit 대비 fallback. 로그인 직후 같은 세션에서는
+        # session_state가 우선이고, 필요 시 CookieManager의 현재 캐시를 확인한다.
+        try:
+            saved_token = cookie_manager.get("hj_auth")
+        except Exception:
+            saved_token = None
 
-    saved_token = cookies.get("hj_auth") if isinstance(cookies, dict) else None
     if st.session_state.get("authenticated") or saved_token == token:
         st.session_state.authenticated = True
         return
