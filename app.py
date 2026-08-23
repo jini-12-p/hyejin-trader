@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.9-LoginPersistNativeCookie"
+APP_VERSION = "STABLE-v4.3.10-LoginPersistURL"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -121,7 +121,14 @@ def require_password() -> None:
         except Exception:
             saved_token = None
 
-    if st.session_state.get("authenticated") or saved_token == token:
+    # iOS/Safari에서 컴포넌트 쿠키가 새로고침 후 상위 Streamlit 요청에
+    # 전달되지 않는 경우를 대비해 URL의 서명 토큰도 로그인 유지 수단으로 사용한다.
+    query_token = str(st.query_params.get("hj_auth", "") or "")
+    if (
+        st.session_state.get("authenticated")
+        or saved_token == token
+        or query_token == token
+    ):
         st.session_state.authenticated = True
         return
     st.title("🔒 HJ Trader")
@@ -131,14 +138,19 @@ def require_password() -> None:
         if password == expected:
             st.session_state.authenticated = True
             if keep:
-                cookie_manager.set(
-                    "hj_auth",
-                    token,
-                    max_age=7 * 24 * 60 * 60,
-                    path="/",
-                    same_site="lax",
-                    key="set_auth",
-                )
+                # 쿠키도 유지하되, 모바일 Safari 새로고침 대비용으로 URL 토큰을 함께 둔다.
+                try:
+                    cookie_manager.set(
+                        "hj_auth",
+                        token,
+                        max_age=7 * 24 * 60 * 60,
+                        path="/",
+                        same_site="lax",
+                        key="set_auth",
+                    )
+                except Exception:
+                    pass
+                st.query_params["hj_auth"] = token
             st.rerun()
         else:
             st.error("비밀번호가 맞지 않습니다.")
@@ -682,7 +694,12 @@ if view_mode not in {"OKX PAPER만 보기", "Bybit Swing PAPER만 보기"}:
         use_container_width=True,
     )
     if col_logout.button("로그아웃", use_container_width=True):
-        cookie_manager.delete("hj_auth", key="delete_auth")
+        try:
+            cookie_manager.delete("hj_auth", key="delete_auth")
+        except Exception:
+            pass
+        if "hj_auth" in st.query_params:
+            del st.query_params["hj_auth"]
         st.session_state.authenticated = False
         st.rerun()
 
