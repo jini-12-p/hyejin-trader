@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
-import time
 import json
 import io
 import csv
@@ -31,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "RC-v4.4.0-HJSafeCycle"
+APP_VERSION = "STABLE-v4.3.6-LiveStats"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -102,42 +100,15 @@ def auth_token(password: str) -> str:
 cookie_manager = stx.CookieManager(key="hj_cookie_manager")
 
 
-def _make_url_auth_token(password: str, expires_at: int) -> str:
-    payload = str(expires_at)
-    signature = hmac.new(
-        password.encode("utf-8"),
-        ("HJ-TRADER-URL-AUTH|" + payload).encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{payload}.{signature}"
-
-
-def _valid_url_auth_token(password: str, value: str) -> bool:
-    try:
-        expires_text, signature = str(value).split(".", 1)
-        expires_at = int(expires_text)
-    except (TypeError, ValueError):
-        return False
-    if expires_at < int(time.time()):
-        return False
-    expected = _make_url_auth_token(password, expires_at).split(".", 1)[1]
-    return hmac.compare_digest(signature, expected)
-
-
 def require_password() -> None:
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
         st.error("APP_PASSWORD가 설정되지 않았습니다.")
         st.stop()
-
-    # 모바일 브라우저 + HTTP 접속에서는 CookieManager 쿠키가 새로고침 뒤
-    # 안정적으로 복원되지 않는 경우가 있어, 서명된 만료 토큰을 URL에 유지한다.
-    # 비밀번호 자체는 URL에 들어가지 않으며 토큰은 7일 뒤 자동 만료된다.
-    url_token = st.query_params.get("auth", "")
-    if st.session_state.get("authenticated") or _valid_url_auth_token(expected, url_token):
+    token = auth_token(expected)
+    if st.session_state.get("authenticated") or cookie_manager.get("hj_auth") == token:
         st.session_state.authenticated = True
         return
-
     st.title("🔒 HJ Trader")
     password = st.text_input("비밀번호", type="password")
     keep = st.checkbox("이 기기에서 7일간 로그인 유지", value=True)
@@ -145,8 +116,7 @@ def require_password() -> None:
         if password == expected:
             st.session_state.authenticated = True
             if keep:
-                expires_at = int(time.time()) + 7 * 24 * 60 * 60
-                st.query_params["auth"] = _make_url_auth_token(expected, expires_at)
+                cookie_manager.set("hj_auth", token, max_age=7 * 24 * 60 * 60, key="set_auth")
             st.rerun()
         else:
             st.error("비밀번호가 맞지 않습니다.")
@@ -690,8 +660,8 @@ if view_mode not in {"OKX PAPER만 보기", "Bybit Swing PAPER만 보기"}:
         use_container_width=True,
     )
     if col_logout.button("로그아웃", use_container_width=True):
+        cookie_manager.delete("hj_auth", key="delete_auth")
         st.session_state.authenticated = False
-        st.query_params.clear()
         st.rerun()
 
     settings = StrategySettings(
@@ -1653,16 +1623,20 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
     if BYBIT_SWING_CONFIG.exists():
         try:
             bs_cfg = json.loads(BYBIT_SWING_CONFIG.read_text(encoding="utf-8"))
+            bs_mode = str(bs_cfg.get("mode", "paper")).strip().lower()
             st.info(
-                f"모드 {str(bs_cfg.get('mode','paper')).upper()} · 격리 {bs_cfg.get('leverage',5)}배 · "
-                f"동시 {bs_cfg.get('max_positions',2)}종목 · 1회 증거금 {bs_cfg.get('position_margin_usdt',54)} USDT"
+                f"모드 {bs_mode.upper()} · 격리 {bs_cfg.get('leverage',5)}배 · "
+                f"동시 {bs_cfg.get('max_positions',2)}종목 · 1회 증거금 {bs_cfg.get('position_margin_usdt',27)} USDT"
             )
             st.write(
                 f"TP1 +{bs_cfg.get('tp1_pct',1.5)}% 절반 · TP2 +{bs_cfg.get('tp2_pct',3.0)}% 나머지 · "
                 f"손절 -{bs_cfg.get('hard_stop_pct',1.5)}% · 최대 {bs_cfg.get('max_hold_hours',3)}시간"
             )
             st.caption("강화 조건: 최근 1시간 0.5% 이상 움직임 · 반등 다음 봉 유지 확인 · 3봉 거래량 연속감소 제외")
-            st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
+            if bs_mode == "live":
+                st.error("🔴 현재 LIVE 모드: 실제 Bybit 주문이 발생합니다.")
+            else:
+                st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
             tg_on = bool(bs_cfg.get("telegram_enabled", False))
             st.caption(
                 "텔레그램 알림: " + ("사용 설정됨" if tg_on else "꺼짐") +
@@ -1676,20 +1650,35 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
             with sqlite3.connect(BYBIT_SWING_DB) as conn:
                 conn.row_factory = sqlite3.Row
                 positions = conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
-                recent_events = conn.execute("SELECT * FROM bot_events ORDER BY id DESC LIMIT 60").fetchall()
-                trade_event_names = (
-                    "ENTRY","REBOUND_ADD","CYCLE_REDUCE","TP1","TP2",
-                    "STOP_HALF","FINAL_STOP","STOP","HJ_STRUCTURE_STOP",
-                    "BE_EXIT","FLAT_EXIT_75M","TIME_EXIT","MANUAL_EXIT"
-                )
-                placeholders = ",".join("?" for _ in trade_event_names)
-                history = conn.execute(
-                    f"SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' "
-                    f"AND event IN ({placeholders}) ORDER BY id DESC LIMIT 2000",
-                    trade_event_names,
+
+                # PAPER와 LIVE 기록을 섞지 않는다.
+                # LIVE 전환 직후에는 live 이벤트가 없으므로 누적/오늘 손익/진입이 0부터 시작한다.
+                stats_mode = str(bs_cfg.get("mode", "paper")).strip().lower()
+                recent_events = conn.execute(
+                    "SELECT * FROM bot_events WHERE lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 60",
+                    (stats_mode,),
                 ).fetchall()
-                today = conn.execute("SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(ts,1,10)=date('now')").fetchone()
-                cumulative = conn.execute("SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0) FROM bot_events").fetchone()
+                history = conn.execute(
+                    "SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' AND lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 500",
+                    (stats_mode,),
+                ).fetchall()
+                today = conn.execute(
+                    """SELECT
+                           SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END),
+                           COALESCE(SUM(realized_pnl),0)
+                       FROM bot_events
+                       WHERE substr(ts,1,10)=date('now')
+                         AND lower(COALESCE(mode,''))=?""",
+                    (stats_mode,),
+                ).fetchone()
+                cumulative = conn.execute(
+                    """SELECT
+                           COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END),
+                           COALESCE(SUM(realized_pnl),0)
+                       FROM bot_events
+                       WHERE lower(COALESCE(mode,''))=?""",
+                    (stats_mode,),
+                ).fetchone()
 
             paused = _bs_state_get("pause_new_entries", "0") == "1"
             shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
@@ -1704,9 +1693,10 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 _bs_state_set("pause_new_entries","1"); _bs_state_set("shutdown_when_flat","1"); st.rerun()
 
             m0,m1,m2,m3=st.columns(4)
-            m0.metric("전체 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
-            m1.metric("오늘 진입",f"{int(today[0] or 0)}회")
-            m2.metric("오늘 확정손익",f"{float(today[1] or 0):+.2f} USDT")
+            stats_label = "실전" if str(bs_cfg.get("mode","paper")).strip().lower() == "live" else "PAPER"
+            m0.metric(f"{stats_label} 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
+            m1.metric(f"오늘 {stats_label} 진입",f"{int(today[0] or 0)}회")
+            m2.metric(f"오늘 {stats_label} 확정손익",f"{float(today[1] or 0):+.2f} USDT")
             m3.metric("현재 포지션",str(len(positions)))
 
             symbol_types = cached_symbol_types()
@@ -1863,10 +1853,10 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
             grouped={}
             for e in reversed(list(history)):
                 grouped.setdefault(e['trade_id'] or f"legacy-{e['symbol']}",[]).append(e)
-            names={"ENTRY":"최초 진입","REBOUND_ADD":"순환추가","CYCLE_REDUCE":"추가분 회수","TP1":"TP1 익절","TP2":"TP2 익절","STOP_HALF":"1차 손절","FINAL_STOP":"최종 손절","STOP":"손절","HJ_STRUCTURE_STOP":"구조 손절","BE_EXIT":"본절 보호 종료","FLAT_EXIT_75M":"정체 종료","TIME_EXIT":"시간 종료","MANUAL_EXIT":"수동 종료"}
+            names={"ENTRY":"최초 진입","REBOUND_ADD":"순환추가","CYCLE_REDUCE":"추가분 회수","TP1":"TP1 익절","TP2":"TP2 익절","STOP_HALF":"1차 손절","FINAL_STOP":"최종 손절","STOP":"손절","BE_EXIT":"본절 보호 종료","FLAT_EXIT_75M":"정체 종료","TIME_EXIT":"시간 종료","MANUAL_EXIT":"수동 종료"}
             for tid,events in list(reversed(list(grouped.items())))[:20]:
                 first=events[0]; total=sum(float(x['realized_pnl'] or 0) for x in events)
-                closed=any(x['event'] in {"TP2","FINAL_STOP","STOP","HJ_STRUCTURE_STOP","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT","MANUAL_EXIT"} for x in events)
+                closed=any(x['event'] in {"TP2","FINAL_STOP","STOP","BE_EXIT","FLAT_EXIT_75M","TIME_EXIT","MANUAL_EXIT"} for x in events)
                 with st.expander(f"{first['symbol']} · {'종료' if closed else '진행 중'} · {total:+.2f} USDT",expanded=False):
                     for e in events:
                         try: d=json.loads(e['details'] or '{}')
