@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.7-LoginPersist"
+APP_VERSION = "STABLE-v4.3.8-LoginPersistFix"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -97,12 +97,7 @@ def auth_token(password: str) -> str:
     return hashlib.sha256(("HJ-TRADER-2026|" + password).encode()).hexdigest()
 
 
-@st.cache_resource
-def _cookie_manager_resource():
-    return stx.CookieManager(key="hj_cookie_manager")
-
-
-cookie_manager = _cookie_manager_resource()
+cookie_manager = stx.CookieManager(key="hj_cookie_manager")
 
 
 def require_password() -> None:
