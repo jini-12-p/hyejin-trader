@@ -23,7 +23,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.42-HJWickOff"
+BOT_RUNTIME_VERSION = "RC-v4.3.43-POnlyTrial"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -1092,6 +1092,9 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not hj_continuation_overextended_fresh_breakout
         and live_gain <= 8.0
     )
+    # v4.3.43 P-only trial: HJ 진입만 비활성화하고 P형 로직은 그대로 유지한다.
+    hj_ok = False
+
     hj_score = (
         hj_trend_score * 10
         + (20 if hj_wick_reversal_active else 0)
