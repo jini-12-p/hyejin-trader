@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.6-LiveStats"
+APP_VERSION = "STABLE-v4.3.7-LoginPersist"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -97,7 +97,12 @@ def auth_token(password: str) -> str:
     return hashlib.sha256(("HJ-TRADER-2026|" + password).encode()).hexdigest()
 
 
-cookie_manager = stx.CookieManager(key="hj_cookie_manager")
+@st.cache_resource
+def _cookie_manager_resource():
+    return stx.CookieManager(key="hj_cookie_manager")
+
+
+cookie_manager = _cookie_manager_resource()
 
 
 def require_password() -> None:
@@ -106,7 +111,15 @@ def require_password() -> None:
         st.error("APP_PASSWORD가 설정되지 않았습니다.")
         st.stop()
     token = auth_token(expected)
-    if st.session_state.get("authenticated") or cookie_manager.get("hj_auth") == token:
+
+    # 새로고침 시 새 Streamlit 세션이 생겨도 브라우저 쿠키를 다시 읽어 로그인 상태를 복원한다.
+    try:
+        cookies = cookie_manager.get_all(key="hj_auth_refresh")
+    except Exception:
+        cookies = {}
+
+    saved_token = cookies.get("hj_auth") if isinstance(cookies, dict) else None
+    if st.session_state.get("authenticated") or saved_token == token:
         st.session_state.authenticated = True
         return
     st.title("🔒 HJ Trader")
@@ -116,7 +129,14 @@ def require_password() -> None:
         if password == expected:
             st.session_state.authenticated = True
             if keep:
-                cookie_manager.set("hj_auth", token, max_age=7 * 24 * 60 * 60, key="set_auth")
+                cookie_manager.set(
+                    "hj_auth",
+                    token,
+                    max_age=7 * 24 * 60 * 60,
+                    path="/",
+                    same_site="lax",
+                    key="set_auth",
+                )
             st.rerun()
         else:
             st.error("비밀번호가 맞지 않습니다.")
