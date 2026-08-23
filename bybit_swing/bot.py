@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import math
+import hmac
+import hashlib
 import sqlite3
 import time
 import threading
@@ -23,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.43-POnlyTrial"
+BOT_RUNTIME_VERSION = "RC-v4.3.45-POnly-ExchangeTP"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -145,10 +147,13 @@ class DailyConfig:
     margin_mode: str = "isolated"
     max_positions: int = 2
     max_daily_entries: int = 0  # 0이면 PAPER 데이터 수집 중 횟수 제한 없음
-    position_margin_usdt: float = 54.0
+    position_margin_usdt: float = 27.0
     hj_position_margin_usdt: float = 36.0
     tp1_pct: float = 1.5
     tp2_pct: float = 3.0
+    # 실전에서는 진입 직후 Bybit 거래소에 TP1/TP2 reduce-only 지정가를 선주문한다.
+    exchange_tp_preorders_enabled: bool = True
+    exchange_tp_sync_seconds: float = 5.0
     hard_stop_pct: float = 1.5
     breakeven_stop_pct: float = 0.1
     staged_stop_enabled: bool = True
@@ -175,7 +180,7 @@ class DailyConfig:
     telegram_notify_exit: bool = True
     telegram_notify_error: bool = True
     rebound_add_enabled: bool = True
-    rebound_add_margin_usdt: float = 27.0
+    rebound_add_margin_usdt: float = 13.5
     hj_rebound_add_margin_usdt: float = 18.0
     hj_structure_stop_enabled: bool = True
 
@@ -2180,6 +2185,232 @@ class DailyBot:
         except (TypeError, ValueError):
             return False
 
+    def _private_v5(self, method: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Bybit v5 private REST. Exchange TP pre-orders only."""
+        api_key = os.getenv("BYBIT_API_KEY", "").strip()
+        api_secret = os.getenv("BYBIT_API_SECRET", "").strip()
+        if not api_key or not api_secret:
+            raise BybitSwingError("TP 선주문용 BYBIT_API_KEY/BYBIT_API_SECRET이 없습니다.")
+
+        method = method.upper()
+        ts = str(int(time.time() * 1000))
+        recv_window = "5000"
+        base_url = "https://api.bybit.com" if self.cfg.mode == "live" else "https://api-demo.bybit.com"
+
+        if method == "GET":
+            query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params.items()))
+            payload = query
+            url = base_url + path + (("?" + query) if query else "")
+            data = None
+        else:
+            payload = json.dumps(params, separators=(",", ":"), ensure_ascii=False)
+            url = base_url + path
+            data = payload.encode("utf-8")
+
+        sign_text = ts + api_key + recv_window + payload
+        signature = hmac.new(
+            api_secret.encode("utf-8"), sign_text.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv_window,
+            "X-BAPI-SIGN": signature,
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            raise BybitSwingError(f"Bybit TP API 통신 오류: {exc}") from exc
+        if int(result.get("retCode", -1)) != 0:
+            raise BybitSwingError(f"Bybit TP API 오류 {result.get('retCode')}: {result.get('retMsg')}")
+        return result
+
+    def _instrument_steps(self, symbol: str) -> tuple[float, float]:
+        """Return (tick_size, qty_step) for linear USDT contract."""
+        url = (
+            "https://api.bybit.com/v5/market/instruments-info?"
+            + urllib.parse.urlencode({"category": "linear", "symbol": symbol})
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = payload.get("result", {}).get("list", [])
+            if rows:
+                tick = float(rows[0].get("priceFilter", {}).get("tickSize") or 0)
+                step = float(rows[0].get("lotSizeFilter", {}).get("qtyStep") or 0)
+                if tick > 0 and step > 0:
+                    return tick, step
+        except Exception:
+            pass
+        return 1e-8, 1e-8
+
+    @staticmethod
+    def _step_floor(value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        return math.floor((value + 1e-12) / step) * step
+
+    @staticmethod
+    def _step_round(value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        return round(value / step) * step
+
+    def _tp_link(self, symbol: str, entry_ts_ms: int, level: int) -> str:
+        return f"SWTP{level}{str(entry_ts_ms)[-10:]}{symbol[:10]}"[:36]
+
+    def _cancel_exchange_tp_orders(self, symbol: str, entry_ts_ms: int) -> None:
+        if self.cfg.mode == "paper" or not self.cfg.exchange_tp_preorders_enabled:
+            return
+        for level in (1, 2):
+            try:
+                self._private_v5("POST", "/v5/order/cancel", {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "orderLinkId": self._tp_link(symbol, entry_ts_ms, level),
+                })
+            except Exception:
+                # 이미 체결/취소된 주문은 취소 실패가 정상일 수 있다.
+                pass
+
+    def _place_exchange_tp_orders(
+        self, symbol: str, base_price: float, total_qty: float, entry_ts_ms: int
+    ) -> None:
+        """Place TP1 50% + TP2 remainder as reduce-only limit orders on Bybit."""
+        if self.cfg.mode == "paper" or not self.cfg.exchange_tp_preorders_enabled:
+            return
+        if total_qty <= 0 or base_price <= 0:
+            return
+
+        tick, qty_step = self._instrument_steps(symbol)
+        total_qty = self._step_floor(total_qty, qty_step)
+        if total_qty <= 0:
+            return
+        qty1 = self._step_floor(total_qty * 0.5, qty_step)
+        qty2 = self._step_floor(total_qty - qty1, qty_step)
+        if qty1 <= 0 or qty2 <= 0:
+            raise BybitSwingError(f"{symbol} TP 수량이 최소 주문단위보다 작습니다.")
+
+        p1 = self._step_round(base_price * (1 + self.cfg.tp1_pct / 100), tick)
+        p2 = self._step_round(base_price * (1 + self.cfg.tp2_pct / 100), tick)
+
+        # 수량 변경(추가/회수) 때 호출될 수 있으므로 기존 TP를 먼저 정리한다.
+        self._cancel_exchange_tp_orders(symbol, entry_ts_ms)
+
+        for level, qty, target in ((1, qty1, p1), (2, qty2, p2)):
+            self._private_v5("POST", "/v5/order/create", {
+                "category": "linear",
+                "symbol": symbol,
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": f"{qty:.12f}".rstrip("0").rstrip("."),
+                "price": f"{target:.12f}".rstrip("0").rstrip("."),
+                "timeInForce": "GTC",
+                "positionIdx": 1,
+                "reduceOnly": True,
+                "closeOnTrigger": False,
+                "orderLinkId": self._tp_link(symbol, entry_ts_ms, level),
+            })
+
+        log_event(
+            symbol, "EXCHANGE_TP_PLACED", base_price, total_qty, self.cfg.mode,
+            details=json.dumps({
+                "tp1_price": p1, "tp1_qty": qty1,
+                "tp2_price": p2, "tp2_qty": qty2,
+                "source": "bybit_reduce_only_limit",
+            }, ensure_ascii=False)
+        )
+
+    def _live_position_qty(self, symbol: str) -> float:
+        payload = self._private_v5("GET", "/v5/position/list", {
+            "category": "linear",
+            "symbol": symbol,
+        })
+        for item in payload.get("result", {}).get("list", []):
+            if str(item.get("side") or "").lower() == "buy" and int(item.get("positionIdx") or 0) in (0, 1):
+                return float(item.get("size") or 0)
+        return 0.0
+
+    def _sync_exchange_tp_fill(self, row: sqlite3.Row, price: float) -> sqlite3.Row | None:
+        """Reconcile exchange-side TP fills into local DB before local stop/TP logic."""
+        if self.cfg.mode != "live" or not self.cfg.exchange_tp_preorders_enabled:
+            return row
+
+        now_ts = time.time()
+        key = f"tp_sync_{row['symbol']}"
+        try:
+            last = float(state_get(key, "0") or 0)
+        except Exception:
+            last = 0.0
+        if now_ts - last < max(2.0, float(self.cfg.exchange_tp_sync_seconds)):
+            return row
+        state_set(key, str(now_ts))
+
+        try:
+            actual_qty = self._live_position_qty(row["symbol"])
+        except Exception as exc:
+            log_event(
+                row["symbol"], "TP_SYNC_ERROR", price, 0, self.cfg.mode,
+                details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or ""
+            )
+            return row
+
+        db_qty = float(row["total_qty"] or 0)
+        base_qty = float(row["base_qty"] or db_qty)
+        base_price = float(row["base_entry_price"] or row["avg_price"])
+        tp1_price = base_price * (1 + self.cfg.tp1_pct / 100)
+        tp2_price = base_price * (1 + self.cfg.tp2_pct / 100)
+        tol = max(base_qty * 0.03, 1e-12)
+
+        # 거래소 포지션이 사라졌다면 TP2까지 체결됐거나 외부에서 종료된 상태.
+        if actual_qty <= tol and db_qty > tol:
+            if int(row["tp1_done"] or 0) == 1 or price >= tp2_price * 0.995:
+                realized_step = (tp2_price - float(row["avg_price"])) * db_qty
+                total_realized = float(row["realized_pnl"] or 0) + realized_step
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE bot_positions SET status='CLOSED',total_qty=0,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
+                        (utc_now(), tp2_price, "TP2", total_realized, row["symbol"]),
+                    )
+                log_event(
+                    row["symbol"], "TP2", tp2_price, db_qty, self.cfg.mode,
+                    details=json.dumps({"source": "exchange_preorder_sync"}, ensure_ascii=False),
+                    strategy=row["strategy"] or "", realized_pnl=realized_step,
+                    trade_id=row["trade_id"] or ""
+                )
+                return None
+            # TP로 확정할 수 없는 외부 종료는 중복 주문 방지를 위해 로컬도 닫는다.
+            with db() as conn:
+                conn.execute(
+                    "UPDATE bot_positions SET status='CLOSED',total_qty=0,updated_at=?,last_price=?,note=? WHERE symbol=?",
+                    (utc_now(), price, "EXTERNAL_CLOSE_SYNC", row["symbol"]),
+                )
+            return None
+
+        # 거래소 수량이 대략 절반으로 줄었다면 TP1 선주문 체결로 본다.
+        if int(row["tp1_done"] or 0) == 0 and actual_qty < db_qty - tol and actual_qty <= base_qty * 0.60 + tol:
+            closed_qty = max(0.0, db_qty - actual_qty)
+            realized_step = (tp1_price - float(row["avg_price"])) * closed_qty
+            total_realized = float(row["realized_pnl"] or 0) + realized_step
+            with db() as conn:
+                conn.execute(
+                    "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
+                    (actual_qty, utc_now(), tp1_price, "TP1", total_realized, row["symbol"]),
+                )
+            log_event(
+                row["symbol"], "TP1", tp1_price, closed_qty, self.cfg.mode,
+                details=json.dumps({"source": "exchange_preorder_sync"}, ensure_ascii=False),
+                strategy=row["strategy"] or "", realized_pnl=realized_step,
+                trade_id=row["trade_id"] or ""
+            )
+            with db() as conn:
+                return conn.execute("SELECT * FROM bot_positions WHERE symbol=?", (row["symbol"],)).fetchone()
+
+        return row
+
     def _execute(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> None:
         if self.cfg.mode == "paper":
             return
@@ -2196,6 +2427,7 @@ class DailyBot:
         qty = qty_from_margin(price, entry_margin, self.cfg.leverage)
         self._execute(symbol, "buy", qty)
         trade_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+        entry_ts_ms = int(time.time() * 1000)
         with db() as conn:
             conn.execute("DELETE FROM bot_positions WHERE symbol=?", (symbol,))
             conn.execute(
@@ -2206,7 +2438,7 @@ class DailyBot:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (symbol, "OPEN", utc_now(), utc_now(), price, qty, entry_margin, 0, 0,
                  price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
-                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0, int(time.time() * 1000)),
+                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0, entry_ts_ms),
             )
         signal_details = signal_details or {}
         details = json.dumps({
@@ -2230,6 +2462,15 @@ class DailyBot:
             "signal_snapshot": signal_details,
         }, ensure_ascii=False)
         log_event(symbol, "ENTRY", price, qty, self.cfg.mode, details, strategy, trade_id=trade_id)
+        try:
+            self._place_exchange_tp_orders(symbol, price, qty, entry_ts_ms)
+        except Exception as exc:
+            # 진입 자체는 이미 완료되었으므로 TP 선주문 실패를 명확히 기록하고
+            # 기존 1초 감시 TP 로직을 백업으로 유지한다.
+            log_event(
+                symbol, "EXCHANGE_TP_PLACE_ERROR", price, qty, self.cfg.mode,
+                details=str(exc), strategy=strategy, trade_id=trade_id
+            )
 
     def _rebound_add(self, row: sqlite3.Row, price: float) -> None:
         old_avg = float(row["avg_price"])
@@ -2259,6 +2500,13 @@ class DailyBot:
                               "cycle_no": int(row["dca_count"] or 0) + 1}, ensure_ascii=False)
         log_event(row["symbol"], "REBOUND_ADD", price, add_qty, self.cfg.mode,
                   details=details, strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
+        try:
+            self._place_exchange_tp_orders(
+                row["symbol"], float(row["base_entry_price"] or old_avg), new_qty, int(row["entry_ts_ms"] or 0)
+            )
+        except Exception as exc:
+            log_event(row["symbol"], "EXCHANGE_TP_REFRESH_ERROR", price, new_qty, self.cfg.mode,
+                      details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
 
     def _cycle_reduce(self, row: sqlite3.Row, price: float) -> None:
         add_qty = float(row["add_qty"] or 0)
@@ -2284,11 +2532,20 @@ class DailyBot:
         log_event(row["symbol"], "CYCLE_REDUCE", price, add_qty, self.cfg.mode,
                   details=details, strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
                   trade_id=row["trade_id"] or "")
+        try:
+            self._place_exchange_tp_orders(
+                row["symbol"], base_price, remaining, int(row["entry_ts_ms"] or 0)
+            )
+        except Exception as exc:
+            log_event(row["symbol"], "EXCHANGE_TP_REFRESH_ERROR", price, remaining, self.cfg.mode,
+                      details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
 
     def _close(self, row: sqlite3.Row, price: float, fraction: float, reason: str,
                detected_price: float | None = None, trigger_price: float | None = None) -> None:
         current_qty = float(row["total_qty"])
         qty = current_qty * fraction
+        if reason not in {"TP1", "TP2"}:
+            self._cancel_exchange_tp_orders(row["symbol"], int(row["entry_ts_ms"] or 0))
         self._execute(row["symbol"], "sell", qty, reduce_only=True)
         pnl_usdt = (price - float(row["avg_price"])) * qty
         remaining = max(0.0, current_qty - qty)
@@ -2545,6 +2802,15 @@ class DailyBot:
             total_qty = float(row["total_qty"] or 0)
             unrealized_usdt = (price - avg) * total_qty
 
+            # 실전: 거래소에 미리 걸어둔 TP 주문의 실제 체결을 먼저 동기화한다.
+            synced_row = self._sync_exchange_tp_fill(row, price)
+            if synced_row is None:
+                continue
+            row = synced_row
+            avg = float(row["avg_price"])
+            base_price = float(row["base_entry_price"] or avg)
+            highest = float(row["highest_price"] or price)
+
             # TP 터치 보강:
             # 현재가만 보지 않고, 이미 저장된 최고가 + (진입 2분 경과 후) 최근 1분봉 high도 확인한다.
             # TP를 한 번이라도 터치했다면 BE/구조손절/시간종료보다 TP를 먼저 처리한다.
@@ -2568,15 +2834,16 @@ class DailyBot:
             tp1_trigger = base_price * (1 + self.cfg.tp1_pct / 100)
             tp2_trigger = base_price * (1 + self.cfg.tp2_pct / 100)
 
-            if int(row["tp1_done"]) == 0 and tp_observed_high >= tp1_trigger:
-                fill = paper_fill(tp1_trigger) if self.cfg.mode == "paper" else price
-                self._close(row, fill, 0.5, "TP1", price, tp1_trigger)
-                continue
+            if not (self.cfg.mode == "live" and self.cfg.exchange_tp_preorders_enabled):
+                if int(row["tp1_done"]) == 0 and tp_observed_high >= tp1_trigger:
+                    fill = paper_fill(tp1_trigger) if self.cfg.mode == "paper" else price
+                    self._close(row, fill, 0.5, "TP1", price, tp1_trigger)
+                    continue
 
-            if int(row["tp1_done"]) == 1 and tp_observed_high >= tp2_trigger:
-                fill = paper_fill(tp2_trigger) if self.cfg.mode == "paper" else price
-                self._close(row, fill, 1.0, "TP2", price, tp2_trigger)
-                continue
+                if int(row["tp1_done"]) == 1 and tp_observed_high >= tp2_trigger:
+                    fill = paper_fill(tp2_trigger) if self.cfg.mode == "paper" else price
+                    self._close(row, fill, 1.0, "TP2", price, tp2_trigger)
+                    continue
 
             # TP가 터치되지 않았을 때만 BE/구조손절/시간종료를 확인한다.
 
