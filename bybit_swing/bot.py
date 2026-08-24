@@ -2353,7 +2353,7 @@ class DailyBot:
                 "qty": f"{qty:.12f}".rstrip("0").rstrip("."),
                 "price": f"{target:.12f}".rstrip("0").rstrip("."),
                 "timeInForce": "GTC",
-                "positionIdx": 1,
+                "positionIdx": 0,
                 "reduceOnly": True,
                 "closeOnTrigger": False,
                 "orderLinkId": self._tp_link(symbol, entry_ts_ms, level),
