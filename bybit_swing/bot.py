@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.45-POnly-ExchangeTP"
+BOT_RUNTIME_VERSION = "RC-v4.3.46-POnly-ScanCSVFix"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -341,17 +341,45 @@ SCAN_REJECTED_FIELDS = [
     "distance_to_recent_high_pct", "ema9_distance_pct",
     "rising_close_streak", "late_entry_ok", "close_location_pct",
     "upper_wick_ratio", "confirmation_hold", "data_complete",
+    # v4.3.46: P 최종판정의 실제 boolean을 CSV에도 남겨 원인 분석 가능하게 한다.
+    "h1_up", "pullback_ok", "rebound", "not_chasing", "momentum_ok",
+    "volume_ok", "volume_trend_ok", "movement_ok", "not_extreme",
+    "ema_ordered", "ema9_rising", "higher_lows", "higher_highs",
+    "p_ema_quality_ok", "p_entry_quality_ok",
+    "p_near_high_weak_reentry", "p_faded_spike_reentry",
+    "p_overextended_continuation",
 ]
 
 def ensure_scan_rejected_csv() -> None:
-    """봇 시작 즉시 CSV 파일과 헤더를 만든다."""
+    """봇 시작 즉시 CSV를 준비한다. 기존 기록은 보존하면서 신규 컬럼만 안전하게 확장한다."""
     SCAN_REJECTED_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if SCAN_REJECTED_CSV_PATH.exists() and SCAN_REJECTED_CSV_PATH.stat().st_size > 0:
+    if not SCAN_REJECTED_CSV_PATH.exists() or SCAN_REJECTED_CSV_PATH.stat().st_size == 0:
+        with SCAN_REJECTED_CSV_PATH.open("w", encoding="utf-8-sig", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=SCAN_REJECTED_FIELDS).writeheader()
+            fh.flush()
+            os.fsync(fh.fileno())
         return
-    with SCAN_REJECTED_CSV_PATH.open("w", encoding="utf-8-sig", newline="") as fh:
-        csv.DictWriter(fh, fieldnames=SCAN_REJECTED_FIELDS).writeheader()
-        fh.flush()
-        os.fsync(fh.fileno())
+
+    # v4.3.46: 예전 헤더의 CSV에 신규 컬럼을 그대로 append하면 열이 어긋난다.
+    # 헤더가 다를 때만 기존 행을 읽어 신규 헤더로 1회 마이그레이션한다.
+    try:
+        with SCAN_REJECTED_CSV_PATH.open("r", encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh)
+            old_fields = list(reader.fieldnames or [])
+            if old_fields == SCAN_REJECTED_FIELDS:
+                return
+            rows = list(reader)
+        tmp = SCAN_REJECTED_CSV_PATH.with_suffix(".csv.tmp")
+        with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=SCAN_REJECTED_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key, "") for key in SCAN_REJECTED_FIELDS})
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(SCAN_REJECTED_CSV_PATH)
+    except Exception as exc:
+        log_event("", "SCAN_CSV_MIGRATE_ERROR", mode="paper", details=str(exc))
 
 def rotate_scan_csv_if_needed(max_bytes: int = 5_000_000, keep_rows: int = 3000) -> None:
     """SCAN CSV가 커지면 전체 원본은 날짜별 archive로 옮기고 최근 행만 유지한다."""
@@ -1128,10 +1156,24 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("rebound")
             if not h1_up:
                 rejected.append("h1_up")
+            if not pullback_ok:
+                rejected.append("pullback_ok")
+            if not not_chasing:
+                rejected.append("not_chasing")
+            if not momentum_ok:
+                rejected.append("momentum_ok")
             if not volume_ok:
                 rejected.append("volume_ok")
+            if not volume_trend_ok:
+                rejected.append("volume_trend_ok")
+            if not movement_ok:
+                rejected.append("movement_ok")
+            if not not_extreme:
+                rejected.append("not_extreme")
             if not p_ema_quality_ok:
                 rejected.append("p_ema_not_ordered")
+            if not p_entry_quality_ok:
+                rejected.append("p_entry_quality_ok")
             if p_near_high_weak_reentry:
                 rejected.append("p_near_high_weak_reentry")
             if p_faded_spike_reentry:
@@ -1205,6 +1247,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "volume_ok": volume_ok,
         "volume_trend_ok": volume_trend_ok,
         "movement_ok": movement_ok,
+        "momentum_ok": momentum_ok,
+        "not_extreme": not_extreme,
         "rsi": round(float(live.rsi if strategy == "HJ" else row.rsi), 2),
         "volume_ratio": round(float(live_volume_ratio if strategy == "HJ" else volume_ratio), 2),
         "pullback_from_high_pct": round(pullback_from_high, 2),
