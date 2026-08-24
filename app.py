@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.10-LoginPersistURL"
+APP_VERSION = "STABLE-v4.3.6-ScanCSV-AlwaysDownload"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -106,29 +106,7 @@ def require_password() -> None:
         st.error("APP_PASSWORD가 설정되지 않았습니다.")
         st.stop()
     token = auth_token(expected)
-
-    # 새로고침 시에는 Streamlit이 최초 HTTP 요청에서 받은 브라우저 쿠키를
-    # 동기적으로 읽는다. extra_streamlit_components.get_all()의 렌더링 타이밍에
-    # 의존하지 않으므로 모바일 새로고침에서도 로그인 상태를 안정적으로 복원한다.
-    saved_token = None
-    try:
-        saved_token = st.context.cookies.get("hj_auth")
-    except Exception:
-        # 구형 Streamlit 대비 fallback. 로그인 직후 같은 세션에서는
-        # session_state가 우선이고, 필요 시 CookieManager의 현재 캐시를 확인한다.
-        try:
-            saved_token = cookie_manager.get("hj_auth")
-        except Exception:
-            saved_token = None
-
-    # iOS/Safari에서 컴포넌트 쿠키가 새로고침 후 상위 Streamlit 요청에
-    # 전달되지 않는 경우를 대비해 URL의 서명 토큰도 로그인 유지 수단으로 사용한다.
-    query_token = str(st.query_params.get("hj_auth", "") or "")
-    if (
-        st.session_state.get("authenticated")
-        or saved_token == token
-        or query_token == token
-    ):
+    if st.session_state.get("authenticated") or cookie_manager.get("hj_auth") == token:
         st.session_state.authenticated = True
         return
     st.title("🔒 HJ Trader")
@@ -138,19 +116,7 @@ def require_password() -> None:
         if password == expected:
             st.session_state.authenticated = True
             if keep:
-                # 쿠키도 유지하되, 모바일 Safari 새로고침 대비용으로 URL 토큰을 함께 둔다.
-                try:
-                    cookie_manager.set(
-                        "hj_auth",
-                        token,
-                        max_age=7 * 24 * 60 * 60,
-                        path="/",
-                        same_site="lax",
-                        key="set_auth",
-                    )
-                except Exception:
-                    pass
-                st.query_params["hj_auth"] = token
+                cookie_manager.set("hj_auth", token, max_age=7 * 24 * 60 * 60, key="set_auth")
             st.rerun()
         else:
             st.error("비밀번호가 맞지 않습니다.")
@@ -694,12 +660,7 @@ if view_mode not in {"OKX PAPER만 보기", "Bybit Swing PAPER만 보기"}:
         use_container_width=True,
     )
     if col_logout.button("로그아웃", use_container_width=True):
-        try:
-            cookie_manager.delete("hj_auth", key="delete_auth")
-        except Exception:
-            pass
-        if "hj_auth" in st.query_params:
-            del st.query_params["hj_auth"]
+        cookie_manager.delete("hj_auth", key="delete_auth")
         st.session_state.authenticated = False
         st.rerun()
 
@@ -1662,20 +1623,16 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
     if BYBIT_SWING_CONFIG.exists():
         try:
             bs_cfg = json.loads(BYBIT_SWING_CONFIG.read_text(encoding="utf-8"))
-            bs_mode = str(bs_cfg.get("mode", "paper")).strip().lower()
             st.info(
-                f"모드 {bs_mode.upper()} · 격리 {bs_cfg.get('leverage',5)}배 · "
-                f"동시 {bs_cfg.get('max_positions',2)}종목 · 1회 증거금 {bs_cfg.get('position_margin_usdt',27)} USDT"
+                f"모드 {str(bs_cfg.get('mode','paper')).upper()} · 격리 {bs_cfg.get('leverage',5)}배 · "
+                f"동시 {bs_cfg.get('max_positions',2)}종목 · 1회 증거금 {bs_cfg.get('position_margin_usdt',54)} USDT"
             )
             st.write(
                 f"TP1 +{bs_cfg.get('tp1_pct',1.5)}% 절반 · TP2 +{bs_cfg.get('tp2_pct',3.0)}% 나머지 · "
                 f"손절 -{bs_cfg.get('hard_stop_pct',1.5)}% · 최대 {bs_cfg.get('max_hold_hours',3)}시간"
             )
             st.caption("강화 조건: 최근 1시간 0.5% 이상 움직임 · 반등 다음 봉 유지 확인 · 3봉 거래량 연속감소 제외")
-            if bs_mode == "live":
-                st.error("🔴 현재 LIVE 모드: 실제 Bybit 주문이 발생합니다.")
-            else:
-                st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
+            st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
             tg_on = bool(bs_cfg.get("telegram_enabled", False))
             st.caption(
                 "텔레그램 알림: " + ("사용 설정됨" if tg_on else "꺼짐") +
@@ -1689,35 +1646,10 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
             with sqlite3.connect(BYBIT_SWING_DB) as conn:
                 conn.row_factory = sqlite3.Row
                 positions = conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
-
-                # PAPER와 LIVE 기록을 섞지 않는다.
-                # LIVE 전환 직후에는 live 이벤트가 없으므로 누적/오늘 손익/진입이 0부터 시작한다.
-                stats_mode = str(bs_cfg.get("mode", "paper")).strip().lower()
-                recent_events = conn.execute(
-                    "SELECT * FROM bot_events WHERE lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 60",
-                    (stats_mode,),
-                ).fetchall()
-                history = conn.execute(
-                    "SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' AND lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 500",
-                    (stats_mode,),
-                ).fetchall()
-                today = conn.execute(
-                    """SELECT
-                           SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END),
-                           COALESCE(SUM(realized_pnl),0)
-                       FROM bot_events
-                       WHERE substr(ts,1,10)=date('now')
-                         AND lower(COALESCE(mode,''))=?""",
-                    (stats_mode,),
-                ).fetchone()
-                cumulative = conn.execute(
-                    """SELECT
-                           COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END),
-                           COALESCE(SUM(realized_pnl),0)
-                       FROM bot_events
-                       WHERE lower(COALESCE(mode,''))=?""",
-                    (stats_mode,),
-                ).fetchone()
+                recent_events = conn.execute("SELECT * FROM bot_events ORDER BY id DESC LIMIT 60").fetchall()
+                history = conn.execute("SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' ORDER BY id DESC LIMIT 500").fetchall()
+                today = conn.execute("SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(ts,1,10)=date('now')").fetchone()
+                cumulative = conn.execute("SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0) FROM bot_events").fetchone()
 
             paused = _bs_state_get("pause_new_entries", "0") == "1"
             shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
@@ -1732,10 +1664,9 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 _bs_state_set("pause_new_entries","1"); _bs_state_set("shutdown_when_flat","1"); st.rerun()
 
             m0,m1,m2,m3=st.columns(4)
-            stats_label = "실전" if str(bs_cfg.get("mode","paper")).strip().lower() == "live" else "PAPER"
-            m0.metric(f"{stats_label} 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
-            m1.metric(f"오늘 {stats_label} 진입",f"{int(today[0] or 0)}회")
-            m2.metric(f"오늘 {stats_label} 확정손익",f"{float(today[1] or 0):+.2f} USDT")
+            m0.metric("전체 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
+            m1.metric("오늘 진입",f"{int(today[0] or 0)}회")
+            m2.metric("오늘 확정손익",f"{float(today[1] or 0):+.2f} USDT")
             m3.metric("현재 포지션",str(len(positions)))
 
             symbol_types = cached_symbol_types()
@@ -1876,18 +1807,26 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 )
                 st.caption("파일에는 진입·추가·회수·TP·손절 시간(KST), 손익과 진입 당시 지표가 포함됩니다.")
 
-                scan_csv_path = Path(__file__).with_name("bybit_swing") / "scan_rejected.csv"
-                if scan_csv_path.exists():
+
+            # SCAN CSV는 당일 체결이 0건이어도 항상 받을 수 있어야 한다.
+            # (기존에는 export_rows가 비면 버튼 자체가 사라지는 문제가 있었다.)
+            scan_csv_path = Path(__file__).with_name("bybit_swing") / "scan_rejected.csv"
+            if scan_csv_path.exists():
+                try:
+                    scan_bytes = scan_csv_path.read_bytes()
                     st.download_button(
                         "📥 SCAN CSV",
-                        scan_csv_path.read_bytes(),
+                        scan_bytes,
                         file_name=f"scan_rejected_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.csv",
                         mime="text/csv",
                         use_container_width=True,
                         key="bs_scan_csv_download",
                     )
-                else:
-                    st.caption("SCAN CSV file not found.")
+                    st.caption(f"SCAN CSV 최신 크기: {len(scan_bytes):,} bytes")
+                except Exception as exc:
+                    st.warning(f"SCAN CSV 읽기 오류: {exc}")
+            else:
+                st.caption(f"SCAN CSV file not found: {scan_csv_path}")
 
             grouped={}
             for e in reversed(list(history)):
