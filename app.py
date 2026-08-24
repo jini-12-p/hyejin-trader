@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.6-ScanCSV-AlwaysDownload"
+APP_VERSION = "STABLE-v4.3.11-LiveStable"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -105,21 +105,52 @@ def require_password() -> None:
     if not expected:
         st.error("APP_PASSWORD가 설정되지 않았습니다.")
         st.stop()
+
     token = auth_token(expected)
-    if st.session_state.get("authenticated") or cookie_manager.get("hj_auth") == token:
+
+    saved_token = None
+    try:
+        saved_token = st.context.cookies.get("hj_auth")
+    except Exception:
+        try:
+            saved_token = cookie_manager.get("hj_auth")
+        except Exception:
+            saved_token = None
+
+    query_token = str(st.query_params.get("hj_auth", "") or "")
+
+    if (
+        st.session_state.get("authenticated")
+        or saved_token == token
+        or query_token == token
+    ):
         st.session_state.authenticated = True
         return
+
     st.title("🔒 HJ Trader")
     password = st.text_input("비밀번호", type="password")
     keep = st.checkbox("이 기기에서 7일간 로그인 유지", value=True)
+
     if st.button("로그인", use_container_width=True):
         if password == expected:
             st.session_state.authenticated = True
             if keep:
-                cookie_manager.set("hj_auth", token, max_age=7 * 24 * 60 * 60, key="set_auth")
+                try:
+                    cookie_manager.set(
+                        "hj_auth",
+                        token,
+                        max_age=7 * 24 * 60 * 60,
+                        path="/",
+                        same_site="lax",
+                        key="set_auth",
+                    )
+                except Exception:
+                    pass
+                st.query_params["hj_auth"] = token
             st.rerun()
         else:
             st.error("비밀번호가 맞지 않습니다.")
+
     st.stop()
 
 
@@ -660,7 +691,12 @@ if view_mode not in {"OKX PAPER만 보기", "Bybit Swing PAPER만 보기"}:
         use_container_width=True,
     )
     if col_logout.button("로그아웃", use_container_width=True):
-        cookie_manager.delete("hj_auth", key="delete_auth")
+        try:
+            cookie_manager.delete("hj_auth", key="delete_auth")
+        except Exception:
+            pass
+        if "hj_auth" in st.query_params:
+            del st.query_params["hj_auth"]
         st.session_state.authenticated = False
         st.rerun()
 
@@ -1632,7 +1668,10 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 f"손절 -{bs_cfg.get('hard_stop_pct',1.5)}% · 최대 {bs_cfg.get('max_hold_hours',3)}시간"
             )
             st.caption("강화 조건: 최근 1시간 0.5% 이상 움직임 · 반등 다음 봉 유지 확인 · 3봉 거래량 연속감소 제외")
-            st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
+            if str(bs_cfg.get("mode", "paper")).strip().lower() == "live":
+                st.error("🔴 현재 LIVE 모드: 실제 Bybit 주문이 발생합니다.")
+            else:
+                st.success("현재 PAPER 모드: Bybit 시세로 모의기록하며 실제 주문은 발생하지 않습니다.")
             tg_on = bool(bs_cfg.get("telegram_enabled", False))
             st.caption(
                 "텔레그램 알림: " + ("사용 설정됨" if tg_on else "꺼짐") +
@@ -1645,11 +1684,29 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
         try:
             with sqlite3.connect(BYBIT_SWING_DB) as conn:
                 conn.row_factory = sqlite3.Row
+                stats_mode = str(bs_cfg.get("mode", "paper")).strip().lower()
                 positions = conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
-                recent_events = conn.execute("SELECT * FROM bot_events ORDER BY id DESC LIMIT 60").fetchall()
-                history = conn.execute("SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' ORDER BY id DESC LIMIT 500").fetchall()
-                today = conn.execute("SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0) FROM bot_events WHERE substr(ts,1,10)=date('now')").fetchone()
-                cumulative = conn.execute("SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0) FROM bot_events").fetchone()
+                recent_events = conn.execute(
+                    "SELECT * FROM bot_events WHERE lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 60",
+                    (stats_mode,),
+                ).fetchall()
+                history = conn.execute(
+                    "SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' AND lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 500",
+                    (stats_mode,),
+                ).fetchall()
+                today = conn.execute(
+                    """SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0)
+                       FROM bot_events
+                       WHERE substr(ts,1,10)=date('now')
+                         AND lower(COALESCE(mode,''))=?""",
+                    (stats_mode,),
+                ).fetchone()
+                cumulative = conn.execute(
+                    """SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0)
+                       FROM bot_events
+                       WHERE lower(COALESCE(mode,''))=?""",
+                    (stats_mode,),
+                ).fetchone()
 
             paused = _bs_state_get("pause_new_entries", "0") == "1"
             shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
@@ -1664,9 +1721,10 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 _bs_state_set("pause_new_entries","1"); _bs_state_set("shutdown_when_flat","1"); st.rerun()
 
             m0,m1,m2,m3=st.columns(4)
-            m0.metric("전체 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
-            m1.metric("오늘 진입",f"{int(today[0] or 0)}회")
-            m2.metric("오늘 확정손익",f"{float(today[1] or 0):+.2f} USDT")
+            stats_label = "LIVE" if str(bs_cfg.get("mode", "paper")).strip().lower() == "live" else "PAPER"
+            m0.metric(f"{stats_label} 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
+            m1.metric(f"오늘 {stats_label} 진입",f"{int(today[0] or 0)}회")
+            m2.metric(f"오늘 {stats_label} 확정손익",f"{float(today[1] or 0):+.2f} USDT")
             m3.metric("현재 포지션",str(len(positions)))
 
             symbol_types = cached_symbol_types()
@@ -1751,7 +1809,7 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                             st.success("수동 종료 요청을 보냈습니다. 봇이 다음 관리 주기에 처리합니다.")
                             st.rerun()
             if not positions:
-                st.info("현재 Bybit Swing PAPER 보유 포지션이 없습니다.")
+                st.info(f"현재 Bybit Swing {stats_label} 보유 포지션이 없습니다.")
 
             st.markdown("### 📒 매매기록")
 
@@ -1790,9 +1848,16 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                     'entry_reason': d.get('entry_reason',''),
                     'details_json': json.dumps(d,ensure_ascii=False),
                 })
-            if export_rows:
+            if True:
                 out=io.StringIO()
-                writer=csv.DictWriter(out,fieldnames=list(export_rows[0].keys()))
+                writer=csv.DictWriter(out,fieldnames=(list(export_rows[0].keys()) if export_rows else [
+                    "time_kst","trade_id","symbol","event","strategy","price","qty",
+                    "realized_pnl_usdt","entry_price","avg_at_exit",
+                    "configured_trigger_price","detected_market_price","score","rsi",
+                    "ema9","ema20","ema60","volume_ratio","change_24h_pct",
+                    "recent_1h_move_pct","recent_4h_range_pct","pullback_pct",
+                    "rebound_pct","entry_reason","details_json"
+                ]))
                 writer.writeheader(); writer.writerows(export_rows)
                 dl1,dl2=st.columns(2)
                 dl1.download_button(
