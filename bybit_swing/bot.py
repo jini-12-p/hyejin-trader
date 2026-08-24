@@ -2460,11 +2460,70 @@ class DailyBot:
             return
         if self.cfg.mode == "live" and not self.client.private_configured:
             raise BybitSwingError("LIVE 모드인데 API 설정이 없습니다.")
-        self.client.set_leverage(symbol, self.cfg.leverage, self.cfg.margin_mode, "long")
-        self.client.place_market_order(
-            symbol, side, f"{qty:.8f}", self.cfg.margin_mode, "long", reduce_only,
-            client_order_id=f"HJ{int(time.time())}{symbol[:4]}"
+
+        # LIVE 주문 전 종목별 주문 규칙을 조회한다.
+        # 신규 BUY는 설정 레버리지(기본 5배)와 거래소 허용 최대 레버리지 중 낮은 값을 사용하고,
+        # 모든 주문 수량은 해당 종목의 qtyStep에 맞춰 내림 처리한다.
+        url = (
+            "https://api.bybit.com/v5/market/instruments-info?"
+            + urllib.parse.urlencode({"category": "linear", "symbol": symbol})
         )
+        try:
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = payload.get("result", {}).get("list", [])
+            if not rows:
+                raise BybitSwingError(f"{symbol}: 주문 규칙을 찾지 못했습니다.")
+
+            rule = rows[0]
+            lot = rule.get("lotSizeFilter", {})
+            lev_filter = rule.get("leverageFilter", {})
+            qty_step = float(lot.get("qtyStep") or 0)
+            min_qty = float(lot.get("minOrderQty") or qty_step or 0)
+            max_leverage = float(lev_filter.get("maxLeverage") or self.cfg.leverage)
+
+            if qty_step <= 0:
+                raise BybitSwingError(f"{symbol}: qtyStep 확인 실패")
+
+            effective_leverage = min(float(self.cfg.leverage), max_leverage)
+            if effective_leverage <= 0:
+                raise BybitSwingError(f"{symbol}: 사용 가능한 레버리지를 확인하지 못했습니다.")
+
+            order_qty = float(qty)
+            if side.lower() == "buy" and not reduce_only:
+                # qty는 설정 레버리지 기준으로 계산되어 들어오므로,
+                # 거래소 최대 레버리지가 더 낮은 종목은 같은 증거금 기준으로 수량을 축소한다.
+                order_qty *= effective_leverage / float(self.cfg.leverage)
+
+            order_qty = math.floor((order_qty + 1e-12) / qty_step) * qty_step
+            if order_qty <= 0:
+                raise BybitSwingError(f"{symbol}: 보정 후 주문수량이 0입니다.")
+            if side.lower() == "buy" and not reduce_only and order_qty < min_qty:
+                raise BybitSwingError(
+                    f"{symbol}: 주문수량 {order_qty}가 최소수량 {min_qty}보다 작습니다."
+                )
+
+            if not reduce_only:
+                try:
+                    self.client.set_leverage(
+                        symbol, effective_leverage, self.cfg.margin_mode, "long"
+                    )
+                except BybitSwingError as exc:
+                    msg = str(exc).lower()
+                    # 이미 동일한 레버리지면 오류가 아니라 정상 상태로 보고 주문을 계속한다.
+                    if "110043" not in msg and "not modified" not in msg:
+                        raise
+
+            qty_text = f"{order_qty:.12f}".rstrip("0").rstrip(".")
+            self.client.place_market_order(
+                symbol, side, qty_text, self.cfg.margin_mode, "long", reduce_only,
+                client_order_id=f"HJ{int(time.time())}{symbol[:4]}"
+            )
+
+        except BybitSwingError:
+            raise
+        except Exception as exc:
+            raise BybitSwingError(f"{symbol}: LIVE 주문규칙 처리 오류: {exc}") from exc
 
     def _open(self, symbol: str, price: float, strategy: str, score: float, signal_details: dict[str, Any] | None = None) -> None:
         entry_margin = self.cfg.hj_position_margin_usdt if strategy == "HJ" else self.cfg.position_margin_usdt

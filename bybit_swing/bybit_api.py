@@ -24,8 +24,32 @@ class BybitSwingClient:
     """
 
     def __init__(self, api_key: str = "", secret_key: str = "", demo: bool = True):
-        self.api_key = api_key or os.getenv("BYBIT_SWING_API_KEY", "")
-        self.secret_key = secret_key or os.getenv("BYBIT_SWING_API_SECRET", "")
+        # 프로젝트 루트의 .env를 직접 읽어 Swing 봇에서도 기존 Bybit API 변수를 인식한다.
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as env_file:
+                    for line in env_file:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        os.environ.setdefault(key, value)
+            except OSError:
+                pass
+
+        self.api_key = (
+            api_key
+            or os.getenv("BYBIT_SWING_API_KEY", "")
+            or os.getenv("BYBIT_API_KEY", "")
+        )
+        self.secret_key = (
+            secret_key
+            or os.getenv("BYBIT_SWING_API_SECRET", "")
+            or os.getenv("BYBIT_API_SECRET", "")
+        )
         self.demo = demo
         self.base_url = os.getenv("BYBIT_SWING_BASE_URL", "https://api.bybit.com")
         self.session = requests.Session()
