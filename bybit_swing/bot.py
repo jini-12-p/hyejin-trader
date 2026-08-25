@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.46-POnly-ScanCSVFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.48-LiveFillPnL-ExchangeBE"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -155,7 +155,9 @@ class DailyConfig:
     exchange_tp_preorders_enabled: bool = True
     exchange_tp_sync_seconds: float = 5.0
     hard_stop_pct: float = 1.5
-    breakeven_stop_pct: float = 0.1
+    # TP1 체결 후 남은 물량은 Bybit 거래소에 실제 평단보다 위쪽으로 보호 스탑을 건다.
+    # 0.15%는 시장가 진입/스탑 청산 수수료와 소폭 슬리피지 여유를 둔 기본값이다.
+    breakeven_stop_pct: float = 0.15
     staged_stop_enabled: bool = True
     stage1_stop_pct: float = 1.5
     stage1_stop_fraction: float = 0.5
@@ -2368,15 +2370,119 @@ class DailyBot:
             }, ensure_ascii=False)
         )
 
-    def _live_position_qty(self, symbol: str) -> float:
+    def _set_exchange_breakeven_stop(
+        self, symbol: str, base_price: float, entry_ts_ms: int
+    ) -> float:
+        """After TP1, arm an exchange-side full-position market stop above actual entry."""
+        if self.cfg.mode != "live":
+            return 0.0
+        if base_price <= 0:
+            raise BybitSwingError(f"{symbol}: 본절보호 기준 평단이 올바르지 않습니다.")
+
+        tick, _ = self._instrument_steps(symbol)
+        # 롱 보호스탑은 실제 체결평단보다 breakeven_stop_pct 만큼 위에 둔다.
+        stop_price = self._step_round(
+            base_price * (1 + float(self.cfg.breakeven_stop_pct) / 100.0),
+            tick,
+        )
+        if stop_price <= 0:
+            raise BybitSwingError(f"{symbol}: 본절보호 스탑 가격 계산 실패")
+
+        self._private_v5("POST", "/v5/position/trading-stop", {
+            "category": "linear",
+            "symbol": symbol,
+            "tpslMode": "Full",
+            "stopLoss": f"{stop_price:.12f}".rstrip("0").rstrip("."),
+            "slTriggerBy": "LastPrice",
+            "slOrderType": "Market",
+            "positionIdx": 0,
+        })
+
+        state_set(f"exchange_be_{symbol}_{entry_ts_ms}", "1")
+        log_event(
+            symbol, "EXCHANGE_BE_ARMED", stop_price, 0, self.cfg.mode,
+            details=json.dumps({
+                "base_price": base_price,
+                "stop_price": stop_price,
+                "buffer_pct": float(self.cfg.breakeven_stop_pct),
+                "source": "bybit_trading_stop",
+            }, ensure_ascii=False),
+        )
+        return stop_price
+
+    def _live_position_snapshot(self, symbol: str) -> dict[str, float]:
+        """Return the live long position size/average price from Bybit."""
         payload = self._private_v5("GET", "/v5/position/list", {
             "category": "linear",
             "symbol": symbol,
         })
         for item in payload.get("result", {}).get("list", []):
             if str(item.get("side") or "").lower() == "buy" and int(item.get("positionIdx") or 0) in (0, 1):
-                return float(item.get("size") or 0)
-        return 0.0
+                return {
+                    "qty": float(item.get("size") or 0),
+                    "avg_price": float(item.get("avgPrice") or 0),
+                    "cur_realized_pnl": float(item.get("curRealisedPnl") or 0),
+                }
+        return {"qty": 0.0, "avg_price": 0.0, "cur_realized_pnl": 0.0}
+
+    def _live_position_qty(self, symbol: str) -> float:
+        return float(self._live_position_snapshot(symbol).get("qty") or 0)
+
+    def _wait_live_position_snapshot(self, symbol: str, min_qty: float = 0.0, tries: int = 20) -> dict[str, float]:
+        """Poll briefly after a market order so DB/TP use the actual Bybit fill average."""
+        last = {"qty": 0.0, "avg_price": 0.0, "cur_realized_pnl": 0.0}
+        for _ in range(max(1, int(tries))):
+            last = self._live_position_snapshot(symbol)
+            qty = float(last.get("qty") or 0)
+            avg = float(last.get("avg_price") or 0)
+            if qty > max(0.0, float(min_qty)) and avg > 0:
+                return last
+            time.sleep(0.20)
+        return last
+
+    def _live_closed_pnl_summary(self, symbol: str, entry_ts_ms: int) -> tuple[float, float]:
+        """Return Bybit Closed P&L total and latest actual exit price for this trade.
+
+        Bybit Closed P&L is the account-side realised result including trading/funding fees.
+        The bot trade duration is well below the API's 7-day query-window limit.
+        """
+        start_ms = max(0, int(entry_ts_ms) - 5000)
+        end_ms = int(time.time() * 1000)
+        payload = self._private_v5("GET", "/v5/position/closed-pnl", {
+            "category": "linear",
+            "symbol": symbol,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": 100,
+        })
+        rows = payload.get("result", {}).get("list", [])
+        total = 0.0
+        latest_price = 0.0
+        latest_ts = -1
+        for item in rows:
+            try:
+                created = int(item.get("createdTime") or item.get("updatedTime") or 0)
+            except Exception:
+                created = 0
+            if created and created < start_ms:
+                continue
+            total += float(item.get("closedPnl") or 0)
+            if created >= latest_ts:
+                latest_ts = created
+                latest_price = float(item.get("avgExitPrice") or 0)
+        return total, latest_price
+
+    def _wait_live_closed_pnl_summary(
+        self, symbol: str, entry_ts_ms: int, previous_total: float, tries: int = 15
+    ) -> tuple[float, float]:
+        """Poll briefly because Closed P&L can appear just after a market/TP fill."""
+        last_total, last_price = float(previous_total), 0.0
+        for _ in range(max(1, int(tries))):
+            last_total, last_price = self._live_closed_pnl_summary(symbol, entry_ts_ms)
+            if abs(last_total - float(previous_total)) > 1e-10:
+                return last_total, last_price
+            time.sleep(0.20)
+        return last_total, last_price
 
     def _sync_exchange_tp_fill(self, row: sqlite3.Row, price: float) -> sqlite3.Row | None:
         """Reconcile exchange-side TP fills into local DB before local stop/TP logic."""
@@ -2412,8 +2518,18 @@ class DailyBot:
         # 거래소 포지션이 사라졌다면 TP2까지 체결됐거나 외부에서 종료된 상태.
         if actual_qty <= tol and db_qty > tol:
             if int(row["tp1_done"] or 0) == 1 or price >= tp2_price * 0.995:
-                realized_step = (tp2_price - float(row["avg_price"])) * db_qty
-                total_realized = float(row["realized_pnl"] or 0) + realized_step
+                previous_realized = float(row["realized_pnl"] or 0)
+                try:
+                    total_realized, actual_exit_price = self._wait_live_closed_pnl_summary(
+                        row["symbol"], int(row["entry_ts_ms"] or 0), previous_realized
+                    )
+                    realized_step = total_realized - previous_realized
+                    if actual_exit_price > 0:
+                        tp2_price = actual_exit_price
+                except Exception as exc:
+                    log_event(row["symbol"], "LIVE_PNL_SYNC_ERROR", price, 0, self.cfg.mode, details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
+                    realized_step = (tp2_price - float(row["avg_price"])) * db_qty
+                    total_realized = previous_realized + realized_step
                 with db() as conn:
                     conn.execute(
                         "UPDATE bot_positions SET status='CLOSED',total_qty=0,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
@@ -2437,13 +2553,40 @@ class DailyBot:
         # 거래소 수량이 대략 절반으로 줄었다면 TP1 선주문 체결로 본다.
         if int(row["tp1_done"] or 0) == 0 and actual_qty < db_qty - tol and actual_qty <= base_qty * 0.60 + tol:
             closed_qty = max(0.0, db_qty - actual_qty)
-            realized_step = (tp1_price - float(row["avg_price"])) * closed_qty
-            total_realized = float(row["realized_pnl"] or 0) + realized_step
+            previous_realized = float(row["realized_pnl"] or 0)
+            try:
+                total_realized, actual_exit_price = self._wait_live_closed_pnl_summary(
+                    row["symbol"], int(row["entry_ts_ms"] or 0), previous_realized
+                )
+                realized_step = total_realized - previous_realized
+                if actual_exit_price > 0:
+                    tp1_price = actual_exit_price
+            except Exception as exc:
+                log_event(row["symbol"], "LIVE_PNL_SYNC_ERROR", price, 0, self.cfg.mode, details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
+                realized_step = (tp1_price - float(row["avg_price"])) * closed_qty
+                total_realized = previous_realized + realized_step
             with db() as conn:
                 conn.execute(
                     "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
                     (actual_qty, utc_now(), tp1_price, "TP1", total_realized, row["symbol"]),
                 )
+
+            # TP1 체결을 확인한 즉시 남은 물량의 본절보호를 거래소에 직접 등록한다.
+            try:
+                snap = self._live_position_snapshot(row["symbol"])
+                live_avg = float(snap.get("avg_price") or 0)
+                be_base = live_avg if live_avg > 0 else float(row["avg_price"] or base_price)
+                self._set_exchange_breakeven_stop(
+                    row["symbol"], be_base, int(row["entry_ts_ms"] or 0)
+                )
+            except Exception as exc:
+                # 실패 시 아래 로컬 BE 감시가 안전망으로 남는다.
+                log_event(
+                    row["symbol"], "EXCHANGE_BE_ERROR", price, 0, self.cfg.mode,
+                    details=str(exc), strategy=row["strategy"] or "",
+                    trade_id=row["trade_id"] or "",
+                )
+
             log_event(
                 row["symbol"], "TP1", tp1_price, closed_qty, self.cfg.mode,
                 details=json.dumps({"source": "exchange_preorder_sync"}, ensure_ascii=False),
@@ -2455,9 +2598,9 @@ class DailyBot:
 
         return row
 
-    def _execute(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> None:
+    def _execute(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> float:
         if self.cfg.mode == "paper":
-            return
+            return float(qty)
         if self.cfg.mode == "live" and not self.client.private_configured:
             raise BybitSwingError("LIVE 모드인데 API 설정이 없습니다.")
 
@@ -2519,6 +2662,7 @@ class DailyBot:
                 symbol, side, qty_text, self.cfg.margin_mode, "long", reduce_only,
                 client_order_id=f"HJ{int(time.time())}{symbol[:4]}"
             )
+            return float(order_qty)
 
         except BybitSwingError:
             raise
@@ -2527,10 +2671,23 @@ class DailyBot:
 
     def _open(self, symbol: str, price: float, strategy: str, score: float, signal_details: dict[str, Any] | None = None) -> None:
         entry_margin = self.cfg.hj_position_margin_usdt if strategy == "HJ" else self.cfg.position_margin_usdt
-        qty = qty_from_margin(price, entry_margin, self.cfg.leverage)
-        self._execute(symbol, "buy", qty)
-        trade_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+        requested_qty = qty_from_margin(price, entry_margin, self.cfg.leverage)
         entry_ts_ms = int(time.time() * 1000)
+        executed_qty = self._execute(symbol, "buy", requested_qty)
+
+        actual_entry_price = float(price)
+        actual_qty = float(executed_qty)
+        if self.cfg.mode == "live":
+            try:
+                snap = self._wait_live_position_snapshot(symbol, min_qty=0.0)
+                if float(snap.get("avg_price") or 0) > 0:
+                    actual_entry_price = float(snap["avg_price"])
+                if float(snap.get("qty") or 0) > 0:
+                    actual_qty = float(snap["qty"])
+            except Exception as exc:
+                log_event(symbol, "LIVE_FILL_SYNC_ERROR", price, executed_qty, self.cfg.mode, details=str(exc), strategy=strategy)
+
+        trade_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
         with db() as conn:
             conn.execute("DELETE FROM bot_positions WHERE symbol=?", (symbol,))
             conn.execute(
@@ -2539,14 +2696,15 @@ class DailyBot:
                     last_price,unrealized_pct,note,strategy,realized_pnl,entry_date_kst,
                     base_entry_price,base_qty,add_qty,add_price,lowest_price,highest_price,cycle_anchor_price,trade_id,stop_stage1_done,entry_ts_ms
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (symbol, "OPEN", utc_now(), utc_now(), price, qty, entry_margin, 0, 0,
-                 price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
-                 price, qty, 0.0, 0.0, price, price, price, trade_id, 0, entry_ts_ms),
+                (symbol, "OPEN", utc_now(), utc_now(), actual_entry_price, actual_qty, entry_margin, 0, 0,
+                 actual_entry_price, 0.0, f"{strategy}형 데일리 진입", strategy, 0.0, trading_day(),
+                 actual_entry_price, actual_qty, 0.0, 0.0, actual_entry_price, actual_entry_price, actual_entry_price, trade_id, 0, entry_ts_ms),
             )
         signal_details = signal_details or {}
         details = json.dumps({
-            "entry_price": price, "margin_usdt": entry_margin,
-            "leverage": self.cfg.leverage, "qty": qty, "score": round(score, 2),
+            "signal_price": price, "entry_price": actual_entry_price, "actual_fill_price": actual_entry_price,
+            "margin_usdt": entry_margin, "leverage": self.cfg.leverage, "qty": actual_qty,
+            "requested_qty": requested_qty, "executed_qty": executed_qty, "score": round(score, 2),
             "strategy": strategy,
             "rsi": signal_details.get("rsi"),
             "ema9": signal_details.get("ema9"),
@@ -2564,14 +2722,12 @@ class DailyBot:
             "entry_reason": signal_details.get("reason") or signal_details.get("entry_reason") or "조건 통과",
             "signal_snapshot": signal_details,
         }, ensure_ascii=False)
-        log_event(symbol, "ENTRY", price, qty, self.cfg.mode, details, strategy, trade_id=trade_id)
+        log_event(symbol, "ENTRY", actual_entry_price, actual_qty, self.cfg.mode, details, strategy, trade_id=trade_id)
         try:
-            self._place_exchange_tp_orders(symbol, price, qty, entry_ts_ms)
+            self._place_exchange_tp_orders(symbol, actual_entry_price, actual_qty, entry_ts_ms)
         except Exception as exc:
-            # 진입 자체는 이미 완료되었으므로 TP 선주문 실패를 명확히 기록하고
-            # 기존 1초 감시 TP 로직을 백업으로 유지한다.
             log_event(
-                symbol, "EXCHANGE_TP_PLACE_ERROR", price, qty, self.cfg.mode,
+                symbol, "EXCHANGE_TP_PLACE_ERROR", actual_entry_price, actual_qty, self.cfg.mode,
                 details=str(exc), strategy=strategy, trade_id=trade_id
             )
 
@@ -2584,10 +2740,22 @@ class DailyBot:
         add_qty = qty_from_margin(price, add_margin, self.cfg.leverage)
         if add_qty <= 0:
             return
-        self._execute(row["symbol"], "buy", add_qty)
+        executed_add_qty = self._execute(row["symbol"], "buy", add_qty)
         old_qty = float(row["total_qty"])
-        new_qty = old_qty + add_qty
-        new_avg = (old_avg * old_qty + price * add_qty) / new_qty
+        new_qty = old_qty + executed_add_qty
+        new_avg = (old_avg * old_qty + price * executed_add_qty) / new_qty
+        actual_add_price = float(price)
+        if self.cfg.mode == "live":
+            try:
+                snap = self._wait_live_position_snapshot(row["symbol"], min_qty=old_qty)
+                if float(snap.get("qty") or 0) > old_qty:
+                    new_qty = float(snap["qty"])
+                if float(snap.get("avg_price") or 0) > 0:
+                    new_avg = float(snap["avg_price"])
+                    if executed_add_qty > 0:
+                        actual_add_price = max(0.0, (new_avg * new_qty - old_avg * old_qty) / executed_add_qty)
+            except Exception as exc:
+                log_event(row["symbol"], "LIVE_FILL_SYNC_ERROR", price, executed_add_qty, self.cfg.mode, details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
         now = datetime.now(timezone.utc)
         add_bucket = str(int(now.timestamp()) // 900)
         with db() as conn:
@@ -2595,13 +2763,13 @@ class DailyBot:
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,dca_count=?,
                    add_qty=?,add_price=?,updated_at=?,last_price=?,note=?,last_add_15m_bucket=? WHERE symbol=?""",
                 (new_avg, new_qty, float(row["total_margin"]) + add_margin,
-                 int(row["dca_count"] or 0) + 1, add_qty, price, utc_now(), price,
+                 int(row["dca_count"] or 0) + 1, executed_add_qty, actual_add_price, utc_now(), actual_add_price,
                  "반등 확인 후 순환 추가진입", add_bucket, row["symbol"]),
             )
-        details = json.dumps({"add_price": price, "add_margin_usdt": add_margin,
-                              "add_qty": add_qty, "previous_avg": old_avg, "new_avg": new_avg,
+        details = json.dumps({"signal_add_price": price, "add_price": actual_add_price, "add_margin_usdt": add_margin,
+                              "add_qty": executed_add_qty, "previous_avg": old_avg, "new_avg": new_avg,
                               "cycle_no": int(row["dca_count"] or 0) + 1}, ensure_ascii=False)
-        log_event(row["symbol"], "REBOUND_ADD", price, add_qty, self.cfg.mode,
+        log_event(row["symbol"], "REBOUND_ADD", actual_add_price, executed_add_qty, self.cfg.mode,
                   details=details, strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
         try:
             self._place_exchange_tp_orders(
@@ -2615,11 +2783,28 @@ class DailyBot:
         add_qty = float(row["add_qty"] or 0)
         if add_qty <= 0:
             return
-        self._execute(row["symbol"], "sell", add_qty, reduce_only=True)
-        pnl_usdt = (price - float(row["add_price"] or row["avg_price"])) * add_qty
-        remaining = max(0.0, float(row["total_qty"]) - add_qty)
+        executed_qty = self._execute(row["symbol"], "sell", add_qty, reduce_only=True)
+        remaining = max(0.0, float(row["total_qty"]) - executed_qty)
         base_price = float(row["base_entry_price"] or row["avg_price"])
-        total_realized = float(row["realized_pnl"] or 0) + pnl_usdt
+        previous_realized = float(row["realized_pnl"] or 0)
+        actual_exit_price = float(price)
+        if self.cfg.mode == "live":
+            try:
+                total_realized, live_exit_price = self._wait_live_closed_pnl_summary(
+                    row["symbol"], int(row["entry_ts_ms"] or 0), previous_realized
+                )
+                pnl_usdt = total_realized - previous_realized
+                if live_exit_price > 0:
+                    actual_exit_price = live_exit_price
+                snap = self._live_position_snapshot(row["symbol"])
+                remaining = float(snap.get("qty") or remaining)
+            except Exception as exc:
+                log_event(row["symbol"], "LIVE_PNL_SYNC_ERROR", price, executed_qty, self.cfg.mode, details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
+                pnl_usdt = (price - float(row["add_price"] or row["avg_price"])) * executed_qty
+                total_realized = previous_realized + pnl_usdt
+        else:
+            pnl_usdt = (price - float(row["add_price"] or row["avg_price"])) * executed_qty
+            total_realized = previous_realized + pnl_usdt
         with db() as conn:
             conn.execute(
                 """UPDATE bot_positions SET avg_price=?,total_qty=?,total_margin=?,add_qty=0,add_price=0,
@@ -2628,11 +2813,11 @@ class DailyBot:
                  utc_now(), price, "순환 추가분 정리 · 최초 물량 유지", total_realized,
                  price, price, price, row["symbol"]),
             )
-        details = json.dumps({"add_entry_price": float(row["add_price"] or 0), "reduce_price": price,
-                              "reduced_qty": add_qty, "avg_before_reduce": float(row["avg_price"]),
+        details = json.dumps({"add_entry_price": float(row["add_price"] or 0), "reduce_price": actual_exit_price,
+                              "reduced_qty": executed_qty, "avg_before_reduce": float(row["avg_price"]),
                               "restored_base_avg": base_price, "remaining_qty": remaining,
                               "cycle_realized_pnl": pnl_usdt}, ensure_ascii=False)
-        log_event(row["symbol"], "CYCLE_REDUCE", price, add_qty, self.cfg.mode,
+        log_event(row["symbol"], "CYCLE_REDUCE", actual_exit_price, executed_qty, self.cfg.mode,
                   details=details, strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
                   trade_id=row["trade_id"] or "")
         try:
@@ -2646,48 +2831,68 @@ class DailyBot:
     def _close(self, row: sqlite3.Row, price: float, fraction: float, reason: str,
                detected_price: float | None = None, trigger_price: float | None = None) -> None:
         current_qty = float(row["total_qty"])
-        qty = current_qty * fraction
+        requested_qty = current_qty * fraction
         if reason not in {"TP1", "TP2"}:
             self._cancel_exchange_tp_orders(row["symbol"], int(row["entry_ts_ms"] or 0))
-        self._execute(row["symbol"], "sell", qty, reduce_only=True)
-        pnl_usdt = (price - float(row["avg_price"])) * qty
-        remaining = max(0.0, current_qty - qty)
-        total_realized = float(row["realized_pnl"] or 0) + pnl_usdt
+        executed_qty = self._execute(row["symbol"], "sell", requested_qty, reduce_only=True)
+
+        previous_realized = float(row["realized_pnl"] or 0)
+        actual_exit_price = float(price)
+        remaining = max(0.0, current_qty - executed_qty)
+        if self.cfg.mode == "live":
+            try:
+                total_realized, live_exit_price = self._wait_live_closed_pnl_summary(
+                    row["symbol"], int(row["entry_ts_ms"] or 0), previous_realized
+                )
+                pnl_usdt = total_realized - previous_realized
+                if live_exit_price > 0:
+                    actual_exit_price = live_exit_price
+                snap = self._live_position_snapshot(row["symbol"])
+                remaining = float(snap.get("qty") or 0)
+            except Exception as exc:
+                log_event(row["symbol"], "LIVE_PNL_SYNC_ERROR", price, executed_qty, self.cfg.mode, details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
+                pnl_usdt = (price - float(row["avg_price"])) * executed_qty
+                total_realized = previous_realized + pnl_usdt
+        else:
+            pnl_usdt = (price - float(row["avg_price"])) * executed_qty
+            total_realized = previous_realized + pnl_usdt
+
         with db() as conn:
             if remaining <= 1e-12:
                 conn.execute(
                     "UPDATE bot_positions SET status='CLOSED',total_qty=0,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
-                    (utc_now(), price, reason, total_realized, row["symbol"]),
+                    (utc_now(), actual_exit_price, reason, total_realized, row["symbol"]),
                 )
             else:
                 if reason == "TP1":
                     conn.execute(
                         "UPDATE bot_positions SET total_qty=?,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
-                        (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
+                        (remaining, utc_now(), actual_exit_price, reason, total_realized, row["symbol"]),
                     )
                 elif reason == "STOP_HALF":
-                    # 1차 손절은 TP1 완료로 처리하지 않는다. 그렇지 않으면 다음 틱에 BE_EXIT가 잘못 발동한다.
                     conn.execute(
                         "UPDATE bot_positions SET total_qty=?,stop_stage1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
-                        (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
+                        (remaining, utc_now(), actual_exit_price, reason, total_realized, row["symbol"]),
                     )
                 else:
                     conn.execute(
                         "UPDATE bot_positions SET total_qty=?,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
-                        (remaining, utc_now(), price, reason, total_realized, row["symbol"]),
+                        (remaining, utc_now(), actual_exit_price, reason, total_realized, row["symbol"]),
                     )
-        details = json.dumps({"exit_price": price,
+        details = json.dumps({"exit_price": actual_exit_price,
                               "detected_market_price": detected_price if detected_price is not None else price,
                               "configured_trigger_price": trigger_price,
                               "avg_at_exit": float(row["avg_price"]),
                               "base_entry_price": float(row["base_entry_price"] or row["avg_price"]),
-                              "closed_qty": qty, "fraction": fraction, "remaining_qty": remaining,
+                              "closed_qty": executed_qty, "requested_qty": requested_qty,
+                              "fraction": fraction, "remaining_qty": remaining,
                               "step_realized_pnl": pnl_usdt, "trade_total_realized_pnl": total_realized,
+                              "pnl_source": "bybit_closed_pnl" if self.cfg.mode == "live" else "paper_calculation",
                               "reason": reason}, ensure_ascii=False)
-        log_event(row["symbol"], reason, price, qty, self.cfg.mode, details=details,
+        log_event(row["symbol"], reason, actual_exit_price, executed_qty, self.cfg.mode, details=details,
                   strategy=row["strategy"] or "", realized_pnl=pnl_usdt,
                   trade_id=row["trade_id"] or "")
-        self._register_stop_review(row, reason, price)
+        self._register_stop_review(row, reason, actual_exit_price)
 
     def _register_stop_review(self, row: sqlite3.Row, stop_event: str, stop_price: float) -> None:
         """손절 발생 후 15·30·60·120·180분 가격을 자동 추적한다."""
@@ -3085,10 +3290,24 @@ class DailyBot:
                     self._close(row, price, 1.0, reason, price, price)
                     continue
 
-            if int(row["tp1_done"]) == 1 and base_pnl_pct <= -self.cfg.breakeven_stop_pct:
-                trigger = base_price * (1 - self.cfg.breakeven_stop_pct / 100)
-                self._close(row, paper_fill(trigger), 1.0, "BE_EXIT", price, trigger)
-                continue
+            if int(row["tp1_done"]) == 1:
+                be_trigger = base_price * (1 + self.cfg.breakeven_stop_pct / 100)
+                exchange_be_armed = (
+                    self.cfg.mode == "live"
+                    and state_get(
+                        f"exchange_be_{row['symbol']}_{int(row['entry_ts_ms'] or 0)}",
+                        "0",
+                    ) == "1"
+                )
+
+                # LIVE에서 거래소 스탑이 정상 등록됐다면 Bybit가 직접 보호한다.
+                # 등록 실패/비LIVE일 때만 로컬 시장가 종료를 안전망으로 사용한다.
+                if not exchange_be_armed and price <= be_trigger:
+                    self._close(
+                        row, paper_fill(be_trigger), 1.0,
+                        "BE_EXIT", price, be_trigger
+                    )
+                    continue
 
             # HJ/P 공통 구조손절:
             # 확정 15분봉의 EMA20/EMA9/저점/RSI/음봉 구조가 실제로 무너질 때 전량 종료한다.
