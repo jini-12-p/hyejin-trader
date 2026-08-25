@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.49-BEExcludedLossCooldown"
+BOT_RUNTIME_VERSION = "RC-v4.3.50-ExchangeExitReasonFix"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -2515,29 +2515,53 @@ class DailyBot:
         tp2_price = base_price * (1 + self.cfg.tp2_pct / 100)
         tol = max(base_qty * 0.03, 1e-12)
 
-        # 거래소 포지션이 사라졌다면 TP2까지 체결됐거나 외부에서 종료된 상태.
+        # 거래소 포지션이 사라졌다면 실제 종료 체결가로 TP2 / 본절보호를 구분한다.
+        # TP1 이후에는 거래소 본절보호 스탑도 포지션을 0으로 만들기 때문에
+        # tp1_done만 보고 무조건 TP2로 기록하면 안 된다.
         if actual_qty <= tol and db_qty > tol:
             if int(row["tp1_done"] or 0) == 1 or price >= tp2_price * 0.995:
                 previous_realized = float(row["realized_pnl"] or 0)
+                actual_exit_price = 0.0
                 try:
                     total_realized, actual_exit_price = self._wait_live_closed_pnl_summary(
                         row["symbol"], int(row["entry_ts_ms"] or 0), previous_realized
                     )
                     realized_step = total_realized - previous_realized
-                    if actual_exit_price > 0:
-                        tp2_price = actual_exit_price
                 except Exception as exc:
                     log_event(row["symbol"], "LIVE_PNL_SYNC_ERROR", price, 0, self.cfg.mode, details=str(exc), strategy=row["strategy"] or "", trade_id=row["trade_id"] or "")
-                    realized_step = (tp2_price - float(row["avg_price"])) * db_qty
+                    total_realized = previous_realized
+                    realized_step = 0.0
+
+                be_price = base_price * (1 + self.cfg.breakeven_stop_pct / 100)
+                exit_price = actual_exit_price if actual_exit_price > 0 else price
+
+                # 실제 종료가가 TP2와 본절보호 중 어느 가격에 더 가까운지로 종료 사유를 판정한다.
+                # Bybit 시장가 스탑은 약간의 슬리피지가 생길 수 있어 정확히 같은 가격일 필요는 없다.
+                if int(row["tp1_done"] or 0) == 1:
+                    dist_tp2 = abs(exit_price - tp2_price)
+                    dist_be = abs(exit_price - be_price)
+                    close_reason = "TP2" if dist_tp2 <= dist_be else "BE_EXIT"
+                else:
+                    close_reason = "TP2"
+
+                # Closed P&L 동기화 실패 시에만 기존 계산값을 안전망으로 사용한다.
+                if actual_exit_price <= 0 and abs(total_realized - previous_realized) <= 1e-10:
+                    realized_step = (exit_price - float(row["avg_price"])) * db_qty
                     total_realized = previous_realized + realized_step
+
                 with db() as conn:
                     conn.execute(
                         "UPDATE bot_positions SET status='CLOSED',total_qty=0,tp1_done=1,updated_at=?,last_price=?,note=?,realized_pnl=? WHERE symbol=?",
-                        (utc_now(), tp2_price, "TP2", total_realized, row["symbol"]),
+                        (utc_now(), exit_price, close_reason, total_realized, row["symbol"]),
                     )
                 log_event(
-                    row["symbol"], "TP2", tp2_price, db_qty, self.cfg.mode,
-                    details=json.dumps({"source": "exchange_preorder_sync"}, ensure_ascii=False),
+                    row["symbol"], close_reason, exit_price, db_qty, self.cfg.mode,
+                    details=json.dumps({
+                        "source": "exchange_position_zero_sync",
+                        "actual_exit_price": actual_exit_price,
+                        "tp2_price": tp2_price,
+                        "be_price": be_price,
+                    }, ensure_ascii=False),
                     strategy=row["strategy"] or "", realized_pnl=realized_step,
                     trade_id=row["trade_id"] or ""
                 )
