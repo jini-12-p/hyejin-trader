@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.50-ExchangeExitReasonFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.51-PLiveGainCap050"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -207,6 +207,9 @@ class DailyConfig:
     live_reversal_min_body_pct: float = 0.20
     live_reversal_max_upper_wick_to_body: float = 1.50
     live_reversal_require_5m_bullish: bool = True
+    # v4.3.51: P형은 진행 중 15분봉이 이미 너무 많이 오른 뒤의 추격 진입을 막는다.
+    # 기본 P형 조건/점수/TP/손절은 그대로 두고 live candle 상승률 상한만 적용한다.
+    p_live_max_gain_pct: float = 0.50
 
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
@@ -791,6 +794,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     before = raw15.iloc[-3]
     live_price = float(live.close)
     live_gain = (live_price / float(live.open) - 1) * 100 if float(live.open) > 0 else 0.0
+    # v4.3.51: P형 live candle 추격 상한.
+    # 0.20% 이상 반등 확인은 기존 live_candle_quality_ok()가 유지하고,
+    # 0.50%를 넘겨 이미 진행된 봉에서는 P형 신규진입만 보류한다.
+    p_live_gain_ok = bool(live_gain <= float(cfg.p_live_max_gain_pct))
     live_volume_ratio = float(live.volume / live.vol_avg) if pd.notna(live.vol_avg) and live.vol_avg > 0 else 0.0
 
     last_body = abs(float(last.close - last.open))
@@ -1142,7 +1149,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         strategy = "HJ"
         score = float(hj_score)
         selected_price = live_price
-    elif p_ok:
+    elif p_ok and p_live_gain_ok:
         strategy = "P"
         score = float(p_score)
         selected_price = price
@@ -1182,6 +1189,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("p_faded_spike_reentry")
             if p_overextended_continuation:
                 rejected.append("p_overextended_continuation")
+            if not p_live_gain_ok:
+                rejected.append("p_live_gain_over_0_50pct")
             if p_score < 65:
                 rejected.append("p_score")
         if not hj_ok:
@@ -1256,6 +1265,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "pullback_from_high_pct": round(pullback_from_high, 2),
         "rebound_from_low_pct": round(float(live_rebound_from_low if strategy == "HJ" else rebound_from_low), 2),
         "entry_candle_gain_pct": round(float(live_gain if strategy == "HJ" else entry_candle_gain), 2),
+        # v4.3.51: P형에서도 실제 진행봉 상태를 사후 검증할 수 있도록 별도 기록.
+        "live_candle_gain_pct": round(float(live_gain), 4),
+        "p_live_max_gain_pct": round(float(cfg.p_live_max_gain_pct), 4),
+        "p_live_gain_ok": bool(p_live_gain_ok),
         "distance_to_recent_high_pct": round(float(live_distance_to_high if strategy == "HJ" else distance_to_high), 2),
         "hj_breakout_raw": bool(hj_breakout_raw),
         "hj_fresh_breakout_confirmed": bool(hj_fresh_breakout),
