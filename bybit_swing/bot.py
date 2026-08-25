@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.48-LiveFillPnL-ExchangeBE"
+BOT_RUNTIME_VERSION = "RC-v4.3.49-BEExcludedLossCooldown"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -2162,11 +2162,11 @@ class DailyBot:
         return float(value or 0)
 
     def consecutive_losses(self) -> int:
-        """실제 손절(STOP/BE_EXIT)만 연속손실로 센다.
+        """실제 손절(STOP)만 연속손실로 센다.
 
-        정체 종료(FLAT_EXIT)와 시간 종료(TIME_EXIT)는 데이터 수집용 중립 종료로
-        간주해 카운트에서 제외한다. 수익 거래가 나오면 연속손실은 즉시 0으로
-        초기화된다.
+        TP1 후 본절보호 종료(BE_EXIT), 정체 종료(FLAT_EXIT), 시간 종료(TIME_EXIT)는
+        중립 종료로 간주해 카운트에서 제외한다. 수익 거래가 나오면 연속손실은
+        즉시 0으로 초기화된다.
         """
         day = trading_day()
         with db() as conn:
@@ -2182,10 +2182,10 @@ class DailyBot:
             reason = str(row["note"] or "").upper()
             if pnl > 0 or reason in {"TP1", "TP2"}:
                 break
-            if reason in {"STOP", "BE_EXIT"} and pnl < 0:
+            if reason == "STOP" and pnl < 0:
                 count += 1
                 continue
-            if reason.startswith("FLAT_EXIT") or reason == "TIME_EXIT":
+            if reason == "BE_EXIT" or reason.startswith("FLAT_EXIT") or reason == "TIME_EXIT":
                 continue
             # 알 수 없는 음수 종료는 안전하게 손절로 계산한다.
             if pnl < 0:
@@ -2201,7 +2201,7 @@ class DailyBot:
         with db() as conn:
             row = conn.execute(
                 """SELECT updated_at FROM bot_positions
-                   WHERE status='CLOSED' AND note IN ('STOP','BE_EXIT')
+                   WHERE status='CLOSED' AND note='STOP'
                    ORDER BY updated_at DESC LIMIT 1"""
             ).fetchone()
         if not row or not row["updated_at"]:
