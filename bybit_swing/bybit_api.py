@@ -158,7 +158,7 @@ class BybitSwingClient:
             "side": "Buy" if side.lower() == "buy" else "Sell",
             "orderType": "Market", "qty": str(size),
             "reduceOnly": bool(reduce_only), "timeInForce": "IOC",
-            "positionIdx": 1,
+            "positionIdx": 0,
         }
         if client_order_id:
             payload["orderLinkId"] = client_order_id[:36]
