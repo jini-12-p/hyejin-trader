@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.52-BEShadowTrack"
+BOT_RUNTIME_VERSION = "RC-v4.3.55-JunPShadow-StallWeakExit-NoLossCooldown"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -166,8 +166,13 @@ class DailyConfig:
     max_hold_hours: int = 3
     daily_loss_limit_usdt: float = 12.0
     max_consecutive_losses: int = 3
-    loss_cooldown_minutes: int = 60
+    loss_cooldown_minutes: int = 0
     paper_consecutive_loss_warning_only: bool = True
+    # v4.3.53: 준P형은 실제 주문 없이 Shadow 데이터만 수집한다.
+    # 정식 P형 핵심 안전조건은 유지하고, 점수 90+에서 soft 조건 딱 1개만 부족한 후보만 추적.
+    junp_shadow_enabled: bool = True
+    junp_shadow_min_score: float = 90.0
+    junp_shadow_same_symbol_cooldown_minutes: int = 90
     same_symbol_cooldown_minutes: int = 90
     min_balance_to_trade: float = 90.0
     emergency_stop_balance: float = 85.0
@@ -267,6 +272,14 @@ class DailyConfig:
     flat_max_ema20_distance_pct: float = 1.0
     flat_rsi_min: float = 40.0
     flat_rsi_max: float = 60.0
+
+    # v4.3.55: TP1 미도달 장기 정체형 조기종료.
+    # 75분 이상 지났는데 현재 수익 진행이 거의 없고 15분 모멘텀이 실제로 약해질 때만 종료한다.
+    # 단순 시간종료가 아니라 약화 확인을 함께 요구해 느리게 올라가는 정상 거래는 최대한 보존한다.
+    stalled_weak_exit_enabled: bool = True
+    stalled_weak_exit_minutes: int = 75
+    stalled_weak_max_current_pnl_pct: float = 0.25
+    stalled_weak_min_weakness_score: int = 3
     min_pullback_from_high_pct: float = 0.30
     max_pullback_from_high_pct: float = 6.00
     min_entry_candle_gain_pct: float = 0.15
@@ -353,6 +366,8 @@ SCAN_REJECTED_FIELDS = [
     "p_ema_quality_ok", "p_entry_quality_ok",
     "p_near_high_weak_reentry", "p_faded_spike_reentry",
     "p_overextended_continuation",
+    # v4.3.53: 준P Shadow 후보/결과 분석용. 실제 P 매매 데이터와는 분리된다.
+    "p_score", "p_live_gain_ok", "junp_shadow_candidate", "junp_missing_condition",
 ]
 
 def ensure_scan_rejected_csv() -> None:
@@ -538,6 +553,32 @@ def init_db() -> None:
             last_price REAL,
             last_checked_at TEXT,
             last_structure_bucket TEXT,
+            result TEXT,
+            result_ts TEXT,
+            result_price REAL,
+            result_details TEXT,
+            completed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS junp_shadow_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shadow_id TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            entry_ts_ms INTEGER NOT NULL,
+            entry_price REAL NOT NULL,
+            p_score REAL NOT NULL,
+            missing_condition TEXT NOT NULL,
+            tp1_done INTEGER NOT NULL DEFAULT 0,
+            tp1_ts TEXT,
+            tp1_price REAL,
+            tp2_price REAL NOT NULL,
+            be_price REAL NOT NULL,
+            highest_price REAL,
+            lowest_price REAL,
+            last_price REAL,
+            last_checked_at TEXT,
+            last_5m_bucket TEXT,
+            last_15m_bucket TEXT,
             result TEXT,
             result_ts TEXT,
             result_price REAL,
@@ -1262,10 +1303,38 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
+    # v4.3.53 준P Shadow 후보 판정. 실제 주문 조건에는 절대 사용하지 않는다.
+    # Hard safety는 정식 P와 동일하게 유지하고, soft 조건 딱 1개만 부족한 90점+ 후보만 추적한다.
+    junp_soft_checks = {
+        "rebound": bool(rebound),
+        "momentum_ok": bool(momentum_ok),
+        "volume_ok": bool(volume_ok),
+        "volume_trend_ok": bool(volume_trend_ok),
+        "p_entry_quality_ok": bool(p_entry_quality_ok),
+    }
+    junp_missing = [name for name, ok in junp_soft_checks.items() if not ok]
+    junp_hard_ok = bool(
+        h1_up and pullback_ok and not_chasing and movement_ok and not_extreme
+        and p_ema_quality_ok and p_live_gain_ok
+        and rebound_from_low >= cfg.min_rebound_from_low_pct
+    )
+    junp_shadow_candidate = bool(
+        cfg.junp_shadow_enabled
+        and not p_ok
+        and p_score >= float(cfg.junp_shadow_min_score)
+        and junp_hard_ok
+        and len(junp_missing) == 1
+    )
+    junp_missing_condition = junp_missing[0] if junp_shadow_candidate else ""
+
     details = {
         "price": selected_price,
+        "live_price": float(live_price),
         "strategy": strategy,
         "score": round(float(score), 2),
+        "p_score": round(float(p_score), 2),
+        "junp_shadow_candidate": bool(junp_shadow_candidate),
+        "junp_missing_condition": junp_missing_condition,
         "entry_reason": (
             "긴꼬리 음봉 후 양봉 몸통회복" if strategy == "HJ" and hj_wick_reversal_active
             else "연속 양봉 후 장대양봉 확장" if strategy == "HJ"
@@ -2028,6 +2097,64 @@ def flat_exit_signal(client: BybitSwingClient, symbol: str, base_price: float, c
     }
 
 
+def stalled_weak_exit_signal(
+    client: BybitSwingClient,
+    symbol: str,
+    base_price: float,
+    cfg: DailyConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """TP1 미도달 장기 정체 포지션이 실제로 약해질 때만 조기종료한다."""
+    m15 = confirmed(indicators(client.candles(symbol, "15m", 100)))
+    if len(m15) < 25:
+        return False, {"reason": "stalled_weak_not_enough_15m"}
+
+    c = m15.iloc[-1]
+    b = m15.iloc[-2]
+
+    close = float(c.close)
+    ema9 = float(c.ema9)
+    ema20 = float(c.ema20)
+    rsi = float(c.rsi)
+    prev_rsi = float(b.rsi)
+    prev_ema9 = float(b.ema9)
+
+    current_pnl_pct = (close / float(base_price) - 1) * 100 if float(base_price) > 0 else -99.0
+    progress_weak = bool(current_pnl_pct <= float(cfg.stalled_weak_max_current_pnl_pct))
+
+    close_below_ema9 = bool(close < ema9)
+    ema9_falling = bool(ema9 < prev_ema9)
+    rsi_falling = bool(rsi < prev_rsi)
+    rsi_weak = bool(rsi <= 55.0)
+    bearish = bool(close < float(c.open))
+    close_below_ema20 = bool(close < ema20)
+
+    weakness_score = (
+        int(close_below_ema9)
+        + int(ema9_falling)
+        + int(rsi_falling)
+        + int(rsi_weak)
+        + int(bearish)
+        + int(close_below_ema20)
+    )
+    ok = bool(progress_weak and weakness_score >= int(cfg.stalled_weak_min_weakness_score))
+
+    return ok, {
+        "reason": "STALL_WEAK_75M" if ok else "stalled_weak_hold",
+        "price": close,
+        "current_pnl_pct": round(current_pnl_pct, 2),
+        "close_below_ema9": close_below_ema9,
+        "ema9_falling": ema9_falling,
+        "rsi_falling": rsi_falling,
+        "rsi_weak": rsi_weak,
+        "bearish": bearish,
+        "close_below_ema20": close_below_ema20,
+        "weakness_score": weakness_score,
+        "rsi": round(rsi, 2),
+        "ema9": ema9,
+        "ema20": ema20,
+    }
+
+
 def qty_from_margin(price: float, margin_usdt: float, leverage: float) -> float:
     """증거금과 레버리지로 주문 수량을 계산한다."""
     price = float(price)
@@ -2229,22 +2356,12 @@ class DailyBot:
         return count
 
     def loss_cooldown_active(self) -> bool:
-        """연속 손절 3회 뒤 설정 시간 동안 신규 진입을 쉬어 시장 국면 전환을 기다린다."""
-        if self.consecutive_losses() < self.cfg.max_consecutive_losses:
-            return False
-        with db() as conn:
-            row = conn.execute(
-                """SELECT updated_at FROM bot_positions
-                   WHERE status='CLOSED' AND note='STOP'
-                   ORDER BY updated_at DESC LIMIT 1"""
-            ).fetchone()
-        if not row or not row["updated_at"]:
-            return False
-        try:
-            last_loss = datetime.fromisoformat(row["updated_at"])
-            return datetime.now(timezone.utc) - last_loss < timedelta(minutes=max(0, self.cfg.loss_cooldown_minutes))
-        except (TypeError, ValueError):
-            return False
+        """v4.3.53: 3연속 STOP에 따른 전체 신규진입 쿨다운은 사용하지 않는다.
+
+        config.json에 예전 loss_cooldown_minutes=60 값이 남아 있어도 무시한다.
+        실제 STOP/일일손실한도/동일종목 쿨다운 등 다른 안전장치는 그대로 유지한다.
+        """
+        return False
 
     def symbol_in_cooldown(self, symbol: str) -> bool:
         """같은 종목을 종료한 뒤 설정 시간 동안 재진입하지 않는다."""
@@ -3127,6 +3244,284 @@ class DailyBot:
                     details=f"{type(exc).__name__}: {exc}", trade_id=trade_id
                 )
 
+    def _register_junp_shadow_candidate(self, symbol: str, details: dict[str, Any]) -> None:
+        """준P형 후보를 실제 주문 없이 별도 DB/SCAN 기록으로만 등록한다."""
+        if not self.cfg.junp_shadow_enabled or not bool(details.get("junp_shadow_candidate")):
+            return
+        price = float(details.get("live_price") or details.get("price") or 0)
+        p_score = float(details.get("p_score") or 0)
+        missing = str(details.get("junp_missing_condition") or "")
+        if price <= 0 or p_score < float(self.cfg.junp_shadow_min_score) or not missing:
+            return
+
+        now = datetime.now(timezone.utc)
+        with db() as conn:
+            pending = conn.execute(
+                "SELECT 1 FROM junp_shadow_reviews WHERE symbol=? AND completed=0 LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            if pending:
+                return
+            last = conn.execute(
+                "SELECT result_ts FROM junp_shadow_reviews WHERE symbol=? AND completed=1 ORDER BY result_ts DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            if last and last["result_ts"]:
+                try:
+                    last_dt = datetime.fromisoformat(str(last["result_ts"]))
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    if now - last_dt < timedelta(minutes=max(0, int(self.cfg.junp_shadow_same_symbol_cooldown_minutes))):
+                        return
+                except Exception:
+                    pass
+
+            opened_at = now.isoformat()
+            shadow_id = f"JUNP-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            conn.execute(
+                """INSERT INTO junp_shadow_reviews(
+                    shadow_id,symbol,opened_at,entry_ts_ms,entry_price,p_score,missing_condition,
+                    tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id, symbol, opened_at, int(now.timestamp() * 1000), price, p_score, missing,
+                    tp2_price, be_price, price, price, price, opened_at,
+                ),
+            )
+
+        append_entry_record(
+            symbol, "JUNP_SHADOW_ENTRY", "JUNP_SHADOW", p_score, price,
+            f"missing={missing}; actual_order=0"
+        )
+
+    def update_junp_shadow_reviews(self) -> None:
+        """준P형 Shadow를 실제 주문 없이 P형 관리규칙으로 가상 추적한다.
+
+        실제 P형 LIVE/DB 손익에는 전혀 반영하지 않는다. 결과는 SCAN CSV의
+        JUNP_SHADOW_* 이벤트와 junp_shadow_reviews 테이블에만 남긴다.
+        DCA는 가상 체결 오차를 키울 수 있어 적용하지 않고 최초 진입가 기준으로 비교한다.
+        """
+        with db() as conn:
+            pending = conn.execute(
+                "SELECT * FROM junp_shadow_reviews WHERE completed=0 ORDER BY opened_at"
+            ).fetchall()
+        if not pending:
+            return
+
+        try:
+            ticker_map = {
+                str(t.get("symbol") or ""): float(t.get("last") or 0)
+                for t in self.client.tickers("SWAP")
+            }
+        except Exception as exc:
+            append_entry_record("", "JUNP_SHADOW_TICKER_ERROR", "JUNP_SHADOW", 0, 0, str(exc))
+            return
+
+        now = datetime.now(timezone.utc)
+        bucket_5m = str(int(now.timestamp()) // 300)
+        bucket_15m = str(int(now.timestamp()) // 900)
+
+        for review in pending:
+            symbol = str(review["symbol"] or "")
+            shadow_id = str(review["shadow_id"] or "")
+            try:
+                price = float(ticker_map.get(symbol) or 0)
+                if price <= 0:
+                    continue
+                entry_price = float(review["entry_price"] or 0)
+                opened_at = str(review["opened_at"])
+                tp1_done = bool(int(review["tp1_done"] or 0))
+                tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
+                tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
+                be_price = float(review["be_price"] or entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100))
+                highest = max(float(review["highest_price"] or price), price)
+                lowest = min(float(review["lowest_price"] or price), price)
+
+                opened = datetime.fromisoformat(opened_at)
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                age_min = (now - opened).total_seconds() / 60.0
+
+                # 1분봉 high로 짧은 TP 터치를 보강한다. API 부담을 줄이기 위해 5분 버킷당 1회만 조회.
+                observed_high = max(price, highest)
+                five_due = str(review["last_5m_bucket"] or "") != bucket_5m
+                if five_due:
+                    try:
+                        m1 = self.client.candles(symbol, "1m", 3)
+                        if m1 is not None and len(m1) > 0 and "high" in m1.columns:
+                            observed_high = max(
+                                observed_high,
+                                float(pd.to_numeric(m1["high"], errors="coerce").dropna().tail(2).max())
+                            )
+                            highest = max(highest, observed_high)
+                    except Exception:
+                        pass
+
+                result = ""
+                result_price = price
+                result_details: dict[str, Any] = {}
+
+                # 실제 봇과 동일하게 시간종료가 최우선.
+                if age_min >= float(self.cfg.max_hold_hours) * 60.0:
+                    result = "TIME_EXIT"
+                    result_details = {"age_min": round(age_min, 1)}
+
+                # TP는 손절보다 먼저 처리한다.
+                if not result and not tp1_done and observed_high >= tp1_price:
+                    tp1_done = True
+                    with db() as conn:
+                        conn.execute(
+                            """UPDATE junp_shadow_reviews SET tp1_done=1,tp1_ts=?,tp1_price=?,highest_price=?,
+                               last_price=?,last_checked_at=?,last_5m_bucket=? WHERE id=?""",
+                            (utc_now(), tp1_price, highest, price, utc_now(), bucket_5m, int(review["id"])),
+                        )
+                    append_entry_record(
+                        symbol, "JUNP_SHADOW_TP1", "JUNP_SHADOW", float(review["p_score"] or 0),
+                        tp1_price, f"missing={review['missing_condition']}"
+                    )
+
+                if not result and tp1_done and observed_high >= tp2_price:
+                    result = "TP2"
+                    result_price = tp2_price
+                    result_details = {"tp2_price": tp2_price}
+
+                # TP1 이후에는 현재 LIVE P형과 동일하게 +0.15% BE를 적용.
+                if not result and tp1_done and price <= be_price:
+                    result = "BE_EXIT"
+                    result_price = be_price
+                    result_details = {"be_price": be_price}
+
+                # TP1 이전 조기/단계형 손절은 확정 5분봉이 바뀔 때만 재평가.
+                if not result and not tp1_done and five_due:
+                    stop_hit = False
+                    stop_type = ""
+                    stop_details: dict[str, Any] = {}
+                    try:
+                        crash, d = early_crash_failure_signal(
+                            self.client, symbol, opened_at, entry_price, price, self.cfg
+                        )
+                        if crash:
+                            stop_hit, stop_type, stop_details = True, "EARLY_CRASH", d
+                    except Exception as exc:
+                        stop_details = {"early_crash_error": str(exc)}
+
+                    if not stop_hit:
+                        try:
+                            cat, d = p_catastrophic_failure_signal(
+                                self.client, symbol, opened_at, entry_price, price, self.cfg
+                            )
+                            if cat:
+                                stop_hit, stop_type, stop_details = True, "P_CATASTROPHIC", d
+                        except Exception as exc:
+                            stop_details = {**stop_details, "p_cat_error": str(exc)}
+
+                    if not stop_hit and self.cfg.early_failure_enabled:
+                        try:
+                            early, d = early_failure_signal(self.client, symbol, opened_at, self.cfg)
+                            if early:
+                                stop_hit, stop_type, stop_details = True, str(d.get("failure_type") or "EARLY_FAILURE"), d
+                        except Exception as exc:
+                            stop_details = {**stop_details, "early_failure_error": str(exc)}
+
+                    if not stop_hit and age_min >= 45.0:
+                        try:
+                            late, d = late_trend_failure_signal(
+                                self.client, symbol, int(review["entry_ts_ms"] or 0), False
+                            )
+                            if late:
+                                stop_hit, stop_type, stop_details = True, "LATE_TREND_FAILURE", d
+                        except Exception as exc:
+                            stop_details = {**stop_details, "late_failure_error": str(exc)}
+
+                    if stop_hit:
+                        result = "STOP"
+                        result_price = price
+                        result_details = {"stop_type": stop_type, "stop": stop_details}
+
+                # HJ/P 공통 15분 구조손절 + 정체종료는 확정 15분봉 변경 시에만 재평가.
+                fifteen_due = str(review["last_15m_bucket"] or "") != bucket_15m
+                emergency_now = bool(
+                    entry_price > 0
+                    and price <= entry_price * (1 - abs(float(self.cfg.structure_emergency_stop_pct)) / 100)
+                )
+                if not result and (fifteen_due or emergency_now):
+                    try:
+                        broken, structure = hj_structure_broken(
+                            self.client, symbol, self.cfg, base_price=entry_price, live_price=price
+                        )
+                    except Exception as exc:
+                        broken, structure = False, {"error": str(exc)}
+                    if broken:
+                        result = "STOP"
+                        result_price = float(structure.get("price") or price)
+                        result_details = {"stop_type": "STRUCTURE", "stop": structure}
+
+                if not result and fifteen_due:
+                    flat_due = bool(
+                        age_min >= float(self.cfg.flat_exit_minutes)
+                        and (highest / entry_price - 1) * 100 < float(self.cfg.flat_min_favorable_pct)
+                    )
+                    if flat_due:
+                        try:
+                            flat_ok, flat_details = flat_exit_signal(self.client, symbol, entry_price, self.cfg)
+                        except Exception as exc:
+                            flat_ok, flat_details = False, {"error": str(exc)}
+                        if flat_ok:
+                            result = "FLAT_EXIT_75M"
+                            result_price = price
+                            result_details = {"flat": flat_details}
+
+                if result:
+                    result_ts = utc_now()
+                    with db() as conn:
+                        conn.execute(
+                            """UPDATE junp_shadow_reviews SET tp1_done=?,highest_price=?,lowest_price=?,last_price=?,
+                               last_checked_at=?,last_5m_bucket=?,last_15m_bucket=?,result=?,result_ts=?,result_price=?,
+                               result_details=?,completed=1 WHERE id=?""",
+                            (
+                                1 if tp1_done else 0, highest, lowest, price, result_ts,
+                                bucket_5m if five_due else str(review["last_5m_bucket"] or ""),
+                                bucket_15m if (fifteen_due or emergency_now) else str(review["last_15m_bucket"] or ""),
+                                result, result_ts, float(result_price),
+                                json.dumps({
+                                    "shadow_id": shadow_id,
+                                    "missing_condition": str(review["missing_condition"] or ""),
+                                    "entry_price": entry_price,
+                                    "p_score": float(review["p_score"] or 0),
+                                    "highest_price": highest,
+                                    "lowest_price": lowest,
+                                    "age_min": round(age_min, 1),
+                                    "dca_simulated": False,
+                                    **result_details,
+                                }, ensure_ascii=False),
+                                int(review["id"]),
+                            ),
+                        )
+                    append_entry_record(
+                        symbol, f"JUNP_SHADOW_{result}", "JUNP_SHADOW",
+                        float(review["p_score"] or 0), float(result_price),
+                        f"missing={review['missing_condition']}; high={highest:.10g}; low={lowest:.10g}; actual_order=0"
+                    )
+                else:
+                    with db() as conn:
+                        conn.execute(
+                            """UPDATE junp_shadow_reviews SET tp1_done=?,highest_price=?,lowest_price=?,last_price=?,
+                               last_checked_at=?,last_5m_bucket=?,last_15m_bucket=? WHERE id=?""",
+                            (
+                                1 if tp1_done else 0, highest, lowest, price, utc_now(),
+                                bucket_5m if five_due else str(review["last_5m_bucket"] or ""),
+                                bucket_15m if (fifteen_due or emergency_now) else str(review["last_15m_bucket"] or ""),
+                                int(review["id"]),
+                            ),
+                        )
+            except Exception as exc:
+                append_entry_record(
+                    symbol, "JUNP_SHADOW_ERROR", "JUNP_SHADOW", float(review["p_score"] or 0),
+                    float(review["last_price"] or 0), f"{type(exc).__name__}: {exc}"
+                )
+
     def update_stop_reviews(self) -> None:
         """미완료 손절 리뷰를 현재 시세로 채우고 3시간 뒤 자동 분류한다."""
         milestones = (
@@ -3546,6 +3941,37 @@ class DailyBot:
                     self._close(row, price, 1.0, reason, price, trigger)
                     continue
 
+            # v4.3.55 P형 장기 정체 + 모멘텀 약화 조기종료:
+            # TP1을 아직 못 찍은 상태에서 75분 이상 지났고, 현재 진행이 거의 없으면서
+            # 확정 15분봉 약화가 3개 이상 겹칠 때만 정체종료로 처리한다.
+            # 기존 FLAT_EXIT보다 넓게 "지지부진 후 약화"를 잡되 단순 시간 종료는 하지 않는다.
+            if (
+                strategy == "P"
+                and self.cfg.stalled_weak_exit_enabled
+                and int(row["tp1_done"] or 0) == 0
+                and age_h * 60 >= float(self.cfg.stalled_weak_exit_minutes)
+            ):
+                try:
+                    stalled_ok, stalled_details = stalled_weak_exit_signal(
+                        self.client, row["symbol"], base_price, self.cfg
+                    )
+                except Exception as exc:
+                    stalled_ok, stalled_details = False, {"error": str(exc)}
+                    log_event(
+                        row["symbol"], "STALL_WEAK_EXIT_CHECK_ERROR", mode=self.cfg.mode,
+                        details=str(exc), strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+
+                if stalled_ok:
+                    log_event(
+                        row["symbol"], "STALL_WEAK_EXIT_75M_TRIGGER",
+                        price=price, mode=self.cfg.mode,
+                        details=json.dumps(stalled_details, ensure_ascii=False),
+                        strategy=strategy, trade_id=row["trade_id"] or ""
+                    )
+                    self._close(row, price, 1.0, "FLAT_EXIT_75M", price, None)
+                    continue
+
             # HJ/P 공통 종료:
             # FLAT_EXIT는 실제 횡보일 때만 허용한다.
             # C98처럼 이미 크게 하락한 포지션을 '정체 종료'로 처리하지 않는다.
@@ -3630,6 +4056,10 @@ class DailyBot:
                 )
                 append_scan_record(symbol, strategy, score, details)
 
+                # v4.3.53: 준P형은 실제 진입과 완전히 분리된 Shadow로만 등록한다.
+                if bool(details.get("junp_shadow_candidate")):
+                    self._register_junp_shadow_candidate(symbol, details)
+
                 if not strategy:
                     continue
                 if same_risk_group(symbol, open_symbols):
@@ -3672,6 +4102,7 @@ class DailyBot:
         self.manage()
         self.update_stop_reviews()
         self.update_be_shadow_reviews()
+        self.update_junp_shadow_reviews()
         self.scan_entries()
 
     def _scan_entries_background(self) -> None:
@@ -3702,6 +4133,7 @@ class DailyBot:
             state_set("stop_review_worker_started_at", datetime.now(timezone.utc).isoformat())
             self.update_stop_reviews()
             self.update_be_shadow_reviews()
+            self.update_junp_shadow_reviews()
             state_set("stop_review_worker_status", "IDLE")
             state_set("stop_review_worker_finished_at", datetime.now(timezone.utc).isoformat())
         except Exception as exc:
