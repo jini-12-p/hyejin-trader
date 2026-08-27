@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.55-JunPShadow-StallWeakExit-NoLossCooldown"
+BOT_RUNTIME_VERSION = "RC-v4.3.56-JunPShadowTickerFix-StallWeakExit-NoLossCooldown"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -3310,14 +3310,47 @@ class DailyBot:
         if not pending:
             return
 
+        # 준P Shadow는 실제 주문과 완전히 분리된 리뷰 기능이다.
+        # bulk tickers 호출이 메인 스캔과 겹쳐 skip/timeout 될 수 있으므로,
+        # bulk 조회가 실패하면 pending 심볼만 개별 ticker로 fallback 한다.
+        ticker_map: dict[str, float] = {}
+        bulk_error = ""
         try:
-            ticker_map = {
-                str(t.get("symbol") or ""): float(t.get("last") or 0)
-                for t in self.client.tickers("SWAP")
-            }
+            for t in self.client.tickers("SWAP"):
+                symbol_key = str(t.get("symbol") or "")
+                if not symbol_key:
+                    continue
+                # Bybit bulk ticker는 lastPrice, wrapper에 따라 last를 쓸 수 있어 둘 다 지원.
+                last_value = t.get("lastPrice")
+                if last_value in (None, ""):
+                    last_value = t.get("last")
+                try:
+                    ticker_map[symbol_key] = float(last_value or 0)
+                except (TypeError, ValueError):
+                    ticker_map[symbol_key] = 0.0
         except Exception as exc:
-            append_entry_record("", "JUNP_SHADOW_TICKER_ERROR", "JUNP_SHADOW", 0, 0, str(exc))
-            return
+            bulk_error = str(exc)
+
+        # bulk 결과가 없거나 해당 심볼 가격이 0이면 개별 ticker로 복구한다.
+        # Shadow 개수만큼만 호출하므로 실제 LIVE 주문/관리 로직에는 관여하지 않는다.
+        for review in pending:
+            symbol_key = str(review["symbol"] or "")
+            if not symbol_key or float(ticker_map.get(symbol_key) or 0) > 0:
+                continue
+            try:
+                one = self.client.ticker(symbol_key)
+                last_value = one.get("last")
+                if last_value in (None, ""):
+                    last_value = one.get("lastPrice")
+                ticker_map[symbol_key] = float(last_value or 0)
+            except Exception as exc:
+                if bulk_error:
+                    err_text = f"bulk={bulk_error}; fallback={type(exc).__name__}: {exc}"
+                else:
+                    err_text = f"fallback={type(exc).__name__}: {exc}"
+                append_entry_record(
+                    symbol_key, "JUNP_SHADOW_TICKER_ERROR", "JUNP_SHADOW", 0, 0, err_text
+                )
 
         now = datetime.now(timezone.utc)
         bucket_5m = str(int(now.timestamp()) // 300)
