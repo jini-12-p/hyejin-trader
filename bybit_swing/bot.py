@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.57-PauseLiveScanJunP-StallWeakExit-NoLossCooldown"
+BOT_RUNTIME_VERSION = "RC-v4.3.58-ResearchShadow-FullTelemetry-NoLiveChange"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -216,6 +216,18 @@ class DailyConfig:
     # 기본 P형 조건/점수/TP/손절은 그대로 두고 live candle 상승률 상한만 적용한다.
     p_live_max_gain_pct: float = 0.50
 
+    # v4.3.58 연구/가상검증 모드. LIVE 주문조건에는 사용하지 않는다.
+    research_shadow_enabled: bool = True
+    research_shadow_same_symbol_cooldown_minutes: int = 90
+    research_new_score_min: float = 90.0
+    research_strength_rsi_min: float = 62.0
+    research_strength_rebound_min_pct: float = 3.0
+    research_strength_live_gain_min_pct: float = 0.32
+    research_live_cap_050_pct: float = 0.50
+    research_live_cap_060_pct: float = 0.60
+    research_nearmiss_max_failed_checks: int = 2
+    research_nearmiss_min_old_score: float = 90.0
+
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
     hj_high_zone_max_distance_pct: float = 0.50
@@ -368,6 +380,26 @@ SCAN_REJECTED_FIELDS = [
     "p_overextended_continuation",
     # v4.3.53: 준P Shadow 후보/결과 분석용. 실제 P 매매 데이터와는 분리된다.
     "p_score", "p_live_gain_ok", "junp_shadow_candidate", "junp_missing_condition",
+    # v4.3.58: 연구용 full telemetry. 나중에 빠진 값 때문에 재분석이 막히지 않도록
+    # 원본 상태 + 새 점수/Strength + 0.50/0.60 가설 + near-miss를 모두 저장한다.
+    "live_price", "live_candle_gain_pct", "p_live_cap050_ok", "p_live_cap060_ok",
+    "live_body_pct", "live_upper_wick_ratio", "live_lower_wick_ratio", "live_volume_ratio",
+    "rsi_prev", "rsi_delta", "one_hour_signed_move_pct", "one_hour_move_pct",
+    "ema9_slope_pct", "ema20_slope_pct", "ema9_ema20_gap_pct", "ema20_ema60_gap_pct",
+    "new_p_score", "new_score_structure", "new_score_trend", "new_score_live",
+    "new_score_rsi", "new_score_market_structure", "new_score_volume",
+    "strength_rsi_ok", "strength_rebound_ok", "strength_live_ok", "strength_pass_count",
+    "strength_2of3_ok", "p_current_shadow_candidate", "p_strength050_shadow_candidate",
+    "p_strength060_shadow_candidate", "p_newscore060_shadow_candidate",
+    "junp_old_shadow_candidate", "junp_new_shadow_candidate",
+    "junp_old_missing_condition", "junp_new_missing_condition",
+    "p_failed_check_count", "p_failed_checks", "research_nearmiss_candidate",
+    "research_variants",
+    "live_quality_ok", "live_quality_reason", "live_quality_bullish", "live_quality_body_ok",
+    "live_quality_wick_ok", "live_quality_prev_bearish", "live_quality_prev_body_recovery",
+    "live_quality_recovery_ok", "live_quality_5m_bullish",
+    "shadow_id", "research_variant", "shadow_entry_time", "mfe_pct", "mae_pct",
+    "shadow_age_min", "shadow_exit_pct", "shadow_stop_type",
 ]
 
 def ensure_scan_rejected_csv() -> None:
@@ -457,6 +489,7 @@ def append_entry_record(
     score: float,
     price: float,
     message: str = "",
+    extra: dict[str, Any] | None = None,
 ) -> None:
     """진입 시도/성공/오류를 기존 SCAN CSV에 같은 열 구조로 기록한다."""
     ensure_scan_rejected_csv()
@@ -471,6 +504,10 @@ def append_entry_record(
         "price": price,
         "rejected_conditions": message,
     })
+    if extra:
+        for key, value in extra.items():
+            if key in row:
+                row[key] = value
     try:
         with SCAN_REJECTED_CSV_PATH.open("a", encoding="utf-8-sig", newline="") as fh:
             writer = csv.DictWriter(
@@ -582,6 +619,37 @@ def init_db() -> None:
             result TEXT,
             result_ts TEXT,
             result_price REAL,
+            result_details TEXT,
+            completed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS research_shadow_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shadow_id TEXT NOT NULL UNIQUE,
+            variant TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            entry_ts_ms INTEGER NOT NULL,
+            entry_price REAL NOT NULL,
+            old_p_score REAL,
+            new_p_score REAL,
+            missing_condition TEXT,
+            snapshot_json TEXT,
+            tp1_done INTEGER NOT NULL DEFAULT 0,
+            tp1_ts TEXT,
+            tp1_price REAL,
+            tp2_price REAL NOT NULL,
+            be_price REAL NOT NULL,
+            highest_price REAL,
+            lowest_price REAL,
+            last_price REAL,
+            last_checked_at TEXT,
+            last_5m_bucket TEXT,
+            last_15m_bucket TEXT,
+            result TEXT,
+            result_ts TEXT,
+            result_price REAL,
+            mfe_pct REAL DEFAULT 0,
+            mae_pct REAL DEFAULT 0,
             result_details TEXT,
             completed INTEGER NOT NULL DEFAULT 0
         );
@@ -847,10 +915,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # 연속 양봉 뒤 현재 장대양봉이 힘 있게 확장하는 경우를 별도로 잡는다.
     live = raw15.iloc[-1]
     quality_ok, quality_details = live_candle_quality_ok(client, symbol, raw15, cfg)
-    if not quality_ok:
-        quality_details = dict(quality_details)
-        quality_details["rejected_conditions"] = ["live_candle_quality"]
-        return None, 0.0, quality_details
+    quality_details = dict(quality_details or {})
 
     last = raw15.iloc[-2]
     before = raw15.iloc[-3]
@@ -861,6 +926,47 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     # 0.50%를 넘겨 이미 진행된 봉에서는 P형 신규진입만 보류한다.
     p_live_gain_ok = bool(live_gain <= float(cfg.p_live_max_gain_pct))
     live_volume_ratio = float(live.volume / live.vol_avg) if pd.notna(live.vol_avg) and live.vol_avg > 0 else 0.0
+
+    # v4.3.58 연구용 점수: 기존 '형태 점수'는 보존하고, 실제 추세 생명력/추진력에
+    # 더 큰 비중을 둔 새 점수를 병행 기록한다. LIVE 주문 판정에는 아직 사용하지 않는다.
+    one_hour_signed_move = (float(row.close) / float(m15.iloc[-5].close) - 1) * 100 if float(m15.iloc[-5].close) > 0 else 0.0
+    rsi_now = float(row.rsi)
+    rsi_prev = float(prev.rsi)
+    rsi_delta = rsi_now - rsi_prev
+    ema9_slope_pct = (float(row.ema9) / float(prev.ema9) - 1) * 100 if float(prev.ema9) > 0 else 0.0
+    ema20_slope_pct = (float(row.ema20) / float(prev.ema20) - 1) * 100 if float(prev.ema20) > 0 else 0.0
+    ema9_ema20_gap_pct = (float(row.ema9) / float(row.ema20) - 1) * 100 if float(row.ema20) > 0 else 0.0
+    ema20_ema60_gap_pct = (float(row.ema20) / float(row.ema60) - 1) * 100 if float(row.ema60) > 0 else 0.0
+
+    new_score_structure = (15 if h1_up else 0) + (10 if pullback_ok else 0) + (10 if rebound else 0) + (10 if p_ema_quality_ok else 0)
+    new_score_trend = min(18.0, max(0.0, one_hour_signed_move) * 6.0) + (6 if ema9_rising else 0)
+    if 0.32 <= live_gain <= 0.60:
+        new_score_live = 14.0
+    elif 0.20 <= live_gain < 0.32:
+        new_score_live = 7.0
+    elif 0.60 < live_gain <= 0.90:
+        new_score_live = 6.0
+    else:
+        new_score_live = 0.0
+    if 62.0 <= rsi_now <= 72.0 and rsi_delta >= 0:
+        new_score_rsi = 12.0
+    elif 58.0 <= rsi_now < 62.0 and rsi_delta >= 0:
+        new_score_rsi = 6.0
+    elif 72.0 < rsi_now <= 75.0 and rsi_delta >= 0:
+        new_score_rsi = 8.0
+    else:
+        new_score_rsi = 2.0 if rsi_delta > 0 else 0.0
+    new_score_market_structure = (6 if higher_lows else 0) + (6 if higher_highs else 0) + min(12.0, max(0.0, rebound_from_low) * 2.4)
+    new_score_volume = min(8.0, max(0.0, volume_ratio) * 5.0) + (4 if volume_trend_ok else 0)
+    new_p_score = float(new_score_structure + new_score_trend + new_score_live + new_score_rsi + new_score_market_structure + new_score_volume)
+
+    strength_rsi_ok = bool(rsi_now >= float(cfg.research_strength_rsi_min))
+    strength_rebound_ok = bool(rebound_from_low >= float(cfg.research_strength_rebound_min_pct))
+    strength_live_ok = bool(live_gain >= float(cfg.research_strength_live_gain_min_pct))
+    strength_pass_count = int(strength_rsi_ok) + int(strength_rebound_ok) + int(strength_live_ok)
+    strength_2of3_ok = bool(strength_pass_count >= 2)
+    p_live_cap050_ok = bool(live_gain <= float(cfg.research_live_cap_050_pct))
+    p_live_cap060_ok = bool(live_gain <= float(cfg.research_live_cap_060_pct))
 
     last_body = abs(float(last.close - last.open))
     last_lower_wick = max(0.0, min(float(last.open), float(last.close)) - float(last.low))
@@ -1211,7 +1317,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         strategy = "HJ"
         score = float(hj_score)
         selected_price = live_price
-    elif p_ok and p_live_gain_ok:
+    elif p_ok and p_live_gain_ok and quality_ok:
         strategy = "P"
         score = float(p_score)
         selected_price = price
@@ -1251,6 +1357,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
                 rejected.append("p_faded_spike_reentry")
             if p_overextended_continuation:
                 rejected.append("p_overextended_continuation")
+            if not quality_ok:
+                rejected.append("live_candle_quality")
             if not p_live_gain_ok:
                 rejected.append("p_live_gain_over_0_50pct")
             if p_score < 65:
@@ -1303,8 +1411,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
             if last_large_bearish:
                 rejected.append("hj_after_large_bearish")
 
-    # v4.3.53 준P Shadow 후보 판정. 실제 주문 조건에는 절대 사용하지 않는다.
-    # Hard safety는 정식 P와 동일하게 유지하고, soft 조건 딱 1개만 부족한 90점+ 후보만 추적한다.
+    # v4.3.58 준P/새P 연구 판정. LIVE 주문 조건에는 절대 사용하지 않는다.
     junp_soft_checks = {
         "rebound": bool(rebound),
         "momentum_ok": bool(momentum_ok),
@@ -1313,19 +1420,57 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_entry_quality_ok": bool(p_entry_quality_ok),
     }
     junp_missing = [name for name, ok in junp_soft_checks.items() if not ok]
-    junp_hard_ok = bool(
+    junp_hard_base_ok = bool(
         h1_up and pullback_ok and not_chasing and movement_ok and not_extreme
-        and p_ema_quality_ok and p_live_gain_ok
+        and p_ema_quality_ok and quality_ok
         and rebound_from_low >= cfg.min_rebound_from_low_pct
     )
+    junp_hard_ok = bool(junp_hard_base_ok and p_live_gain_ok)
     junp_shadow_candidate = bool(
-        cfg.junp_shadow_enabled
-        and not p_ok
+        cfg.junp_shadow_enabled and not p_ok
         and p_score >= float(cfg.junp_shadow_min_score)
-        and junp_hard_ok
-        and len(junp_missing) == 1
+        and junp_hard_ok and len(junp_missing) == 1
     )
     junp_missing_condition = junp_missing[0] if junp_shadow_candidate else ""
+
+    # 현재 P의 필수조건에서 점수/상한만 분리해 연구 가설을 동시에 판정한다.
+    p_required_checks = {
+        "h1_up": h1_up, "pullback_ok": pullback_ok, "not_chasing": not_chasing,
+        "rebound": rebound, "momentum_ok": momentum_ok, "volume_ok": volume_ok,
+        "volume_trend_ok": volume_trend_ok, "movement_ok": movement_ok,
+        "not_extreme": not_extreme, "p_entry_quality_ok": p_entry_quality_ok,
+        "rebound_min": rebound_from_low >= cfg.min_rebound_from_low_pct,
+        "live_candle_quality": quality_ok,
+    }
+    p_failed_checks = [name for name, ok in p_required_checks.items() if not bool(ok)]
+    p_base_checks_ok = bool(not p_failed_checks)
+    p_current_shadow_candidate = bool(p_base_checks_ok and p_score >= 65 and p_live_cap050_ok)
+    p_strength050_shadow_candidate = bool(p_current_shadow_candidate and strength_2of3_ok)
+    p_strength060_shadow_candidate = bool(p_base_checks_ok and p_score >= 65 and strength_2of3_ok and p_live_cap060_ok)
+    p_newscore060_shadow_candidate = bool(p_base_checks_ok and new_p_score >= float(cfg.research_new_score_min) and strength_2of3_ok and p_live_cap060_ok)
+
+    junp_old_shadow_candidate = bool(
+        cfg.research_shadow_enabled and not p_current_shadow_candidate
+        and p_score >= float(cfg.junp_shadow_min_score)
+        and junp_hard_base_ok and p_live_cap050_ok and len(junp_missing) == 1
+    )
+    junp_new_shadow_candidate = bool(
+        cfg.research_shadow_enabled and not p_newscore060_shadow_candidate
+        and new_p_score >= float(cfg.research_new_score_min)
+        and junp_hard_base_ok and p_live_cap060_ok and len(junp_missing) == 1
+    )
+    research_nearmiss_candidate = bool(
+        cfg.research_shadow_enabled and 1 <= len(p_failed_checks) <= int(cfg.research_nearmiss_max_failed_checks)
+        and (p_score >= float(cfg.research_nearmiss_min_old_score) or new_p_score >= float(cfg.research_new_score_min) or strength_2of3_ok)
+    )
+    research_variants = []
+    if p_current_shadow_candidate: research_variants.append("P_CURRENT")
+    if p_strength050_shadow_candidate: research_variants.append("P_STRENGTH_050")
+    if p_strength060_shadow_candidate: research_variants.append("P_STRENGTH_060")
+    if p_newscore060_shadow_candidate: research_variants.append("P_NEWSCORE_060")
+    if junp_old_shadow_candidate: research_variants.append("JUNP_OLD")
+    if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
+    if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
     details = {
         "price": selected_price,
@@ -1333,6 +1478,30 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "strategy": strategy,
         "score": round(float(score), 2),
         "p_score": round(float(p_score), 2),
+        "new_p_score": round(float(new_p_score), 2),
+        "new_score_structure": round(float(new_score_structure), 2),
+        "new_score_trend": round(float(new_score_trend), 2),
+        "new_score_live": round(float(new_score_live), 2),
+        "new_score_rsi": round(float(new_score_rsi), 2),
+        "new_score_market_structure": round(float(new_score_market_structure), 2),
+        "new_score_volume": round(float(new_score_volume), 2),
+        "strength_rsi_ok": strength_rsi_ok,
+        "strength_rebound_ok": strength_rebound_ok,
+        "strength_live_ok": strength_live_ok,
+        "strength_pass_count": strength_pass_count,
+        "strength_2of3_ok": strength_2of3_ok,
+        "p_current_shadow_candidate": p_current_shadow_candidate,
+        "p_strength050_shadow_candidate": p_strength050_shadow_candidate,
+        "p_strength060_shadow_candidate": p_strength060_shadow_candidate,
+        "p_newscore060_shadow_candidate": p_newscore060_shadow_candidate,
+        "junp_old_shadow_candidate": junp_old_shadow_candidate,
+        "junp_new_shadow_candidate": junp_new_shadow_candidate,
+        "junp_old_missing_condition": junp_missing[0] if junp_old_shadow_candidate and junp_missing else "",
+        "junp_new_missing_condition": junp_missing[0] if junp_new_shadow_candidate and junp_missing else "",
+        "p_failed_check_count": len(p_failed_checks),
+        "p_failed_checks": ",".join(p_failed_checks),
+        "research_nearmiss_candidate": research_nearmiss_candidate,
+        "research_variants": ",".join(research_variants),
         "junp_shadow_candidate": bool(junp_shadow_candidate),
         "junp_missing_condition": junp_missing_condition,
         "entry_reason": (
@@ -1351,19 +1520,33 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "momentum_ok": momentum_ok,
         "not_extreme": not_extreme,
         "rsi": round(float(live.rsi if strategy == "HJ" else row.rsi), 2),
+        "rsi_prev": round(rsi_prev, 2),
+        "rsi_delta": round(rsi_delta, 3),
         "volume_ratio": round(float(live_volume_ratio if strategy == "HJ" else volume_ratio), 2),
+        "live_volume_ratio": round(float(live_volume_ratio), 4),
         "pullback_from_high_pct": round(pullback_from_high, 2),
         "rebound_from_low_pct": round(float(live_rebound_from_low if strategy == "HJ" else rebound_from_low), 2),
         "entry_candle_gain_pct": round(float(live_gain if strategy == "HJ" else entry_candle_gain), 2),
         # v4.3.51: P형에서도 실제 진행봉 상태를 사후 검증할 수 있도록 별도 기록.
+        "live_price": round(float(live_price), 10),
         "live_candle_gain_pct": round(float(live_gain), 4),
         "p_live_max_gain_pct": round(float(cfg.p_live_max_gain_pct), 4),
         "p_live_gain_ok": bool(p_live_gain_ok),
+        "p_live_cap050_ok": p_live_cap050_ok,
+        "p_live_cap060_ok": p_live_cap060_ok,
+        "live_body_pct": round(float((max(float(live.close)-float(live.open),0.0)/float(live.open)*100) if float(live.open)>0 else 0.0), 4),
+        "live_upper_wick_ratio": round(float((max(float(live.high)-max(float(live.open),float(live.close)),0.0)/max(abs(float(live.close)-float(live.open)),1e-12))), 4),
+        "live_lower_wick_ratio": round(float((max(min(float(live.open),float(live.close))-float(live.low),0.0)/max(abs(float(live.close)-float(live.open)),1e-12))), 4),
         "distance_to_recent_high_pct": round(float(live_distance_to_high if strategy == "HJ" else distance_to_high), 2),
         "hj_breakout_raw": bool(hj_breakout_raw),
         "hj_fresh_breakout_confirmed": bool(hj_fresh_breakout),
         "hj_breakout_confirm_age_sec": round(float(hj_breakout_confirm_age_sec), 1),
         "one_hour_move_pct": round(one_hour_move, 2),
+        "one_hour_signed_move_pct": round(one_hour_signed_move, 4),
+        "ema9_slope_pct": round(ema9_slope_pct, 4),
+        "ema20_slope_pct": round(ema20_slope_pct, 4),
+        "ema9_ema20_gap_pct": round(ema9_ema20_gap_pct, 4),
+        "ema20_ema60_gap_pct": round(ema20_ema60_gap_pct, 4),
         "volume_declining_3": volume_declining_3,
         "confirmation_hold": confirmation_hold,
         "ema_ordered": ema_ordered,
@@ -1419,7 +1602,16 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "hj_last_large_bearish": last_large_bearish,
         "hj_body_recovery_pct": round(body_recovery * 100, 2),
         "hj_lower_wick_body_ratio": round(lower_wick_ratio, 2),
-        "rejected_conditions": list(dict.fromkeys(rejected)),
+        "live_quality_ok": bool(quality_ok),
+        "live_quality_reason": str(quality_details.get("reason") or ""),
+        "live_quality_bullish": quality_details.get("bullish", ""),
+        "live_quality_body_ok": quality_details.get("body_ok", ""),
+        "live_quality_wick_ok": quality_details.get("wick_ok", ""),
+        "live_quality_prev_bearish": quality_details.get("prev_bearish", ""),
+        "live_quality_prev_body_recovery": quality_details.get("prev_body_recovery", ""),
+        "live_quality_recovery_ok": quality_details.get("recovery_ok", ""),
+        "live_quality_5m_bullish": quality_details.get("five_ok", ""),
+        "rejected_conditions": list(dict.fromkeys((["live_candle_quality"] if not quality_ok else []) + rejected)),
     }
     return strategy, float(score), details
 
@@ -3244,6 +3436,288 @@ class DailyBot:
                     details=f"{type(exc).__name__}: {exc}", trade_id=trade_id
                 )
 
+    def _register_research_shadow_candidates(self, symbol: str, details: dict[str, Any]) -> None:
+        """v4.3.58: 여러 P/준P 가설을 동일 시점에 가상진입해 사후 결과를 비교한다.
+
+        실제 주문/실제 포지션 DB에는 영향을 주지 않는다. 같은 symbol+variant는 진행 중 1개만 유지한다.
+        """
+        if not self.cfg.research_shadow_enabled:
+            return
+        raw_variants = str(details.get("research_variants") or "")
+        variants = [v.strip() for v in raw_variants.split(",") if v.strip()]
+        if not variants:
+            return
+        price = float(details.get("live_price") or details.get("price") or 0)
+        if price <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        old_score = float(details.get("p_score") or 0)
+        new_score = float(details.get("new_p_score") or 0)
+        snapshot = json.dumps(details, ensure_ascii=False, default=str)
+        for variant in variants:
+            if variant == "JUNP_OLD":
+                missing = str(details.get("junp_old_missing_condition") or "")
+            elif variant == "JUNP_NEW":
+                missing = str(details.get("junp_new_missing_condition") or "")
+            elif variant == "REJECT_NEARMISS":
+                missing = str(details.get("p_failed_checks") or "")
+            else:
+                missing = ""
+            with db() as conn:
+                pending = conn.execute(
+                    "SELECT 1 FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=0 LIMIT 1",
+                    (symbol, variant),
+                ).fetchone()
+                if pending:
+                    continue
+                last = conn.execute(
+                    "SELECT result_ts FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=1 ORDER BY result_ts DESC LIMIT 1",
+                    (symbol, variant),
+                ).fetchone()
+                if last and last["result_ts"]:
+                    try:
+                        last_dt = datetime.fromisoformat(str(last["result_ts"]))
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        if now - last_dt < timedelta(minutes=max(0, int(self.cfg.research_shadow_same_symbol_cooldown_minutes))):
+                            continue
+                    except Exception:
+                        pass
+                opened_at = now.isoformat()
+                shadow_id = f"RSH-{variant}-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+                tp2_price = price * (1 + float(self.cfg.tp2_pct) / 100)
+                be_price = price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+                conn.execute(
+                    """INSERT INTO research_shadow_reviews(
+                        shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                        missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
+                        last_checked_at,mfe_pct,mae_pct
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        shadow_id, variant, symbol, opened_at, int(now.timestamp()*1000), price,
+                        old_score, new_score, missing, snapshot, tp2_price, be_price,
+                        price, price, price, opened_at, 0.0, 0.0,
+                    ),
+                )
+            append_entry_record(
+                symbol, f"RESEARCH_{variant}_ENTRY", variant,
+                new_score if "NEW" in variant or "STRENGTH" in variant else old_score,
+                price,
+                f"old_score={old_score:.2f}; new_score={new_score:.2f}; missing={missing}; actual_order=0",
+                extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
+            )
+
+    def update_research_shadow_reviews(self) -> None:
+        """v4.3.58: 연구용 P/준P/near-miss Shadow를 현재 P 관리규칙으로 가상 추적한다.
+
+        TP1/TP2/BE/STOP/TIME/FLAT 결과와 MFE/MAE를 남긴다. 여러 variant가 같은 symbol이면
+        ticker는 공유해 API 호출량을 줄인다.
+        """
+        with db() as conn:
+            pending = conn.execute(
+                "SELECT * FROM research_shadow_reviews WHERE completed=0 ORDER BY opened_at"
+            ).fetchall()
+        if not pending:
+            return
+
+        symbols = sorted({str(r["symbol"] or "") for r in pending if str(r["symbol"] or "")})
+        ticker_map: dict[str, float] = {}
+        try:
+            for tk in self.client.tickers("SWAP"):
+                sk = str(tk.get("symbol") or "")
+                if sk not in symbols:
+                    continue
+                lv = tk.get("lastPrice")
+                if lv in (None, ""):
+                    lv = tk.get("last")
+                try:
+                    ticker_map[sk] = float(lv or 0)
+                except (TypeError, ValueError):
+                    ticker_map[sk] = 0.0
+        except Exception:
+            pass
+        for symbol in symbols:
+            if float(ticker_map.get(symbol) or 0) > 0:
+                continue
+            try:
+                one = self.client.ticker(symbol)
+                lv = one.get("last")
+                if lv in (None, ""):
+                    lv = one.get("lastPrice")
+                ticker_map[symbol] = float(lv or 0)
+            except Exception as exc:
+                append_entry_record(symbol, "RESEARCH_TICKER_ERROR", "RESEARCH", 0, 0, f"{type(exc).__name__}: {exc}")
+
+        now = datetime.now(timezone.utc)
+        bucket_5m = str(int(now.timestamp()) // 300)
+        bucket_15m = str(int(now.timestamp()) // 900)
+        # 1분 high는 5분 버킷이 바뀐 symbol만 한 번 조회해 여러 variant에 공유한다.
+        due_symbols = {str(r["symbol"] or "") for r in pending if str(r["last_5m_bucket"] or "") != bucket_5m}
+        observed_high_map: dict[str, float] = {}
+        for symbol in sorted(due_symbols):
+            try:
+                m1 = self.client.candles(symbol, "1m", 3)
+                if m1 is not None and len(m1) > 0 and "high" in m1.columns:
+                    observed_high_map[symbol] = float(pd.to_numeric(m1["high"], errors="coerce").dropna().tail(2).max())
+            except Exception:
+                pass
+
+        # 동일 스캔에서 여러 variant가 동시에 열린 경우 stop/structure API 결과를 공유해 rate-limit을 줄인다.
+        stop_cache: dict[tuple[Any, ...], tuple[bool, str, dict[str, Any]]] = {}
+        structure_cache: dict[tuple[Any, ...], tuple[bool, dict[str, Any]]] = {}
+        flat_cache: dict[tuple[Any, ...], tuple[bool, dict[str, Any]]] = {}
+        for review in pending:
+            symbol = str(review["symbol"] or "")
+            variant = str(review["variant"] or "")
+            try:
+                price = float(ticker_map.get(symbol) or 0)
+                if price <= 0:
+                    continue
+                entry_price = float(review["entry_price"] or 0)
+                opened_at = str(review["opened_at"])
+                tp1_done = bool(int(review["tp1_done"] or 0))
+                tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
+                tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
+                be_price = float(review["be_price"] or entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100))
+                highest = max(float(review["highest_price"] or price), price, float(observed_high_map.get(symbol) or 0))
+                lowest = min(float(review["lowest_price"] or price), price)
+                mfe_pct = (highest / entry_price - 1) * 100 if entry_price > 0 else 0.0
+                mae_pct = (lowest / entry_price - 1) * 100 if entry_price > 0 else 0.0
+                opened = datetime.fromisoformat(opened_at)
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                age_min = (now - opened).total_seconds() / 60.0
+                five_due = str(review["last_5m_bucket"] or "") != bucket_5m
+                fifteen_due = str(review["last_15m_bucket"] or "") != bucket_15m
+                observed_high = highest
+
+                result = ""
+                result_price = price
+                result_details: dict[str, Any] = {}
+                if age_min >= float(self.cfg.max_hold_hours) * 60.0:
+                    result = "TIME_EXIT"
+                    result_details = {"age_min": round(age_min, 1)}
+                if not result and not tp1_done and observed_high >= tp1_price:
+                    tp1_done = True
+                    with db() as conn:
+                        conn.execute(
+                            "UPDATE research_shadow_reviews SET tp1_done=1,tp1_ts=?,tp1_price=? WHERE id=?",
+                            (utc_now(), tp1_price, int(review["id"])),
+                        )
+                    append_entry_record(symbol, f"RESEARCH_{variant}_TP1", variant, float(review["new_p_score"] or 0), tp1_price, "actual_order=0",
+                        extra={"shadow_id": str(review["shadow_id"] or ""), "research_variant": variant, "mfe_pct": round(mfe_pct,4), "mae_pct": round(mae_pct,4), "shadow_age_min": round(age_min,1)})
+                if not result and tp1_done and observed_high >= tp2_price:
+                    result, result_price = "TP2", tp2_price
+                    result_details = {"tp2_price": tp2_price}
+                if not result and tp1_done and price <= be_price:
+                    result, result_price = "BE_EXIT", be_price
+                    result_details = {"be_price": be_price}
+
+                if not result and not tp1_done and five_due:
+                    stop_key = (symbol, opened_at, round(entry_price, 12), bucket_5m)
+                    if stop_key in stop_cache:
+                        stop_hit, stop_type, stop_details = stop_cache[stop_key]
+                    else:
+                        stop_hit = False
+                        stop_type = ""
+                        stop_details: dict[str, Any] = {}
+                        try:
+                            crash, d = early_crash_failure_signal(self.client, symbol, opened_at, entry_price, price, self.cfg)
+                            if crash:
+                                stop_hit, stop_type, stop_details = True, "EARLY_CRASH", d
+                        except Exception as exc:
+                            stop_details = {"early_crash_error": str(exc)}
+                        if not stop_hit:
+                            try:
+                                cat, d = p_catastrophic_failure_signal(self.client, symbol, opened_at, entry_price, price, self.cfg)
+                                if cat:
+                                    stop_hit, stop_type, stop_details = True, "P_CATASTROPHIC", d
+                            except Exception as exc:
+                                stop_details = {**stop_details, "p_cat_error": str(exc)}
+                        if not stop_hit and self.cfg.early_failure_enabled:
+                            try:
+                                early, d = early_failure_signal(self.client, symbol, opened_at, self.cfg)
+                                if early:
+                                    stop_hit, stop_type, stop_details = True, str(d.get("failure_type") or "EARLY_FAILURE"), d
+                            except Exception as exc:
+                                stop_details = {**stop_details, "early_failure_error": str(exc)}
+                        if not stop_hit and age_min >= 45.0:
+                            try:
+                                late, d = late_trend_failure_signal(self.client, symbol, int(review["entry_ts_ms"] or 0), False)
+                                if late:
+                                    stop_hit, stop_type, stop_details = True, "LATE_TREND_FAILURE", d
+                            except Exception as exc:
+                                stop_details = {**stop_details, "late_failure_error": str(exc)}
+                        stop_cache[stop_key] = (stop_hit, stop_type, stop_details)
+                    if stop_hit:
+                        result, result_price = "STOP", price
+                        result_details = {"stop_type": stop_type, "stop": stop_details}
+
+                emergency_now = bool(entry_price > 0 and price <= entry_price * (1 - abs(float(self.cfg.structure_emergency_stop_pct)) / 100))
+                if not result and (fifteen_due or emergency_now):
+                    structure_key = (symbol, round(entry_price, 12), bucket_15m, bool(emergency_now))
+                    if structure_key in structure_cache:
+                        broken, structure = structure_cache[structure_key]
+                    else:
+                        try:
+                            broken, structure = hj_structure_broken(self.client, symbol, self.cfg, base_price=entry_price, live_price=price)
+                        except Exception as exc:
+                            broken, structure = False, {"error": str(exc)}
+                        structure_cache[structure_key] = (broken, structure)
+                    if broken:
+                        result = "STOP"
+                        result_price = float(structure.get("price") or price)
+                        result_details = {"stop_type": "STRUCTURE", "stop": structure}
+                if not result and fifteen_due:
+                    flat_due = bool(age_min >= float(self.cfg.flat_exit_minutes) and mfe_pct < float(self.cfg.flat_min_favorable_pct))
+                    if flat_due:
+                        flat_key = (symbol, round(entry_price, 12), bucket_15m)
+                        if flat_key in flat_cache:
+                            flat_ok, flat_details = flat_cache[flat_key]
+                        else:
+                            try:
+                                flat_ok, flat_details = flat_exit_signal(self.client, symbol, entry_price, self.cfg)
+                            except Exception as exc:
+                                flat_ok, flat_details = False, {"error": str(exc)}
+                            flat_cache[flat_key] = (flat_ok, flat_details)
+                        if flat_ok:
+                            result, result_price = "FLAT_EXIT_75M", price
+                            result_details = {"flat": flat_details}
+
+                if result:
+                    result_ts = utc_now()
+                    net_pct = (float(result_price) / entry_price - 1) * 100 if entry_price > 0 else 0.0
+                    details_json = json.dumps({
+                        "shadow_id": str(review["shadow_id"] or ""), "variant": variant,
+                        "entry_price": entry_price, "old_p_score": float(review["old_p_score"] or 0),
+                        "new_p_score": float(review["new_p_score"] or 0), "missing_condition": str(review["missing_condition"] or ""),
+                        "highest_price": highest, "lowest_price": lowest, "mfe_pct": round(mfe_pct, 4),
+                        "mae_pct": round(mae_pct, 4), "age_min": round(age_min, 1), "net_pct_at_exit": round(net_pct, 4),
+                        "snapshot": json.loads(str(review["snapshot_json"] or "{}")), **result_details,
+                    }, ensure_ascii=False, default=str)
+                    with db() as conn:
+                        conn.execute(
+                            """UPDATE research_shadow_reviews SET tp1_done=?,highest_price=?,lowest_price=?,last_price=?,
+                               last_checked_at=?,last_5m_bucket=?,last_15m_bucket=?,mfe_pct=?,mae_pct=?,result=?,result_ts=?,
+                               result_price=?,result_details=?,completed=1 WHERE id=?""",
+                            (1 if tp1_done else 0, highest, lowest, price, result_ts, bucket_5m if five_due else str(review["last_5m_bucket"] or ""),
+                             bucket_15m if (fifteen_due or emergency_now) else str(review["last_15m_bucket"] or ""), mfe_pct, mae_pct,
+                             result, result_ts, float(result_price), details_json, int(review["id"])),
+                        )
+                    append_entry_record(symbol, f"RESEARCH_{variant}_{result}", variant, float(review["new_p_score"] or 0), float(result_price), f"mfe={mfe_pct:.3f}%; mae={mae_pct:.3f}%; actual_order=0",
+                        extra={"shadow_id": str(review["shadow_id"] or ""), "research_variant": variant, "mfe_pct": round(mfe_pct,4), "mae_pct": round(mae_pct,4),
+                               "shadow_age_min": round(age_min,1), "shadow_exit_pct": round(net_pct,4), "shadow_stop_type": str(result_details.get("stop_type") or "")})
+                else:
+                    with db() as conn:
+                        conn.execute(
+                            """UPDATE research_shadow_reviews SET tp1_done=?,highest_price=?,lowest_price=?,last_price=?,last_checked_at=?,
+                               last_5m_bucket=?,last_15m_bucket=?,mfe_pct=?,mae_pct=? WHERE id=?""",
+                            (1 if tp1_done else 0, highest, lowest, price, utc_now(), bucket_5m if five_due else str(review["last_5m_bucket"] or ""),
+                             bucket_15m if (fifteen_due or emergency_now) else str(review["last_15m_bucket"] or ""), mfe_pct, mae_pct, int(review["id"])),
+                        )
+            except Exception as exc:
+                append_entry_record(symbol, "RESEARCH_SHADOW_ERROR", variant, float(review["new_p_score"] or 0), float(review["last_price"] or 0), f"{type(exc).__name__}: {exc}")
+
     def _register_junp_shadow_candidate(self, symbol: str, details: dict[str, Any]) -> None:
         """준P형 후보를 실제 주문 없이 별도 DB/SCAN 기록으로만 등록한다."""
         if not self.cfg.junp_shadow_enabled or not bool(details.get("junp_shadow_candidate")):
@@ -4093,6 +4567,9 @@ class DailyBot:
                 )
                 append_scan_record(symbol, strategy, score, details)
 
+                # v4.3.58: LIVE pause 여부와 무관하게 연구용 P/준P/near-miss Shadow를 등록한다.
+                self._register_research_shadow_candidates(symbol, details)
+
                 # v4.3.53: 준P형은 실제 진입과 완전히 분리된 Shadow로만 등록한다.
                 if bool(details.get("junp_shadow_candidate")):
                     self._register_junp_shadow_candidate(symbol, details)
@@ -4181,6 +4658,7 @@ class DailyBot:
             self.update_stop_reviews()
             self.update_be_shadow_reviews()
             self.update_junp_shadow_reviews()
+            self.update_research_shadow_reviews()
             state_set("stop_review_worker_status", "IDLE")
             state_set("stop_review_worker_finished_at", datetime.now(timezone.utc).isoformat())
         except Exception as exc:
