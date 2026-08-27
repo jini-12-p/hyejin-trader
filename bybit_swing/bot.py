@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.56-JunPShadowTickerFix-StallWeakExit-NoLossCooldown"
+BOT_RUNTIME_VERSION = "RC-v4.3.57-PauseLiveScanJunP-StallWeakExit-NoLossCooldown"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -4049,9 +4049,11 @@ class DailyBot:
         기존처럼 모든 후보를 모은 뒤 별도 진입 루프로 넘기지 않아
         SCAN_OK 이후 발생하던 공통 오류를 우회한다.
         """
-        if state_flag("pause_new_entries", False):
-            append_entry_record("", "ENTRY_BLOCKED", "", 0, 0, "pause_new_entries=1")
-            return
+        live_entry_paused = state_flag("pause_new_entries", False)
+        if live_entry_paused:
+            # v4.3.57: LIVE 신규진입만 막고 SCAN/JUNP Shadow는 계속 수행한다.
+            # 실제 주문은 아래 strategy 처리 직전에 차단한다.
+            append_entry_record("", "ENTRY_PAUSED_SCAN_CONTINUES", "", 0, 0, "pause_new_entries=1; scan=1; junp_shadow=1; live_order=0")
         if self.loss_cooldown_active():
             losses = self.consecutive_losses()
             state_set("loss_cooldown_active", "1")
@@ -4062,12 +4064,14 @@ class DailyBot:
         open_rows = self.open_rows()
         open_symbols = {str(r["symbol"]) for r in open_rows}
         slots = max(0, int(self.cfg.max_positions) - len(open_symbols))
-        if slots <= 0:
+        if slots <= 0 and not live_entry_paused:
             append_entry_record("", "ENTRY_BLOCKED", "", 0, 0, "slots=0")
             return
 
         for symbol in self.active_symbols():
-            if slots <= 0:
+            # LIVE 진입이 허용된 경우에만 실제 슬롯 제한으로 스캔을 멈춘다.
+            # pause 상태에서는 준P Shadow 후보 수집을 위해 전체 스캔을 계속한다.
+            if slots <= 0 and not live_entry_paused:
                 break
             if symbol in open_symbols:
                 continue
@@ -4095,6 +4099,16 @@ class DailyBot:
 
                 if not strategy:
                     continue
+
+                # v4.3.57: pause_new_entries는 실제 LIVE 주문만 차단한다.
+                # SCAN/정식 P 신호 기록/준P Shadow 등록은 위에서 정상 수행된다.
+                if live_entry_paused:
+                    append_entry_record(
+                        symbol, "ENTRY_BLOCKED", strategy, score, price,
+                        "pause_new_entries=1; scan_and_junp_shadow_continued=1"
+                    )
+                    continue
+
                 if same_risk_group(symbol, open_symbols):
                     continue
 
