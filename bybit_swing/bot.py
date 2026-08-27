@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.51-PLiveGainCap050"
+BOT_RUNTIME_VERSION = "RC-v4.3.52-BEShadowTrack"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -522,6 +522,27 @@ def init_db() -> None:
             review_label TEXT,
             completed INTEGER NOT NULL DEFAULT 0,
             UNIQUE(trade_id, stop_event, stop_ts)
+        );
+        CREATE TABLE IF NOT EXISTS be_shadow_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            strategy TEXT,
+            opened_at TEXT NOT NULL,
+            shadow_started_at TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            be_exit_price REAL NOT NULL,
+            tp2_price REAL NOT NULL,
+            highest_price REAL,
+            lowest_price REAL,
+            last_price REAL,
+            last_checked_at TEXT,
+            last_structure_bucket TEXT,
+            result TEXT,
+            result_ts TEXT,
+            result_price REAL,
+            result_details TEXT,
+            completed INTEGER NOT NULL DEFAULT 0
         );
         """)
         _ensure_column(conn, "bot_positions", "strategy", "TEXT DEFAULT 'P'")
@@ -2954,6 +2975,158 @@ class DailyBot:
                 ),
             )
 
+            # v4.3.52: 실제 TP1→BE_EXIT로 끝난 거래만 shadow 추적한다.
+            # 실제 주문/포지션에는 전혀 영향 없이, BE가 없었다고 가정했을 때
+            # TP2와 TP1 이후 공통 구조손절 중 무엇이 먼저였는지 기록한다.
+            if stop_event == "BE_EXIT" and entry_price > 0:
+                tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+                started_at = utc_now()
+                conn.execute(
+                    """INSERT OR IGNORE INTO be_shadow_reviews(
+                        trade_id,symbol,strategy,opened_at,shadow_started_at,entry_price,
+                        be_exit_price,tp2_price,highest_price,lowest_price,last_price,last_checked_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(row["trade_id"] or ""),
+                        str(row["symbol"]),
+                        str(row["strategy"] or ""),
+                        str(row["opened_at"]),
+                        started_at,
+                        entry_price,
+                        float(stop_price),
+                        tp2_price,
+                        float(stop_price),
+                        float(stop_price),
+                        float(stop_price),
+                        started_at,
+                    ),
+                )
+
+    def update_be_shadow_reviews(self) -> None:
+        """TP1→BE_EXIT 이후를 가상 추적한다 (실제 주문 없음).
+
+        가정은 딱 하나다: TP1은 실제처럼 이미 체결됐고, +0.15% BE만 없었다.
+        그 상태에서 실제 봇의 TP1 이후 공통 구조손절과 TP2(+3%) 중
+        무엇이 먼저 발생하는지, 또는 원래 3시간 TIME_EXIT까지 둘 다 없는지 기록한다.
+        """
+        with db() as conn:
+            pending = conn.execute(
+                "SELECT * FROM be_shadow_reviews WHERE completed=0 ORDER BY shadow_started_at"
+            ).fetchall()
+        if not pending:
+            return
+
+        # shadow가 여러 개여도 현재가는 public tickers 한 번으로 묶어 조회해
+        # LIVE 주문/스캔 API에 불필요한 부담을 주지 않는다.
+        try:
+            ticker_map = {
+                str(t.get("symbol") or ""): float(t.get("last") or 0)
+                for t in self.client.tickers("SWAP")
+            }
+        except Exception as exc:
+            log_event("", "BE_SHADOW_TICKER_ERROR", mode=self.cfg.mode, details=str(exc))
+            return
+
+        now = datetime.now(timezone.utc)
+        current_bucket = str(int(now.timestamp()) // 900)
+
+        for review in pending:
+            symbol = str(review["symbol"] or "")
+            trade_id = str(review["trade_id"] or "")
+            try:
+                price = float(ticker_map.get(symbol) or 0)
+                if price <= 0:
+                    continue
+                entry_price = float(review["entry_price"] or 0)
+                tp2_price = float(review["tp2_price"] or 0)
+                highest = max(float(review["highest_price"] or price), price)
+                lowest = min(float(review["lowest_price"] or price), price)
+
+                opened = datetime.fromisoformat(str(review["opened_at"]))
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                age_h = (now - opened).total_seconds() / 3600.0
+
+                # 구조손절은 확정 15분봉 기준이라 15분 버킷이 바뀔 때만 재계산한다.
+                # 단, -8% 재난손절은 live_price 기반이므로 즉시 확인한다.
+                emergency_now = bool(
+                    entry_price > 0
+                    and price <= entry_price * (1 - abs(float(self.cfg.structure_emergency_stop_pct)) / 100)
+                )
+                structure_due = (str(review["last_structure_bucket"] or "") != current_bucket) or emergency_now
+                broken = False
+                structure = {}
+                if self.cfg.hj_structure_stop_enabled and structure_due:
+                    broken, structure = hj_structure_broken(
+                        self.client, symbol, self.cfg,
+                        base_price=entry_price, live_price=price
+                    )
+
+                tp2_hit = bool(tp2_price > 0 and price >= tp2_price)
+
+                # 같은 샘플에서 둘 다 처음 보이면 선후를 확정할 수 없으므로 따로 표시한다.
+                if tp2_hit and broken:
+                    result = "AMBIGUOUS_TP2_OR_STOP"
+                    result_price = price
+                    details = {"structure": structure, "note": "same shadow sample"}
+                elif tp2_hit:
+                    result = "TP2_FIRST"
+                    result_price = price
+                    details = {"tp2_price": tp2_price}
+                elif broken:
+                    result = "STOP_FIRST"
+                    result_price = float(structure.get("price") or price)
+                    details = {"structure": structure}
+                elif age_h >= float(self.cfg.max_hold_hours):
+                    result = "TIME_EXIT_FIRST"
+                    result_price = price
+                    details = {"max_hold_hours": self.cfg.max_hold_hours}
+                else:
+                    with db() as conn:
+                        conn.execute(
+                            """UPDATE be_shadow_reviews SET highest_price=?,lowest_price=?,last_price=?,
+                               last_checked_at=?,last_structure_bucket=? WHERE id=?""",
+                            (
+                                highest, lowest, price, utc_now(),
+                                current_bucket if structure_due else str(review["last_structure_bucket"] or ""),
+                                int(review["id"]),
+                            ),
+                        )
+                    continue
+
+                result_ts = utc_now()
+                with db() as conn:
+                    conn.execute(
+                        """UPDATE be_shadow_reviews SET highest_price=?,lowest_price=?,last_price=?,
+                           last_checked_at=?,last_structure_bucket=?,result=?,result_ts=?,result_price=?,
+                           result_details=?,completed=1 WHERE id=?""",
+                        (
+                            highest, lowest, price, result_ts,
+                            current_bucket if structure_due else str(review["last_structure_bucket"] or ""),
+                            result, result_ts, float(result_price),
+                            json.dumps(details, ensure_ascii=False), int(review["id"]),
+                        ),
+                    )
+                log_event(
+                    symbol, f"BE_SHADOW_{result}", float(result_price), 0, self.cfg.mode,
+                    details=json.dumps({
+                        "source": "tp1_be_shadow_only",
+                        "entry_price": entry_price,
+                        "be_exit_price": float(review["be_exit_price"] or 0),
+                        "tp2_price": tp2_price,
+                        "highest_price": highest,
+                        "lowest_price": lowest,
+                        "age_hours": round(age_h, 3),
+                        **details,
+                    }, ensure_ascii=False),
+                    strategy=str(review["strategy"] or ""), trade_id=trade_id
+                )
+            except Exception as exc:
+                log_event(
+                    symbol, "BE_SHADOW_ERROR", mode=self.cfg.mode,
+                    details=f"{type(exc).__name__}: {exc}", trade_id=trade_id
+                )
+
     def update_stop_reviews(self) -> None:
         """미완료 손절 리뷰를 현재 시세로 채우고 3시간 뒤 자동 분류한다."""
         milestones = (
@@ -3498,6 +3671,7 @@ class DailyBot:
     def run_once(self) -> None:
         self.manage()
         self.update_stop_reviews()
+        self.update_be_shadow_reviews()
         self.scan_entries()
 
     def _scan_entries_background(self) -> None:
@@ -3527,6 +3701,7 @@ class DailyBot:
             state_set("stop_review_worker_status", "RUNNING")
             state_set("stop_review_worker_started_at", datetime.now(timezone.utc).isoformat())
             self.update_stop_reviews()
+            self.update_be_shadow_reviews()
             state_set("stop_review_worker_status", "IDLE")
             state_set("stop_review_worker_finished_at", datetime.now(timezone.utc).isoformat())
         except Exception as exc:
