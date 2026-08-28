@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.58-ResearchShadow-FullTelemetry-NoLiveChange"
+BOT_RUNTIME_VERSION = "RC-v4.3.59-Pv2-JunPv2-Shadow"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -228,6 +228,16 @@ class DailyConfig:
     research_nearmiss_max_failed_checks: int = 2
     research_nearmiss_min_old_score: float = 90.0
 
+    # v4.3.59 새 P/JUNP v2 Shadow 기준. LIVE 주문에는 사용하지 않는다.
+    # 8/28 누적 연구에서 TP2군과 STOP군 차이가 반복된 추세 지속력(1h 방향, EMA slope/gap, rebound)을
+    # 중심으로 점수화하고, 단일 old-P boolean 하나 때문에 강한 후보가 탈락하지 않게 설계한다.
+    research_pv2_total_min: float = 62.0
+    research_pv2_component_pass_min: int = 3
+    research_pv2_signal_pass_min: int = 4
+    research_junpv2_total_min: float = 54.0
+    research_junpv2_component_pass_min: int = 2
+    research_junpv2_signal_pass_min: int = 3
+
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
     hj_high_zone_max_distance_pct: float = 0.50
@@ -394,6 +404,10 @@ SCAN_REJECTED_FIELDS = [
     "junp_old_shadow_candidate", "junp_new_shadow_candidate",
     "junp_old_missing_condition", "junp_new_missing_condition",
     "p_failed_check_count", "p_failed_checks", "research_nearmiss_candidate",
+    # v4.3.59 P/JUNP v2 full telemetry
+    "p_v2_score", "p_v2_trend_score", "p_v2_structure_score", "p_v2_momentum_score",
+    "p_v2_soft_score", "p_v2_signal_pass_count", "p_v2_component_pass_count",
+    "p_v2_candidate", "junp_v2_candidate", "junp_v2_missing_components",
     "research_variants",
     "live_quality_ok", "live_quality_reason", "live_quality_bullish", "live_quality_body_ok",
     "live_quality_wick_ok", "live_quality_prev_bearish", "live_quality_prev_body_recovery",
@@ -968,6 +982,62 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     p_live_cap050_ok = bool(live_gain <= float(cfg.research_live_cap_050_pct))
     p_live_cap060_ok = bool(live_gain <= float(cfg.research_live_cap_060_pct))
 
+    # v4.3.59 P v2: “모양”보다 추세가 실제로 살아 있는지를 중심으로 별도 점수화한다.
+    # 각 항목을 연속 점수로 만들어 RSI/volume 한 조건의 경계값 때문에 좋은 후보가 잘리지 않게 한다.
+    p_v2_trend_score = (
+        min(15.0, max(0.0, one_hour_signed_move) * 6.0)
+        + min(10.0, max(0.0, ema9_slope_pct) * 25.0)
+        + min(10.0, max(0.0, ema20_slope_pct) * 30.0)
+        + min(10.0, max(0.0, ema9_ema20_gap_pct) * 6.67)
+    )
+    p_v2_structure_score = (
+        min(15.0, max(0.0, rebound_from_low) * 2.0)
+        + (5.0 if higher_highs else 0.0)
+        + (5.0 if higher_lows else 0.0)
+    )
+    if 62.0 <= rsi_now <= 72.0:
+        p_v2_rsi_level_score = 12.0
+    elif 58.0 <= rsi_now < 62.0:
+        p_v2_rsi_level_score = 8.0
+    elif 54.0 <= rsi_now < 58.0:
+        p_v2_rsi_level_score = 4.0
+    elif 72.0 < rsi_now <= 75.0:
+        p_v2_rsi_level_score = 8.0
+    elif rsi_now > 75.0:
+        p_v2_rsi_level_score = 3.0
+    else:
+        p_v2_rsi_level_score = 0.0
+    p_v2_rsi_delta_score = max(-3.0, min(5.0, rsi_delta * 1.5))
+    p_v2_live_score = 5.0 if 0.20 <= live_gain <= 0.60 else (2.0 if -0.10 <= live_gain <= 0.90 else 0.0)
+    p_v2_momentum_score = p_v2_rsi_level_score + p_v2_rsi_delta_score + p_v2_live_score
+    p_v2_soft_score = (
+        (3.0 if pullback_ok else 0.0)
+        + (3.0 if rebound else 0.0)
+        + (2.0 if momentum_ok else 0.0)
+        + (2.0 if volume_ok else 0.0)
+        + (2.0 if volume_trend_ok else 0.0)
+        + (3.0 if quality_ok else 0.0)
+        + (3.0 if not_chasing else 0.0)
+    )
+    p_v2_score = float(p_v2_trend_score + p_v2_structure_score + p_v2_momentum_score + p_v2_soft_score)
+    p_v2_signal_checks = {
+        "1h_positive_force": one_hour_signed_move >= 0.75,
+        "ema9_rising_force": ema9_slope_pct >= 0.12,
+        "ema20_rising_force": ema20_slope_pct >= 0.08,
+        "ema_gap_alive": ema9_ema20_gap_pct >= 0.20,
+        "rebound_force": rebound_from_low >= 3.50,
+        "rsi_level": rsi_now >= 56.0,
+        "rsi_not_fading": rsi_delta >= -1.0,
+    }
+    p_v2_signal_pass_count = sum(int(v) for v in p_v2_signal_checks.values())
+    p_v2_component_checks = {
+        "trend": p_v2_trend_score >= 20.0,
+        "structure": p_v2_structure_score >= 10.0,
+        "momentum": p_v2_momentum_score >= 8.0,
+        "soft_quality": p_v2_soft_score >= 10.0,
+    }
+    p_v2_component_pass_count = sum(int(v) for v in p_v2_component_checks.values())
+
     last_body = abs(float(last.close - last.open))
     last_lower_wick = max(0.0, min(float(last.open), float(last.close)) - float(last.low))
     lower_wick_ratio = last_lower_wick / max(last_body, 1e-12)
@@ -1463,6 +1533,24 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         cfg.research_shadow_enabled and 1 <= len(p_failed_checks) <= int(cfg.research_nearmiss_max_failed_checks)
         and (p_score >= float(cfg.research_nearmiss_min_old_score) or new_p_score >= float(cfg.research_new_score_min) or strength_2of3_ok)
     )
+
+    # v4.3.59 새 P v2 / 준P v2 Shadow. 실제 LIVE P 판정(p_ok)은 그대로 유지한다.
+    # 절대 안전조건만 hard로 두고, 기존 rebound/volume/not_chasing/quality는 점수로 흡수한다.
+    p_v2_hard_ok = bool(h1_up and movement_ok and not_extreme and p_live_cap060_ok)
+    p_v2_candidate = bool(
+        cfg.research_shadow_enabled and p_v2_hard_ok
+        and p_v2_score >= float(cfg.research_pv2_total_min)
+        and p_v2_component_pass_count >= int(cfg.research_pv2_component_pass_min)
+        and p_v2_signal_pass_count >= int(cfg.research_pv2_signal_pass_min)
+    )
+    junp_v2_candidate = bool(
+        cfg.research_shadow_enabled and p_v2_hard_ok and not p_v2_candidate
+        and p_v2_score >= float(cfg.research_junpv2_total_min)
+        and p_v2_component_pass_count >= int(cfg.research_junpv2_component_pass_min)
+        and p_v2_signal_pass_count >= int(cfg.research_junpv2_signal_pass_min)
+    )
+    junp_v2_missing_components = ",".join(name for name, ok in p_v2_component_checks.items() if not ok) if junp_v2_candidate else ""
+
     research_variants = []
     if p_current_shadow_candidate: research_variants.append("P_CURRENT")
     if p_strength050_shadow_candidate: research_variants.append("P_STRENGTH_050")
@@ -1470,6 +1558,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     if p_newscore060_shadow_candidate: research_variants.append("P_NEWSCORE_060")
     if junp_old_shadow_candidate: research_variants.append("JUNP_OLD")
     if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
+    if p_v2_candidate: research_variants.append("P_V2")
+    if junp_v2_candidate: research_variants.append("JUNP_V2")
     if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
     details = {
@@ -1501,6 +1591,16 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_failed_check_count": len(p_failed_checks),
         "p_failed_checks": ",".join(p_failed_checks),
         "research_nearmiss_candidate": research_nearmiss_candidate,
+        "p_v2_score": round(float(p_v2_score), 2),
+        "p_v2_trend_score": round(float(p_v2_trend_score), 2),
+        "p_v2_structure_score": round(float(p_v2_structure_score), 2),
+        "p_v2_momentum_score": round(float(p_v2_momentum_score), 2),
+        "p_v2_soft_score": round(float(p_v2_soft_score), 2),
+        "p_v2_signal_pass_count": int(p_v2_signal_pass_count),
+        "p_v2_component_pass_count": int(p_v2_component_pass_count),
+        "p_v2_candidate": bool(p_v2_candidate),
+        "junp_v2_candidate": bool(junp_v2_candidate),
+        "junp_v2_missing_components": junp_v2_missing_components,
         "research_variants": ",".join(research_variants),
         "junp_shadow_candidate": bool(junp_shadow_candidate),
         "junp_missing_condition": junp_missing_condition,
@@ -3437,7 +3537,7 @@ class DailyBot:
                 )
 
     def _register_research_shadow_candidates(self, symbol: str, details: dict[str, Any]) -> None:
-        """v4.3.58: 여러 P/준P 가설을 동일 시점에 가상진입해 사후 결과를 비교한다.
+        """v4.3.59: 기존 연구군 + 새 P/JUNP v2를 동일 시점에 가상진입해 사후 결과를 비교한다.
 
         실제 주문/실제 포지션 DB에는 영향을 주지 않는다. 같은 symbol+variant는 진행 중 1개만 유지한다.
         """
@@ -3459,10 +3559,13 @@ class DailyBot:
                 missing = str(details.get("junp_old_missing_condition") or "")
             elif variant == "JUNP_NEW":
                 missing = str(details.get("junp_new_missing_condition") or "")
+            elif variant == "JUNP_V2":
+                missing = str(details.get("junp_v2_missing_components") or "")
             elif variant == "REJECT_NEARMISS":
                 missing = str(details.get("p_failed_checks") or "")
             else:
                 missing = ""
+            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2") else new_score
             with db() as conn:
                 pending = conn.execute(
                     "SELECT 1 FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=0 LIMIT 1",
@@ -3495,15 +3598,15 @@ class DailyBot:
                     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         shadow_id, variant, symbol, opened_at, int(now.timestamp()*1000), price,
-                        old_score, new_score, missing, snapshot, tp2_price, be_price,
+                        old_score, variant_score, missing, snapshot, tp2_price, be_price,
                         price, price, price, opened_at, 0.0, 0.0,
                     ),
                 )
             append_entry_record(
                 symbol, f"RESEARCH_{variant}_ENTRY", variant,
-                new_score if "NEW" in variant or "STRENGTH" in variant else old_score,
+                variant_score if variant in ("P_V2", "JUNP_V2") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
                 price,
-                f"old_score={old_score:.2f}; new_score={new_score:.2f}; missing={missing}; actual_order=0",
+                f"old_score={old_score:.2f}; new_score={new_score:.2f}; v2_score={float(details.get('p_v2_score') or 0):.2f}; missing={missing}; actual_order=0",
                 extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
             )
 
