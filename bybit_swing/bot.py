@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.61-Pv22-JunPv22-Shadow"
+BOT_RUNTIME_VERSION = "RC-v4.3.62-Pv22-JunPv22-Telemetry3Bar"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -432,6 +432,18 @@ SCAN_REJECTED_FIELDS = [
     "p_v22_heat_count", "p_v22_heat_flags", "p_v22_late_extension",
     "p_v22_structure_weak_count", "p_v22_structure_weak_flags", "p_v22_structure_incomplete",
     "p_v22_candidate", "junp_v22_candidate", "junp_v22_missing_reason",
+    # v4.3.62 telemetry only: 진입 직전 3개 확정 15분봉의 힘이 가속/둔화되는지 추적.
+    # P_V22/JUNP_V22 진입 판정에는 사용하지 않는다.
+    "prev1_candle_gain_pct", "prev2_candle_gain_pct", "prev3_candle_gain_pct",
+    "rsi_prev2", "rsi_prev3", "rsi_change_prev1", "rsi_change_prev2",
+    "ema9_slope_prev1_pct", "ema9_slope_prev2_pct",
+    "ema20_slope_prev1_pct", "ema20_slope_prev2_pct",
+    "ema9_ema20_gap_prev1_pct", "ema9_ema20_gap_prev2_pct", "ema9_ema20_gap_prev3_pct",
+    "close_change_prev1_pct", "close_change_prev2_pct", "close_change_prev3_pct",
+    "high_change_prev1_pct", "high_change_prev2_pct", "high_change_prev3_pct",
+    "low_change_prev1_pct", "low_change_prev2_pct", "low_change_prev3_pct",
+    "ema9_slope_delta_pct", "ema20_slope_delta_pct", "ema_gap_delta_pct",
+    "rsi_rollover_3bar", "price_gain_decelerating_3bar", "ema_force_decelerating",
     "research_variants",
     "live_quality_ok", "live_quality_reason", "live_quality_bullish", "live_quality_body_ok",
     "live_quality_wick_ok", "live_quality_prev_bearish", "live_quality_prev_body_recovery",
@@ -975,6 +987,55 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     ema20_slope_pct = (float(row.ema20) / float(prev.ema20) - 1) * 100 if float(prev.ema20) > 0 else 0.0
     ema9_ema20_gap_pct = (float(row.ema9) / float(row.ema20) - 1) * 100 if float(row.ema20) > 0 else 0.0
     ema20_ema60_gap_pct = (float(row.ema20) / float(row.ema60) - 1) * 100 if float(row.ema60) > 0 else 0.0
+
+    # v4.3.62 telemetry only: latest confirmed bar(row)와 그 직전 2개 확정봉의
+    # candle/RSI/EMA/고저점 변화를 저장한다. 신호 판정에는 사용하지 않는다.
+    prev3 = m15.iloc[-4]
+
+    def _pct_change(now_value: float, prev_value: float) -> float:
+        return (float(now_value) / float(prev_value) - 1) * 100 if float(prev_value) != 0 else 0.0
+
+    def _bar_gain(bar) -> float:
+        return _pct_change(float(bar.close), float(bar.open)) if float(bar.open) != 0 else 0.0
+
+    prev1_candle_gain_pct = _bar_gain(row)
+    prev2_candle_gain_pct = _bar_gain(prev)
+    prev3_candle_gain_pct = _bar_gain(prevprev)
+
+    rsi_prev2 = float(prevprev.rsi)
+    rsi_prev3 = float(prev3.rsi)
+    rsi_change_prev1 = float(prev.rsi) - float(prevprev.rsi)
+    rsi_change_prev2 = float(prevprev.rsi) - float(prev3.rsi)
+
+    ema9_slope_prev1_pct = _pct_change(float(prev.ema9), float(prevprev.ema9))
+    ema9_slope_prev2_pct = _pct_change(float(prevprev.ema9), float(prev3.ema9))
+    ema20_slope_prev1_pct = _pct_change(float(prev.ema20), float(prevprev.ema20))
+    ema20_slope_prev2_pct = _pct_change(float(prevprev.ema20), float(prev3.ema20))
+
+    ema9_ema20_gap_prev1_pct = _pct_change(float(prev.ema9), float(prev.ema20))
+    ema9_ema20_gap_prev2_pct = _pct_change(float(prevprev.ema9), float(prevprev.ema20))
+    ema9_ema20_gap_prev3_pct = _pct_change(float(prev3.ema9), float(prev3.ema20))
+
+    close_change_prev1_pct = _pct_change(float(row.close), float(prev.close))
+    close_change_prev2_pct = _pct_change(float(prev.close), float(prevprev.close))
+    close_change_prev3_pct = _pct_change(float(prevprev.close), float(prev3.close))
+    high_change_prev1_pct = _pct_change(float(row.high), float(prev.high))
+    high_change_prev2_pct = _pct_change(float(prev.high), float(prevprev.high))
+    high_change_prev3_pct = _pct_change(float(prevprev.high), float(prev3.high))
+    low_change_prev1_pct = _pct_change(float(row.low), float(prev.low))
+    low_change_prev2_pct = _pct_change(float(prev.low), float(prevprev.low))
+    low_change_prev3_pct = _pct_change(float(prevprev.low), float(prev3.low))
+
+    ema9_slope_delta_pct = ema9_slope_pct - ema9_slope_prev1_pct
+    ema20_slope_delta_pct = ema20_slope_pct - ema20_slope_prev1_pct
+    ema_gap_delta_pct = ema9_ema20_gap_pct - ema9_ema20_gap_prev1_pct
+    rsi_rollover_3bar = bool(rsi_change_prev2 > 0 and rsi_change_prev1 > 0 and rsi_delta < 0)
+    price_gain_decelerating_3bar = bool(
+        close_change_prev3_pct > close_change_prev2_pct > close_change_prev1_pct
+    )
+    ema_force_decelerating = bool(
+        ema9_slope_pct < ema9_slope_prev1_pct and ema20_slope_pct < ema20_slope_prev1_pct
+    )
 
     new_score_structure = (15 if h1_up else 0) + (10 if pullback_ok else 0) + (10 if rebound else 0) + (10 if p_ema_quality_ok else 0)
     new_score_trend = min(18.0, max(0.0, one_hour_signed_move) * 6.0) + (6 if ema9_rising else 0)
@@ -1748,6 +1809,35 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_v22_candidate": bool(p_v22_candidate),
         "junp_v22_candidate": bool(junp_v22_candidate),
         "junp_v22_missing_reason": junp_v22_missing_reason,
+        "prev1_candle_gain_pct": round(float(prev1_candle_gain_pct), 4),
+        "prev2_candle_gain_pct": round(float(prev2_candle_gain_pct), 4),
+        "prev3_candle_gain_pct": round(float(prev3_candle_gain_pct), 4),
+        "rsi_prev2": round(float(rsi_prev2), 3),
+        "rsi_prev3": round(float(rsi_prev3), 3),
+        "rsi_change_prev1": round(float(rsi_change_prev1), 3),
+        "rsi_change_prev2": round(float(rsi_change_prev2), 3),
+        "ema9_slope_prev1_pct": round(float(ema9_slope_prev1_pct), 4),
+        "ema9_slope_prev2_pct": round(float(ema9_slope_prev2_pct), 4),
+        "ema20_slope_prev1_pct": round(float(ema20_slope_prev1_pct), 4),
+        "ema20_slope_prev2_pct": round(float(ema20_slope_prev2_pct), 4),
+        "ema9_ema20_gap_prev1_pct": round(float(ema9_ema20_gap_prev1_pct), 4),
+        "ema9_ema20_gap_prev2_pct": round(float(ema9_ema20_gap_prev2_pct), 4),
+        "ema9_ema20_gap_prev3_pct": round(float(ema9_ema20_gap_prev3_pct), 4),
+        "close_change_prev1_pct": round(float(close_change_prev1_pct), 4),
+        "close_change_prev2_pct": round(float(close_change_prev2_pct), 4),
+        "close_change_prev3_pct": round(float(close_change_prev3_pct), 4),
+        "high_change_prev1_pct": round(float(high_change_prev1_pct), 4),
+        "high_change_prev2_pct": round(float(high_change_prev2_pct), 4),
+        "high_change_prev3_pct": round(float(high_change_prev3_pct), 4),
+        "low_change_prev1_pct": round(float(low_change_prev1_pct), 4),
+        "low_change_prev2_pct": round(float(low_change_prev2_pct), 4),
+        "low_change_prev3_pct": round(float(low_change_prev3_pct), 4),
+        "ema9_slope_delta_pct": round(float(ema9_slope_delta_pct), 4),
+        "ema20_slope_delta_pct": round(float(ema20_slope_delta_pct), 4),
+        "ema_gap_delta_pct": round(float(ema_gap_delta_pct), 4),
+        "rsi_rollover_3bar": bool(rsi_rollover_3bar),
+        "price_gain_decelerating_3bar": bool(price_gain_decelerating_3bar),
+        "ema_force_decelerating": bool(ema_force_decelerating),
         "research_variants": ",".join(research_variants),
         "junp_shadow_candidate": bool(junp_shadow_candidate),
         "junp_missing_condition": junp_missing_condition,
