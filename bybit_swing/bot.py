@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.60-Pv21-JunPv21-Shadow"
+BOT_RUNTIME_VERSION = "RC-v4.3.61-Pv22-JunPv22-Shadow"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -245,6 +245,16 @@ class DailyConfig:
     research_junpv21_persistence_min: float = 38.0
     research_junpv21_signal_pass_min: int = 4
     research_pv21_max_overheat_risk_count: int = 1
+    # v4.3.61: P/JUNP v2.2 Shadow. v2.1의 전체 점수는 유지하되 실패 유형을 두 갈래로 최소 보정한다.
+    # 1) 약한/미완성 구조, 2) 강하지만 이미 과진행된 끝물. LIVE 주문에는 사용하지 않는다.
+    research_pv22_total_min: float = 68.0
+    research_pv22_persistence_min: float = 46.0
+    research_pv22_signal_pass_min: int = 4
+    research_junpv22_total_min: float = 60.0
+    research_junpv22_persistence_min: float = 42.0
+    research_junpv22_signal_pass_min: int = 4
+    research_pv22_max_heat_count: int = 2
+    research_pv22_max_structure_weak_count: int = 2
 
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
@@ -418,6 +428,10 @@ SCAN_REJECTED_FIELDS = [
     "p_v2_candidate", "junp_v2_candidate", "junp_v2_missing_components",
     "p_v21_persistence_score", "p_v21_overheat_risk_count", "p_v21_overheat_flags",
     "p_v21_candidate", "junp_v21_candidate", "junp_v21_missing_reason",
+    # v4.3.61 P/JUNP v2.2: 구조 미완성 + 복합 과진행을 분리 기록
+    "p_v22_heat_count", "p_v22_heat_flags", "p_v22_late_extension",
+    "p_v22_structure_weak_count", "p_v22_structure_weak_flags", "p_v22_structure_incomplete",
+    "p_v22_candidate", "junp_v22_candidate", "junp_v22_missing_reason",
     "research_variants",
     "live_quality_ok", "live_quality_reason", "live_quality_bullish", "live_quality_body_ok",
     "live_quality_wick_ok", "live_quality_prev_bearish", "live_quality_prev_body_recovery",
@@ -1064,6 +1078,45 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     p_v21_overheat_risk_count = len(p_v21_overheat_flags_list)
     p_v21_overheat_flags = ",".join(p_v21_overheat_flags_list)
 
+    # v4.3.61 P v2.2 연구용 보정.
+    # 단일 RSI/EMA 컷이 아니라, 여러 과진행 신호가 동시에 겹칠 때만 끝물로 판정한다.
+    p_v22_heat_flags_list = []
+    if rsi_now >= 75.0:
+        p_v22_heat_flags_list.append("rsi_ge_75")
+    if rebound_from_low >= 12.0:
+        p_v22_heat_flags_list.append("rebound_ge_12")
+    if ema9_ema20_gap_pct >= 2.0:
+        p_v22_heat_flags_list.append("ema_gap_ge_2")
+    if one_hour_signed_move >= 3.5:
+        p_v22_heat_flags_list.append("1h_ge_3p5")
+    if live_gain >= 0.45:
+        p_v22_heat_flags_list.append("live_ge_045")
+    p_v22_heat_count = len(p_v22_heat_flags_list)
+    p_v22_heat_flags = ",".join(p_v22_heat_flags_list)
+    p_v22_late_extension = bool(
+        p_v22_heat_count > int(cfg.research_pv22_max_heat_count)
+        or (rsi_now >= 78.0 and rsi_delta >= 4.0 and p_v22_heat_count >= 2)
+    )
+
+    # 구조 미완성도 한 숫자로 자르지 않는다. gap/EMA slope/구조점수/1h 힘이 여러 개 동시에 약할 때만 차단한다.
+    p_v22_structure_weak_flags_list = []
+    if ema9_ema20_gap_pct < 0.05:
+        p_v22_structure_weak_flags_list.append("ema_gap_lt_005")
+    if ema20_slope_pct < 0.06:
+        p_v22_structure_weak_flags_list.append("ema20_slope_lt_006")
+    if ema9_slope_pct < 0.08:
+        p_v22_structure_weak_flags_list.append("ema9_slope_lt_008")
+    if p_v2_structure_score < 12.0:
+        p_v22_structure_weak_flags_list.append("structure_lt_12")
+    if one_hour_signed_move < 0.40:
+        p_v22_structure_weak_flags_list.append("1h_lt_040")
+    p_v22_structure_weak_count = len(p_v22_structure_weak_flags_list)
+    p_v22_structure_weak_flags = ",".join(p_v22_structure_weak_flags_list)
+    p_v22_structure_incomplete = bool(
+        p_v22_structure_weak_count > int(cfg.research_pv22_max_structure_weak_count)
+        or (ema9_ema20_gap_pct <= 0.0 and (ema20_slope_pct <= 0.0 or p_v2_structure_score < 14.0))
+    )
+
     last_body = abs(float(last.close - last.open))
     last_lower_wick = max(0.0, min(float(last.open), float(last.close)) - float(last.low))
     lower_wick_ratio = last_lower_wick / max(last_body, 1e-12)
@@ -1601,6 +1654,35 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     else:
         junp_v21_missing_reason = ""
 
+    # v4.3.61 P/JUNP v2.2 Shadow. v2.1은 비교 telemetry로 남기되 신규 Shadow 등록은 v2.2만 한다.
+    p_v22_candidate = bool(
+        cfg.research_shadow_enabled and p_v2_hard_ok
+        and p_v2_score >= float(cfg.research_pv22_total_min)
+        and p_v21_persistence_score >= float(cfg.research_pv22_persistence_min)
+        and p_v2_signal_pass_count >= int(cfg.research_pv22_signal_pass_min)
+        and not p_v22_structure_incomplete
+        and not p_v22_late_extension
+    )
+    junp_v22_candidate = bool(
+        cfg.research_shadow_enabled and p_v2_hard_ok and not p_v22_candidate
+        and p_v2_score >= float(cfg.research_junpv22_total_min)
+        and p_v21_persistence_score >= float(cfg.research_junpv22_persistence_min)
+        and p_v2_signal_pass_count >= int(cfg.research_junpv22_signal_pass_min)
+        and p_v2_structure_score >= 12.0
+        and ema9_ema20_gap_pct > -0.05
+        and ema20_slope_pct > 0.0
+        and not p_v22_structure_incomplete
+        and not p_v22_late_extension
+    )
+    if junp_v22_candidate:
+        _miss22 = []
+        if p_v2_score < float(cfg.research_pv22_total_min): _miss22.append("p_total")
+        if p_v21_persistence_score < float(cfg.research_pv22_persistence_min): _miss22.append("p_persistence")
+        if p_v2_signal_pass_count < int(cfg.research_pv22_signal_pass_min): _miss22.append("p_signal")
+        junp_v22_missing_reason = ",".join(_miss22) or "below_p_v22"
+    else:
+        junp_v22_missing_reason = ""
+
     research_variants = []
     if p_current_shadow_candidate: research_variants.append("P_CURRENT")
     if p_strength050_shadow_candidate: research_variants.append("P_STRENGTH_050")
@@ -1608,8 +1690,8 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     if p_newscore060_shadow_candidate: research_variants.append("P_NEWSCORE_060")
     if junp_old_shadow_candidate: research_variants.append("JUNP_OLD")
     if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
-    if p_v21_candidate: research_variants.append("P_V21")
-    if junp_v21_candidate: research_variants.append("JUNP_V21")
+    if p_v22_candidate: research_variants.append("P_V22")
+    if junp_v22_candidate: research_variants.append("JUNP_V22")
     if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
     details = {
@@ -1657,6 +1739,15 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_v21_candidate": bool(p_v21_candidate),
         "junp_v21_candidate": bool(junp_v21_candidate),
         "junp_v21_missing_reason": junp_v21_missing_reason,
+        "p_v22_heat_count": int(p_v22_heat_count),
+        "p_v22_heat_flags": p_v22_heat_flags,
+        "p_v22_late_extension": bool(p_v22_late_extension),
+        "p_v22_structure_weak_count": int(p_v22_structure_weak_count),
+        "p_v22_structure_weak_flags": p_v22_structure_weak_flags,
+        "p_v22_structure_incomplete": bool(p_v22_structure_incomplete),
+        "p_v22_candidate": bool(p_v22_candidate),
+        "junp_v22_candidate": bool(junp_v22_candidate),
+        "junp_v22_missing_reason": junp_v22_missing_reason,
         "research_variants": ",".join(research_variants),
         "junp_shadow_candidate": bool(junp_shadow_candidate),
         "junp_missing_condition": junp_missing_condition,
@@ -3593,7 +3684,7 @@ class DailyBot:
                 )
 
     def _register_research_shadow_candidates(self, symbol: str, details: dict[str, Any]) -> None:
-        """v4.3.60: 기존 연구군 + 새 P/JUNP v2.1을 동일 시점에 가상진입해 사후 결과를 비교한다.
+        """v4.3.61: 기존 연구군 + 새 P/JUNP v2.2를 동일 시점에 가상진입해 사후 결과를 비교한다.
 
         실제 주문/실제 포지션 DB에는 영향을 주지 않는다. 같은 symbol+variant는 진행 중 1개만 유지한다.
         """
@@ -3619,11 +3710,13 @@ class DailyBot:
                 missing = str(details.get("junp_v2_missing_components") or "")
             elif variant == "JUNP_V21":
                 missing = str(details.get("junp_v21_missing_reason") or "")
+            elif variant == "JUNP_V22":
+                missing = str(details.get("junp_v22_missing_reason") or "")
             elif variant == "REJECT_NEARMISS":
                 missing = str(details.get("p_failed_checks") or "")
             else:
                 missing = ""
-            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21") else new_score
+            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "JUNP_V22") else new_score
             with db() as conn:
                 pending = conn.execute(
                     "SELECT 1 FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=0 LIMIT 1",
@@ -3662,7 +3755,7 @@ class DailyBot:
                 )
             append_entry_record(
                 symbol, f"RESEARCH_{variant}_ENTRY", variant,
-                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
+                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "JUNP_V22") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
                 price,
                 f"old_score={old_score:.2f}; new_score={new_score:.2f}; v2_score={float(details.get('p_v2_score') or 0):.2f}; missing={missing}; actual_order=0",
                 extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
