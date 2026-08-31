@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.62-Pv22-JunPv22-Telemetry3Bar"
+BOT_RUNTIME_VERSION = "RC-v4.3.63-Pv23-DualFilter-Shadow"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -255,6 +255,10 @@ class DailyConfig:
     research_junpv22_signal_pass_min: int = 4
     research_pv22_max_heat_count: int = 2
     research_pv22_max_structure_weak_count: int = 2
+    # v4.3.63 P_V23 research-only dual filter. P_V22 remains unchanged as control.
+    research_pv23_weak_ema20_slope_max: float = 0.25
+    research_pv23_weak_ema_gap_max: float = 1.00
+    research_pv23_rsi_delta_spike_min: float = 8.00
 
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
@@ -432,6 +436,8 @@ SCAN_REJECTED_FIELDS = [
     "p_v22_heat_count", "p_v22_heat_flags", "p_v22_late_extension",
     "p_v22_structure_weak_count", "p_v22_structure_weak_flags", "p_v22_structure_incomplete",
     "p_v22_candidate", "junp_v22_candidate", "junp_v22_missing_reason",
+    # v4.3.63 P_V23: P_V22를 대조군으로 유지하고 두 STOP 선택 필터를 동시에 검증한다.
+    "p_v23_weak_trend_block", "p_v23_rsi_spike_block", "p_v23_block_reason", "p_v23_candidate",
     # v4.3.62 telemetry only: 진입 직전 3개 확정 15분봉의 힘이 가속/둔화되는지 추적.
     # P_V22/JUNP_V22 진입 판정에는 사용하지 않는다.
     "prev1_candle_gain_pct", "prev2_candle_gain_pct", "prev3_candle_gain_pct",
@@ -1744,6 +1750,30 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     else:
         junp_v22_missing_reason = ""
 
+    # v4.3.63 P_V23 research-only.
+    # 전체 P_V22를 더 조이는 대신, 과거 P_V22 결과에서 STOP에 선택적으로 몰린 두 패턴만 동시에 차단한다.
+    # 1) 중기 추세 받침 약함: EMA20 slope < 0.25% AND EMA9-20 gap < 1.00%
+    # 2) 순간 RSI 과가속: RSI delta >= 8.0
+    # 실제 LIVE 주문/기존 P_V22/JUNP_V22 판정은 변경하지 않는다.
+    p_v23_weak_trend_block = bool(
+        ema20_slope_pct < float(cfg.research_pv23_weak_ema20_slope_max)
+        and ema9_ema20_gap_pct < float(cfg.research_pv23_weak_ema_gap_max)
+    )
+    p_v23_rsi_spike_block = bool(
+        rsi_delta >= float(cfg.research_pv23_rsi_delta_spike_min)
+    )
+    _v23_reasons = []
+    if p_v23_weak_trend_block:
+        _v23_reasons.append("weak_ema20_and_gap")
+    if p_v23_rsi_spike_block:
+        _v23_reasons.append("rsi_delta_ge_8")
+    p_v23_block_reason = ",".join(_v23_reasons)
+    p_v23_candidate = bool(
+        p_v22_candidate
+        and not p_v23_weak_trend_block
+        and not p_v23_rsi_spike_block
+    )
+
     research_variants = []
     if p_current_shadow_candidate: research_variants.append("P_CURRENT")
     if p_strength050_shadow_candidate: research_variants.append("P_STRENGTH_050")
@@ -1752,6 +1782,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     if junp_old_shadow_candidate: research_variants.append("JUNP_OLD")
     if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
     if p_v22_candidate: research_variants.append("P_V22")
+    if p_v23_candidate: research_variants.append("P_V23")
     if junp_v22_candidate: research_variants.append("JUNP_V22")
     if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
@@ -1809,6 +1840,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_v22_candidate": bool(p_v22_candidate),
         "junp_v22_candidate": bool(junp_v22_candidate),
         "junp_v22_missing_reason": junp_v22_missing_reason,
+        "p_v23_weak_trend_block": bool(p_v23_weak_trend_block),
+        "p_v23_rsi_spike_block": bool(p_v23_rsi_spike_block),
+        "p_v23_block_reason": p_v23_block_reason,
+        "p_v23_candidate": bool(p_v23_candidate),
         "prev1_candle_gain_pct": round(float(prev1_candle_gain_pct), 4),
         "prev2_candle_gain_pct": round(float(prev2_candle_gain_pct), 4),
         "prev3_candle_gain_pct": round(float(prev3_candle_gain_pct), 4),
@@ -3774,7 +3809,7 @@ class DailyBot:
                 )
 
     def _register_research_shadow_candidates(self, symbol: str, details: dict[str, Any]) -> None:
-        """v4.3.61: 기존 연구군 + 새 P/JUNP v2.2를 동일 시점에 가상진입해 사후 결과를 비교한다.
+        """v4.3.63: 기존 연구군 + P_V22 대조군 + P_V23 dual-filter를 동일 시점에 가상진입해 사후 결과를 비교한다.
 
         실제 주문/실제 포지션 DB에는 영향을 주지 않는다. 같은 symbol+variant는 진행 중 1개만 유지한다.
         """
@@ -3806,7 +3841,7 @@ class DailyBot:
                 missing = str(details.get("p_failed_checks") or "")
             else:
                 missing = ""
-            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "JUNP_V22") else new_score
+            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "JUNP_V22") else new_score
             with db() as conn:
                 pending = conn.execute(
                     "SELECT 1 FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=0 LIMIT 1",
@@ -3845,7 +3880,7 @@ class DailyBot:
                 )
             append_entry_record(
                 symbol, f"RESEARCH_{variant}_ENTRY", variant,
-                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "JUNP_V22") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
+                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "JUNP_V22") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
                 price,
                 f"old_score={old_score:.2f}; new_score={new_score:.2f}; v2_score={float(details.get('p_v2_score') or 0):.2f}; missing={missing}; actual_order=0",
                 extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
