@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.64-Pv24-ConfirmCohort-BETrace-Shadow"
+BOT_RUNTIME_VERSION = "RC-v4.3.65-Pv24-AllConfirm-RollingCohort-BETrace-Shadow"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -269,6 +269,7 @@ class DailyConfig:
     research_pv24_max_entries_per_15m: int = 2
     research_pv24_stop_pause_window_minutes: int = 30
     research_pv24_stop_pause_count: int = 2
+    research_pv24_max_open_positions: int = 2
 
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
@@ -1804,11 +1805,12 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not p_v23_rsi_spike_block
     )
 
-    # P_V24: 깨끗한 V23 신호는 즉시 비교, 위험 V22 신호는 setup WATCH로 회복 확인.
+    # v4.3.65 P_V24: 모든 P_V22 후보를 같은 방식으로 WATCH -> 회복확인 후 진입한다.
+    # V23 통과 후보도 즉시 진입시키지 않는다.
     _setup_bucket = int(datetime.now(timezone.utc).timestamp()) // 900
-    p_setup_id = f"PSET-{symbol}-{_setup_bucket}"
-    p_v24_immediate_candidate = bool(p_v23_candidate)
-    p_v24_watch_candidate = bool(p_v22_candidate and not p_v23_candidate)
+    p_setup_id = f"P65SET-{symbol}-{_setup_bucket}"
+    p_v24_immediate_candidate = False
+    p_v24_watch_candidate = bool(p_v22_candidate)
 
     research_variants = []
     if p_current_shadow_candidate: research_variants.append("P_CURRENT")
@@ -1819,7 +1821,6 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
     if p_v22_candidate: research_variants.append("P_V22")
     if p_v23_candidate: research_variants.append("P_V23")
-    if p_v24_immediate_candidate: research_variants.append("P_V24")
     if junp_v22_candidate: research_variants.append("JUNP_V22")
     if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
@@ -1884,7 +1885,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_setup_id": p_setup_id,
         "p_v24_watch_candidate": bool(p_v24_watch_candidate),
         "p_v24_immediate_candidate": bool(p_v24_immediate_candidate),
-        "p_v24_confirm_state": "IMMEDIATE" if p_v24_immediate_candidate else ("WATCH" if p_v24_watch_candidate else ""),
+        "p_v24_confirm_state": "WATCH" if p_v24_watch_candidate else "",
         "prev1_candle_gain_pct": round(float(prev1_candle_gain_pct), 4),
         "prev2_candle_gain_pct": round(float(prev2_candle_gain_pct), 4),
         "prev3_candle_gain_pct": round(float(prev3_candle_gain_pct), 4),
@@ -3944,8 +3945,9 @@ class DailyBot:
                 extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
             )
 
-        if bool(details.get("p_v22_candidate")):
-            self._handle_pv24_watch(symbol, details)
+        # v4.3.65: 활성 WATCH는 이후 P_V22 조건에서 빠져도 매 스캔 계속 추적한다.
+        # 새 WATCH 생성 여부는 _handle_pv24_watch 내부의 p_v24_watch_candidate가 결정한다.
+        self._handle_pv24_watch(symbol, details)
 
     def _pv24_has_active_watch(self, symbol: str, now: datetime) -> bool:
         lock_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_same_setup_lock_minutes)))
@@ -3957,13 +3959,27 @@ class DailyBot:
         return bool(row)
 
     def _pv24_can_open_now(self, now: datetime) -> tuple[bool, str]:
-        bucket_start = now - timedelta(minutes=now.minute % 15, seconds=now.second, microseconds=now.microsecond)
+        # v4.3.65: 고정 시계 구간이 아니라 직전 15분 rolling window로 제한한다.
+        rolling_start = now - timedelta(minutes=15)
         stop_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_stop_pause_window_minutes)))
         with db() as conn:
-            cnt = conn.execute("SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND opened_at>=?", (bucket_start.isoformat(),)).fetchone()
+            cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND opened_at>=?",
+                (rolling_start.isoformat(),),
+            ).fetchone()
             if int(cnt["n"] or 0) >= max(1, int(self.cfg.research_pv24_max_entries_per_15m)):
-                return False, "cohort_entry_cap"
-            stops = conn.execute("SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND completed=1 AND result='STOP' AND result_ts>=?", (stop_cut.isoformat(),)).fetchone()
+                return False, "rolling_15m_entry_cap"
+
+            open_cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND completed=0"
+            ).fetchone()
+            if int(open_cnt["n"] or 0) >= max(1, int(self.cfg.research_pv24_max_open_positions)):
+                return False, "max_open_positions"
+
+            stops = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND completed=1 AND result='STOP' AND result_ts>=?",
+                (stop_cut.isoformat(),),
+            ).fetchone()
             if int(stops["n"] or 0) >= max(1, int(self.cfg.research_pv24_stop_pause_count)):
                 return False, "recent_stop_pause"
         return True, ""
@@ -3996,7 +4012,7 @@ class DailyBot:
     def _handle_pv24_watch(self, symbol: str, details: dict[str, Any]) -> None:
         now = datetime.now(timezone.utc); price = float(details.get("live_price") or details.get("price") or 0)
         if price <= 0: return
-        base_setup = str(details.get("p_setup_id") or f"PSET-{symbol}-{int(now.timestamp())//900}")
+        base_setup = str(details.get("p_setup_id") or f"P65SET-{symbol}-{int(now.timestamp())//900}")
         lock_cut = now - timedelta(minutes=max(1,int(self.cfg.research_pv24_same_setup_lock_minutes)))
         confirmed_setup = None
         with db() as conn:
@@ -4024,8 +4040,8 @@ class DailyBot:
                     return
                 expires=now+timedelta(minutes=max(1,int(self.cfg.research_pv24_confirm_max_minutes)))
                 conn.execute("""INSERT OR IGNORE INTO research_pv24_setups(setup_id,symbol,first_seen_at,last_seen_at,trigger_price,lowest_price,last_price,block_reason,snapshot_json,status,expires_at) VALUES(?,?,?,?,?,?,?,?,?,'WATCH',?)""",
-                    (base_setup,symbol,now.isoformat(),now.isoformat(),price,price,price,str(details.get("p_v23_block_reason") or ""),json.dumps(details,ensure_ascii=False,default=str),expires.isoformat()))
-                append_entry_record(symbol,"RESEARCH_P_V24_WATCH","P_V24",float(details.get("p_v2_score") or 0),price,str(details.get("p_v23_block_reason") or ""),extra={**details,"p_setup_id":base_setup,"p_v24_confirm_state":"WATCH"})
+                    (base_setup,symbol,now.isoformat(),now.isoformat(),price,price,price,str(details.get("p_v23_block_reason") or "all_confirm"),json.dumps(details,ensure_ascii=False,default=str),expires.isoformat()))
+                append_entry_record(symbol,"RESEARCH_P_V24_WATCH","P_V24",float(details.get("p_v2_score") or 0),price,str(details.get("p_v23_block_reason") or "all_confirm"),extra={**details,"p_setup_id":base_setup,"p_v24_confirm_state":"WATCH"})
                 return
         if confirmed_setup:
             self._open_pv24_confirmed_shadow(symbol, details, confirmed_setup, price, "CONFIRMED_RECOVERY")
