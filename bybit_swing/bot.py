@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.64-Pv24-ConfirmCohort-BETrace-Shadow"
+BOT_RUNTIME_VERSION = "RC-v4.3.66-Pv24-4Slot-Pv25-5mTrigger-Shadow"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -269,6 +269,14 @@ class DailyConfig:
     research_pv24_max_entries_per_15m: int = 2
     research_pv24_stop_pause_window_minutes: int = 30
     research_pv24_stop_pause_count: int = 2
+    research_pv24_max_open_positions: int = 4
+    # v4.3.66 P_V25 research-only: P_V22가 고른 15분 후보를 확정 5분봉 재가속으로 실행한다.
+    research_pv25_confirm_min_minutes: int = 5
+    research_pv25_confirm_max_minutes: int = 20
+    research_pv25_max_adverse_before_confirm_pct: float = 1.50
+    research_pv25_same_setup_lock_minutes: int = 45
+    research_pv25_max_entries_per_15m: int = 2
+    research_pv25_max_open_positions: int = 4
 
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
@@ -450,6 +458,9 @@ SCAN_REJECTED_FIELDS = [
     "p_v23_weak_trend_block", "p_v23_rsi_spike_block", "p_v23_block_reason", "p_v23_candidate",
     # v4.3.64 P_V24 confirm/setup telemetry
     "p_setup_id", "p_v24_watch_candidate", "p_v24_immediate_candidate", "p_v24_confirm_state",
+    # v4.3.66 P_V25 15m-candidate + confirmed-5m execution telemetry
+    "p_v25_setup_id", "p_v25_confirm_state", "p_v25_5m_bullish",
+    "p_v25_prev_high_break", "p_v25_closed_5m_price",
     # v4.3.62 telemetry only: 진입 직전 3개 확정 15분봉의 힘이 가속/둔화되는지 추적.
     # P_V22/JUNP_V22 진입 판정에는 사용하지 않는다.
     "prev1_candle_gain_pct", "prev2_candle_gain_pct", "prev3_candle_gain_pct",
@@ -728,6 +739,15 @@ def init_db() -> None:
             trigger_price REAL NOT NULL, lowest_price REAL NOT NULL, last_price REAL NOT NULL,
             block_reason TEXT, snapshot_json TEXT, status TEXT NOT NULL DEFAULT 'WATCH',
             confirmed_at TEXT, confirmed_price REAL, expires_at TEXT, note TEXT
+        );
+        CREATE TABLE IF NOT EXISTS research_pv25_setups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            setup_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+            trigger_price REAL NOT NULL, lowest_price REAL NOT NULL, last_price REAL NOT NULL,
+            snapshot_json TEXT, status TEXT NOT NULL DEFAULT 'WATCH',
+            last_5m_bucket TEXT, confirmed_at TEXT, confirmed_price REAL,
+            expires_at TEXT, note TEXT
         );
         CREATE TABLE IF NOT EXISTS research_be_shadow_reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1804,11 +1824,12 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not p_v23_rsi_spike_block
     )
 
-    # P_V24: 깨끗한 V23 신호는 즉시 비교, 위험 V22 신호는 setup WATCH로 회복 확인.
+    # v4.3.65 P_V24: 모든 P_V22 후보를 같은 방식으로 WATCH -> 회복확인 후 진입한다.
+    # V23 통과 후보도 즉시 진입시키지 않는다.
     _setup_bucket = int(datetime.now(timezone.utc).timestamp()) // 900
-    p_setup_id = f"PSET-{symbol}-{_setup_bucket}"
-    p_v24_immediate_candidate = bool(p_v23_candidate)
-    p_v24_watch_candidate = bool(p_v22_candidate and not p_v23_candidate)
+    p_setup_id = f"P65SET-{symbol}-{_setup_bucket}"
+    p_v24_immediate_candidate = False
+    p_v24_watch_candidate = bool(p_v22_candidate)
 
     research_variants = []
     if p_current_shadow_candidate: research_variants.append("P_CURRENT")
@@ -1819,7 +1840,6 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
     if p_v22_candidate: research_variants.append("P_V22")
     if p_v23_candidate: research_variants.append("P_V23")
-    if p_v24_immediate_candidate: research_variants.append("P_V24")
     if junp_v22_candidate: research_variants.append("JUNP_V22")
     if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
@@ -1884,7 +1904,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_setup_id": p_setup_id,
         "p_v24_watch_candidate": bool(p_v24_watch_candidate),
         "p_v24_immediate_candidate": bool(p_v24_immediate_candidate),
-        "p_v24_confirm_state": "IMMEDIATE" if p_v24_immediate_candidate else ("WATCH" if p_v24_watch_candidate else ""),
+        "p_v24_confirm_state": "WATCH" if p_v24_watch_candidate else "",
         "prev1_candle_gain_pct": round(float(prev1_candle_gain_pct), 4),
         "prev2_candle_gain_pct": round(float(prev2_candle_gain_pct), 4),
         "prev3_candle_gain_pct": round(float(prev3_candle_gain_pct), 4),
@@ -3858,8 +3878,7 @@ class DailyBot:
             return
         raw_variants = str(details.get("research_variants") or "")
         variants = [v.strip() for v in raw_variants.split(",") if v.strip()]
-        if not variants:
-            return
+        # v4.3.66: variant가 없는 스캔에서도 활성 P_V24/P_V25 WATCH의 가격경로는 계속 추적해야 한다.
         price = float(details.get("live_price") or details.get("price") or 0)
         if price <= 0:
             return
@@ -3892,7 +3911,7 @@ class DailyBot:
                 missing = str(details.get("p_failed_checks") or "")
             else:
                 missing = ""
-            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "P_V24", "JUNP_V22") else new_score
+            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "P_V24", "P_V25", "JUNP_V22") else new_score
             with db() as conn:
                 pending = conn.execute(
                     "SELECT 1 FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=0 LIMIT 1",
@@ -3938,14 +3957,16 @@ class DailyBot:
                 )
             append_entry_record(
                 symbol, f"RESEARCH_{variant}_ENTRY", variant,
-                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "P_V24", "JUNP_V22") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
+                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "P_V24", "P_V25", "JUNP_V22") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
                 price,
                 f"old_score={old_score:.2f}; new_score={new_score:.2f}; v2_score={float(details.get('p_v2_score') or 0):.2f}; missing={missing}; actual_order=0",
                 extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
             )
 
-        if bool(details.get("p_v22_candidate")):
-            self._handle_pv24_watch(symbol, details)
+        # v4.3.65+: 활성 WATCH는 이후 P_V22 조건에서 빠져도 매 스캔 계속 추적한다.
+        self._handle_pv24_watch(symbol, details)
+        # v4.3.66: P_V25는 P_V22 후보를 별도 WATCH로 받아 확정 5분봉 재가속만 검증한다.
+        self._handle_pv25_watch(symbol, details)
 
     def _pv24_has_active_watch(self, symbol: str, now: datetime) -> bool:
         lock_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_same_setup_lock_minutes)))
@@ -3957,13 +3978,27 @@ class DailyBot:
         return bool(row)
 
     def _pv24_can_open_now(self, now: datetime) -> tuple[bool, str]:
-        bucket_start = now - timedelta(minutes=now.minute % 15, seconds=now.second, microseconds=now.microsecond)
+        # v4.3.65: 고정 시계 구간이 아니라 직전 15분 rolling window로 제한한다.
+        rolling_start = now - timedelta(minutes=15)
         stop_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_stop_pause_window_minutes)))
         with db() as conn:
-            cnt = conn.execute("SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND opened_at>=?", (bucket_start.isoformat(),)).fetchone()
+            cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND opened_at>=?",
+                (rolling_start.isoformat(),),
+            ).fetchone()
             if int(cnt["n"] or 0) >= max(1, int(self.cfg.research_pv24_max_entries_per_15m)):
-                return False, "cohort_entry_cap"
-            stops = conn.execute("SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND completed=1 AND result='STOP' AND result_ts>=?", (stop_cut.isoformat(),)).fetchone()
+                return False, "rolling_15m_entry_cap"
+
+            open_cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND completed=0"
+            ).fetchone()
+            if int(open_cnt["n"] or 0) >= max(1, int(self.cfg.research_pv24_max_open_positions)):
+                return False, "max_open_positions"
+
+            stops = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND completed=1 AND result='STOP' AND result_ts>=?",
+                (stop_cut.isoformat(),),
+            ).fetchone()
             if int(stops["n"] or 0) >= max(1, int(self.cfg.research_pv24_stop_pause_count)):
                 return False, "recent_stop_pause"
         return True, ""
@@ -3996,7 +4031,7 @@ class DailyBot:
     def _handle_pv24_watch(self, symbol: str, details: dict[str, Any]) -> None:
         now = datetime.now(timezone.utc); price = float(details.get("live_price") or details.get("price") or 0)
         if price <= 0: return
-        base_setup = str(details.get("p_setup_id") or f"PSET-{symbol}-{int(now.timestamp())//900}")
+        base_setup = str(details.get("p_setup_id") or f"P65SET-{symbol}-{int(now.timestamp())//900}")
         lock_cut = now - timedelta(minutes=max(1,int(self.cfg.research_pv24_same_setup_lock_minutes)))
         confirmed_setup = None
         with db() as conn:
@@ -4024,11 +4059,152 @@ class DailyBot:
                     return
                 expires=now+timedelta(minutes=max(1,int(self.cfg.research_pv24_confirm_max_minutes)))
                 conn.execute("""INSERT OR IGNORE INTO research_pv24_setups(setup_id,symbol,first_seen_at,last_seen_at,trigger_price,lowest_price,last_price,block_reason,snapshot_json,status,expires_at) VALUES(?,?,?,?,?,?,?,?,?,'WATCH',?)""",
-                    (base_setup,symbol,now.isoformat(),now.isoformat(),price,price,price,str(details.get("p_v23_block_reason") or ""),json.dumps(details,ensure_ascii=False,default=str),expires.isoformat()))
-                append_entry_record(symbol,"RESEARCH_P_V24_WATCH","P_V24",float(details.get("p_v2_score") or 0),price,str(details.get("p_v23_block_reason") or ""),extra={**details,"p_setup_id":base_setup,"p_v24_confirm_state":"WATCH"})
+                    (base_setup,symbol,now.isoformat(),now.isoformat(),price,price,price,str(details.get("p_v23_block_reason") or "all_confirm"),json.dumps(details,ensure_ascii=False,default=str),expires.isoformat()))
+                append_entry_record(symbol,"RESEARCH_P_V24_WATCH","P_V24",float(details.get("p_v2_score") or 0),price,str(details.get("p_v23_block_reason") or "all_confirm"),extra={**details,"p_setup_id":base_setup,"p_v24_confirm_state":"WATCH"})
                 return
         if confirmed_setup:
             self._open_pv24_confirmed_shadow(symbol, details, confirmed_setup, price, "CONFIRMED_RECOVERY")
+
+    def _pv25_can_open_now(self, now: datetime) -> tuple[bool, str]:
+        """P_V25 portfolio guard. LIVE 예정 4슬롯을 반영하되 15분 몰림은 2건으로 제한한다."""
+        rolling_start = now - timedelta(minutes=15)
+        stop_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_stop_pause_window_minutes)))
+        with db() as conn:
+            cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V25' AND opened_at>=?",
+                (rolling_start.isoformat(),),
+            ).fetchone()
+            if int(cnt["n"] or 0) >= max(1, int(self.cfg.research_pv25_max_entries_per_15m)):
+                return False, "rolling_15m_entry_cap"
+            open_cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V25' AND completed=0"
+            ).fetchone()
+            if int(open_cnt["n"] or 0) >= max(1, int(self.cfg.research_pv25_max_open_positions)):
+                return False, "max_open_positions"
+            stops = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V25' AND completed=1 AND result='STOP' AND result_ts>=?",
+                (stop_cut.isoformat(),),
+            ).fetchone()
+            if int(stops["n"] or 0) >= max(1, int(self.cfg.research_pv24_stop_pause_count)):
+                return False, "recent_stop_pause"
+        return True, ""
+
+    def _open_pv25_confirmed_shadow(self, symbol: str, details: dict[str, Any], setup_id: str,
+                                     entry_price: float, five_bullish: bool, high_break: bool) -> bool:
+        now = datetime.now(timezone.utc)
+        allowed, why = self._pv25_can_open_now(now)
+        if not allowed:
+            with db() as conn:
+                conn.execute("UPDATE research_pv25_setups SET status='DROPPED',last_seen_at=?,note=? WHERE setup_id=?",
+                             (now.isoformat(), why, setup_id))
+            append_entry_record(symbol, "RESEARCH_P_V25_SKIPPED", "P_V25", float(details.get("p_v2_score") or 0), entry_price, why,
+                extra={**details, "p_v25_setup_id": setup_id, "p_v25_confirm_state": why,
+                       "p_v25_5m_bullish": five_bullish, "p_v25_prev_high_break": high_break,
+                       "p_v25_closed_5m_price": entry_price})
+            return False
+        with db() as conn:
+            existing = conn.execute("SELECT 1 FROM research_shadow_reviews WHERE variant='P_V25' AND setup_id=? LIMIT 1", (setup_id,)).fetchone()
+            if existing:
+                return False
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V25-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details)
+            snap.update({"p_v25_confirm_state": "CONFIRMED_5M_BREAK", "p_v25_5m_bullish": five_bullish,
+                         "p_v25_prev_high_break": high_break, "p_v25_closed_5m_price": entry_price,
+                         "p_v25_setup_id": setup_id})
+            conn.execute("""INSERT INTO research_shadow_reviews(
+                shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,mfe_pct,mae_pct,setup_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (shadow_id,"P_V25",symbol,opened_at,int(now.timestamp()*1000),entry_price,float(details.get("p_score") or 0),
+                 float(details.get("p_v2_score") or 0),"confirmed_5m_break",json.dumps(snap,ensure_ascii=False,default=str),
+                 tp2_price,be_price,entry_price,entry_price,entry_price,opened_at,0.0,0.0,setup_id))
+            conn.execute("UPDATE research_pv25_setups SET status='CONFIRMED',confirmed_at=?,confirmed_price=?,last_seen_at=?,note=? WHERE setup_id=?",
+                         (now.isoformat(),entry_price,now.isoformat(),"confirmed_5m_break",setup_id))
+        append_entry_record(symbol,"RESEARCH_P_V25_ENTRY","P_V25",float(details.get("p_v2_score") or 0),entry_price,
+            "confirmed closed 5m bullish + previous high break; actual_order=0",
+            extra={**details,"shadow_id":shadow_id,"research_variant":"P_V25","shadow_entry_time":_kst_stamp(opened_at),
+                   "p_v25_setup_id":setup_id,"p_v25_confirm_state":"CONFIRMED_5M_BREAK",
+                   "p_v25_5m_bullish":five_bullish,"p_v25_prev_high_break":high_break,"p_v25_closed_5m_price":entry_price})
+        return True
+
+    def _handle_pv25_watch(self, symbol: str, details: dict[str, Any]) -> None:
+        """P_V25: 15분 P_V22 후보 발생 후 확정 5분봉에서 재가속이 확인될 때만 Shadow 진입."""
+        now = datetime.now(timezone.utc)
+        live_price = float(details.get("live_price") or details.get("price") or 0)
+        if live_price <= 0:
+            return
+        source_setup = str(details.get("p_setup_id") or f"P65SET-{symbol}-{int(now.timestamp())//900}")
+        bucket_suffix = source_setup.rsplit("-", 1)[-1] if "-" in source_setup else str(int(now.timestamp())//900)
+        setup_id = f"P25SET-{symbol}-{bucket_suffix}"
+        lock_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv25_same_setup_lock_minutes)))
+        current_5m_bucket = str(int(now.timestamp()) // 300)
+
+        with db() as conn:
+            recent = conn.execute(
+                "SELECT * FROM research_pv25_setups WHERE symbol=? AND first_seen_at>=? ORDER BY first_seen_at DESC LIMIT 1",
+                (symbol, lock_cut.isoformat()),
+            ).fetchone()
+            if not recent:
+                if not bool(details.get("p_v22_candidate")):
+                    return
+                expires = now + timedelta(minutes=max(1, int(self.cfg.research_pv25_confirm_max_minutes)))
+                conn.execute("""INSERT OR IGNORE INTO research_pv25_setups(
+                    setup_id,symbol,first_seen_at,last_seen_at,trigger_price,lowest_price,last_price,snapshot_json,status,last_5m_bucket,expires_at,note
+                ) VALUES(?,?,?,?,?,?,?,?,'WATCH','',?,?)""",
+                    (setup_id,symbol,now.isoformat(),now.isoformat(),live_price,live_price,live_price,
+                     json.dumps(details,ensure_ascii=False,default=str),expires.isoformat(),"await_closed_5m"))
+                append_entry_record(symbol,"RESEARCH_P_V25_WATCH","P_V25",float(details.get("p_v2_score") or 0),live_price,"await_closed_5m",
+                    extra={**details,"p_v25_setup_id":setup_id,"p_v25_confirm_state":"WATCH"})
+                return
+
+            status = str(recent["status"] or "")
+            if status != "WATCH":
+                return
+            setup_id = str(recent["setup_id"] or setup_id)
+            first = datetime.fromisoformat(str(recent["first_seen_at"]))
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=timezone.utc)
+            trigger = float(recent["trigger_price"] or live_price)
+            low = min(float(recent["lowest_price"] or live_price), live_price)
+            age = (now - first).total_seconds() / 60.0
+            adverse = (low / trigger - 1) * 100 if trigger > 0 else 0.0
+
+            if age > float(self.cfg.research_pv25_confirm_max_minutes) or adverse <= -abs(float(self.cfg.research_pv25_max_adverse_before_confirm_pct)):
+                conn.execute("UPDATE research_pv25_setups SET status='DROPPED',last_seen_at=?,last_price=?,lowest_price=?,note=? WHERE id=?",
+                             (now.isoformat(),live_price,low,"expired_or_adverse",int(recent["id"])))
+                append_entry_record(symbol,"RESEARCH_P_V25_DROP","P_V25",float(details.get("p_v2_score") or 0),live_price,"expired_or_adverse",
+                    extra={**details,"p_v25_setup_id":setup_id,"p_v25_confirm_state":"DROPPED"})
+                return
+
+            # 가격/저점은 매 스캔 갱신하되, 확정 5분봉 평가는 5분 bucket당 한 번만 한다.
+            if str(recent["last_5m_bucket"] or "") == current_5m_bucket:
+                conn.execute("UPDATE research_pv25_setups SET last_seen_at=?,last_price=?,lowest_price=?,snapshot_json=? WHERE id=?",
+                             (now.isoformat(),live_price,low,json.dumps(details,ensure_ascii=False,default=str),int(recent["id"])))
+                return
+            conn.execute("UPDATE research_pv25_setups SET last_seen_at=?,last_price=?,lowest_price=?,last_5m_bucket=?,snapshot_json=? WHERE id=?",
+                         (now.isoformat(),live_price,low,current_5m_bucket,json.dumps(details,ensure_ascii=False,default=str),int(recent["id"])))
+
+        if age < float(self.cfg.research_pv25_confirm_min_minutes):
+            return
+        try:
+            m5 = confirmed(indicators(self.client.candles(symbol, "5m", 8)))
+            if len(m5) < 2:
+                return
+            row5, prev5 = m5.iloc[-1], m5.iloc[-2]
+            five_bullish = bool(float(row5.close) > float(row5.open))
+            high_break = bool(float(row5.close) > float(prev5.high))
+            closed_price = float(row5.close)
+        except Exception as exc:
+            append_entry_record(symbol,"RESEARCH_P_V25_CHECK_ERROR","P_V25",float(details.get("p_v2_score") or 0),live_price,str(exc),
+                extra={**details,"p_v25_setup_id":setup_id,"p_v25_confirm_state":"CHECK_ERROR"})
+            return
+
+        if not (five_bullish and high_break):
+            return
+        self._open_pv25_confirmed_shadow(symbol, details, setup_id, closed_price, five_bullish, high_break)
 
     def update_research_shadow_reviews(self) -> None:
         """v4.3.58: 연구용 P/준P/near-miss Shadow를 현재 P 관리규칙으로 가상 추적한다.
