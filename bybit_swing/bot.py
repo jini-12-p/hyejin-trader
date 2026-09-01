@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.63-Pv23-DualFilter-Shadow"
+BOT_RUNTIME_VERSION = "RC-v4.3.64-Pv24-ConfirmCohort-BETrace-Shadow"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -259,6 +259,16 @@ class DailyConfig:
     research_pv23_weak_ema20_slope_max: float = 0.25
     research_pv23_weak_ema_gap_max: float = 1.00
     research_pv23_rsi_delta_spike_min: float = 8.00
+    # v4.3.64 P_V24 research-only. LIVE/P_V22/P_V23 판정은 그대로 둔다.
+    research_pv24_confirm_min_minutes: int = 5
+    research_pv24_confirm_max_minutes: int = 20
+    research_pv24_recovery_from_low_min_pct: float = 0.35
+    research_pv24_live_gain_min_pct: float = -0.10
+    research_pv24_max_adverse_before_confirm_pct: float = 1.50
+    research_pv24_same_setup_lock_minutes: int = 45
+    research_pv24_max_entries_per_15m: int = 2
+    research_pv24_stop_pause_window_minutes: int = 30
+    research_pv24_stop_pause_count: int = 2
 
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
@@ -438,6 +448,8 @@ SCAN_REJECTED_FIELDS = [
     "p_v22_candidate", "junp_v22_candidate", "junp_v22_missing_reason",
     # v4.3.63 P_V23: P_V22를 대조군으로 유지하고 두 STOP 선택 필터를 동시에 검증한다.
     "p_v23_weak_trend_block", "p_v23_rsi_spike_block", "p_v23_block_reason", "p_v23_candidate",
+    # v4.3.64 P_V24 confirm/setup telemetry
+    "p_setup_id", "p_v24_watch_candidate", "p_v24_immediate_candidate", "p_v24_confirm_state",
     # v4.3.62 telemetry only: 진입 직전 3개 확정 15분봉의 힘이 가속/둔화되는지 추적.
     # P_V22/JUNP_V22 진입 판정에는 사용하지 않는다.
     "prev1_candle_gain_pct", "prev2_candle_gain_pct", "prev3_candle_gain_pct",
@@ -709,6 +721,23 @@ def init_db() -> None:
             result_details TEXT,
             completed INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS research_pv24_setups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            setup_id TEXT NOT NULL UNIQUE, symbol TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+            trigger_price REAL NOT NULL, lowest_price REAL NOT NULL, last_price REAL NOT NULL,
+            block_reason TEXT, snapshot_json TEXT, status TEXT NOT NULL DEFAULT 'WATCH',
+            confirmed_at TEXT, confirmed_price REAL, expires_at TEXT, note TEXT
+        );
+        CREATE TABLE IF NOT EXISTS research_be_shadow_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shadow_id TEXT NOT NULL UNIQUE, variant TEXT NOT NULL, symbol TEXT NOT NULL,
+            opened_at TEXT NOT NULL, shadow_started_at TEXT NOT NULL,
+            entry_price REAL NOT NULL, be_exit_price REAL NOT NULL, tp2_price REAL NOT NULL,
+            highest_price REAL, lowest_price REAL, last_price REAL, last_checked_at TEXT,
+            result TEXT, result_ts TEXT, result_price REAL, result_details TEXT,
+            completed INTEGER NOT NULL DEFAULT 0
+        );
         """)
         _ensure_column(conn, "bot_positions", "strategy", "TEXT DEFAULT 'P'")
         _ensure_column(conn, "bot_positions", "realized_pnl", "REAL DEFAULT 0")
@@ -730,6 +759,7 @@ def init_db() -> None:
         _ensure_column(conn, "bot_events", "strategy", "TEXT")
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_events", "trade_id", "TEXT")
+        _ensure_column(conn, "research_shadow_reviews", "setup_id", "TEXT")
 
 
 def state_get(key: str, default: str = "") -> str:
@@ -1774,6 +1804,12 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         and not p_v23_rsi_spike_block
     )
 
+    # P_V24: 깨끗한 V23 신호는 즉시 비교, 위험 V22 신호는 setup WATCH로 회복 확인.
+    _setup_bucket = int(datetime.now(timezone.utc).timestamp()) // 900
+    p_setup_id = f"PSET-{symbol}-{_setup_bucket}"
+    p_v24_immediate_candidate = bool(p_v23_candidate)
+    p_v24_watch_candidate = bool(p_v22_candidate and not p_v23_candidate)
+
     research_variants = []
     if p_current_shadow_candidate: research_variants.append("P_CURRENT")
     if p_strength050_shadow_candidate: research_variants.append("P_STRENGTH_050")
@@ -1783,6 +1819,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
     if p_v22_candidate: research_variants.append("P_V22")
     if p_v23_candidate: research_variants.append("P_V23")
+    if p_v24_immediate_candidate: research_variants.append("P_V24")
     if junp_v22_candidate: research_variants.append("JUNP_V22")
     if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
@@ -1844,6 +1881,10 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
         "p_v23_rsi_spike_block": bool(p_v23_rsi_spike_block),
         "p_v23_block_reason": p_v23_block_reason,
         "p_v23_candidate": bool(p_v23_candidate),
+        "p_setup_id": p_setup_id,
+        "p_v24_watch_candidate": bool(p_v24_watch_candidate),
+        "p_v24_immediate_candidate": bool(p_v24_immediate_candidate),
+        "p_v24_confirm_state": "IMMEDIATE" if p_v24_immediate_candidate else ("WATCH" if p_v24_watch_candidate else ""),
         "prev1_candle_gain_pct": round(float(prev1_candle_gain_pct), 4),
         "prev2_candle_gain_pct": round(float(prev2_candle_gain_pct), 4),
         "prev3_candle_gain_pct": round(float(prev3_candle_gain_pct), 4),
@@ -3827,6 +3868,16 @@ class DailyBot:
         new_score = float(details.get("new_p_score") or 0)
         snapshot = json.dumps(details, ensure_ascii=False, default=str)
         for variant in variants:
+            if variant == "P_V24":
+                # 기존 위험 setup이 WATCH 중이면 깨끗한 신호가 나와도 즉시 새 진입하지 않고
+                # 같은 setup의 회복확인 절차를 끝까지 사용한다.
+                if self._pv24_has_active_watch(symbol, now):
+                    continue
+                allowed, why = self._pv24_can_open_now(now)
+                if not allowed:
+                    append_entry_record(symbol, "RESEARCH_P_V24_SKIPPED", "P_V24", float(details.get("p_v2_score") or 0), price, why,
+                        extra={**details, "p_v24_confirm_state": why, "p_setup_id": str(details.get("p_setup_id") or "")})
+                    continue
             if variant == "JUNP_OLD":
                 missing = str(details.get("junp_old_missing_condition") or "")
             elif variant == "JUNP_NEW":
@@ -3841,7 +3892,7 @@ class DailyBot:
                 missing = str(details.get("p_failed_checks") or "")
             else:
                 missing = ""
-            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "JUNP_V22") else new_score
+            variant_score = float(details.get("p_v2_score") or 0) if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "P_V24", "JUNP_V22") else new_score
             with db() as conn:
                 pending = conn.execute(
                     "SELECT 1 FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=0 LIMIT 1",
@@ -3849,6 +3900,13 @@ class DailyBot:
                 ).fetchone()
                 if pending:
                     continue
+                if variant == "P_V24" and str(details.get("p_setup_id") or ""):
+                    same_setup = conn.execute(
+                        "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V24' AND setup_id=? LIMIT 1",
+                        (str(details.get("p_setup_id") or ""),),
+                    ).fetchone()
+                    if same_setup:
+                        continue
                 last = conn.execute(
                     "SELECT result_ts FROM research_shadow_reviews WHERE symbol=? AND variant=? AND completed=1 ORDER BY result_ts DESC LIMIT 1",
                     (symbol, variant),
@@ -3870,21 +3928,107 @@ class DailyBot:
                     """INSERT INTO research_shadow_reviews(
                         shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
                         missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
-                        last_checked_at,mfe_pct,mae_pct
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        last_checked_at,mfe_pct,mae_pct,setup_id
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         shadow_id, variant, symbol, opened_at, int(now.timestamp()*1000), price,
                         old_score, variant_score, missing, snapshot, tp2_price, be_price,
-                        price, price, price, opened_at, 0.0, 0.0,
+                        price, price, price, opened_at, 0.0, 0.0, str(details.get("p_setup_id") or ""),
                     ),
                 )
             append_entry_record(
                 symbol, f"RESEARCH_{variant}_ENTRY", variant,
-                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "JUNP_V22") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
+                variant_score if variant in ("P_V2", "JUNP_V2", "P_V21", "JUNP_V21", "P_V22", "P_V23", "P_V24", "JUNP_V22") else (new_score if "NEW" in variant or "STRENGTH" in variant else old_score),
                 price,
                 f"old_score={old_score:.2f}; new_score={new_score:.2f}; v2_score={float(details.get('p_v2_score') or 0):.2f}; missing={missing}; actual_order=0",
                 extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
             )
+
+        if bool(details.get("p_v22_candidate")):
+            self._handle_pv24_watch(symbol, details)
+
+    def _pv24_has_active_watch(self, symbol: str, now: datetime) -> bool:
+        lock_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_same_setup_lock_minutes)))
+        with db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM research_pv24_setups WHERE symbol=? AND status='WATCH' AND first_seen_at>=? ORDER BY first_seen_at DESC LIMIT 1",
+                (symbol, lock_cut.isoformat()),
+            ).fetchone()
+        return bool(row)
+
+    def _pv24_can_open_now(self, now: datetime) -> tuple[bool, str]:
+        bucket_start = now - timedelta(minutes=now.minute % 15, seconds=now.second, microseconds=now.microsecond)
+        stop_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_stop_pause_window_minutes)))
+        with db() as conn:
+            cnt = conn.execute("SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND opened_at>=?", (bucket_start.isoformat(),)).fetchone()
+            if int(cnt["n"] or 0) >= max(1, int(self.cfg.research_pv24_max_entries_per_15m)):
+                return False, "cohort_entry_cap"
+            stops = conn.execute("SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V24' AND completed=1 AND result='STOP' AND result_ts>=?", (stop_cut.isoformat(),)).fetchone()
+            if int(stops["n"] or 0) >= max(1, int(self.cfg.research_pv24_stop_pause_count)):
+                return False, "recent_stop_pause"
+        return True, ""
+
+    def _open_pv24_confirmed_shadow(self, symbol: str, details: dict[str, Any], setup_id: str, price: float, note: str) -> bool:
+        now = datetime.now(timezone.utc)
+        allowed, why = self._pv24_can_open_now(now)
+        if not allowed:
+            append_entry_record(symbol, "RESEARCH_P_V24_SKIPPED", "P_V24", float(details.get("p_v2_score") or 0), price, why, extra={**details, "p_v24_confirm_state": why, "p_setup_id": setup_id})
+            return False
+        with db() as conn:
+            existing = conn.execute("SELECT 1 FROM research_shadow_reviews WHERE variant='P_V24' AND setup_id=? LIMIT 1", (setup_id,)).fetchone()
+            if existing:
+                return False
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V24-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details); snap["p_v24_confirm_state"] = note
+            conn.execute("""INSERT INTO research_shadow_reviews(
+                shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,mfe_pct,mae_pct,setup_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (shadow_id,"P_V24",symbol,opened_at,int(now.timestamp()*1000),price,float(details.get("p_score") or 0),float(details.get("p_v2_score") or 0),note,
+                 json.dumps(snap,ensure_ascii=False,default=str),tp2_price,be_price,price,price,price,opened_at,0.0,0.0,setup_id))
+        append_entry_record(symbol,"RESEARCH_P_V24_ENTRY","P_V24",float(details.get("p_v2_score") or 0),price,f"confirmed={note}; actual_order=0",
+            extra={**details,"shadow_id":shadow_id,"research_variant":"P_V24","shadow_entry_time":_kst_stamp(opened_at),"p_v24_confirm_state":note,"p_setup_id":setup_id})
+        return True
+
+    def _handle_pv24_watch(self, symbol: str, details: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc); price = float(details.get("live_price") or details.get("price") or 0)
+        if price <= 0: return
+        base_setup = str(details.get("p_setup_id") or f"PSET-{symbol}-{int(now.timestamp())//900}")
+        lock_cut = now - timedelta(minutes=max(1,int(self.cfg.research_pv24_same_setup_lock_minutes)))
+        confirmed_setup = None
+        with db() as conn:
+            recent = conn.execute("SELECT * FROM research_pv24_setups WHERE symbol=? AND first_seen_at>=? ORDER BY first_seen_at DESC LIMIT 1", (symbol,lock_cut.isoformat())).fetchone()
+            if recent:
+                status=str(recent["status"] or ""); setup_id=str(recent["setup_id"] or base_setup)
+                if status != "WATCH": return
+                first=datetime.fromisoformat(str(recent["first_seen_at"]));
+                if first.tzinfo is None: first=first.replace(tzinfo=timezone.utc)
+                trigger=float(recent["trigger_price"] or price); low=min(float(recent["lowest_price"] or price),price); age=(now-first).total_seconds()/60.0
+                adverse=(low/trigger-1)*100 if trigger>0 else 0.0; recovery=(price/low-1)*100 if low>0 else 0.0
+                if age > float(self.cfg.research_pv24_confirm_max_minutes) or adverse <= -abs(float(self.cfg.research_pv24_max_adverse_before_confirm_pct)):
+                    conn.execute("UPDATE research_pv24_setups SET status='DROPPED',last_seen_at=?,last_price=?,lowest_price=?,note=? WHERE id=?", (now.isoformat(),price,low,"expired_or_adverse",int(recent["id"])))
+                    append_entry_record(symbol,"RESEARCH_P_V24_DROP","P_V24",float(details.get("p_v2_score") or 0),price,"expired_or_adverse",extra={**details,"p_setup_id":setup_id,"p_v24_confirm_state":"DROPPED"})
+                    return
+                normalized=float(details.get("rsi_delta") or 0) < float(self.cfg.research_pv23_rsi_delta_spike_min)
+                live_ok=float(details.get("live_candle_gain_pct") or 0) >= float(self.cfg.research_pv24_live_gain_min_pct)
+                ok=bool(age >= float(self.cfg.research_pv24_confirm_min_minutes) and price >= trigger and recovery >= float(self.cfg.research_pv24_recovery_from_low_min_pct) and normalized and live_ok)
+                conn.execute("UPDATE research_pv24_setups SET last_seen_at=?,last_price=?,lowest_price=?,snapshot_json=? WHERE id=?", (now.isoformat(),price,low,json.dumps(details,ensure_ascii=False,default=str),int(recent["id"])))
+                if not ok: return
+                conn.execute("UPDATE research_pv24_setups SET status='CONFIRMED',confirmed_at=?,confirmed_price=?,note=? WHERE id=?", (now.isoformat(),price,"price_recovery",int(recent["id"])))
+                confirmed_setup=setup_id
+            else:
+                if not bool(details.get("p_v24_watch_candidate")):
+                    return
+                expires=now+timedelta(minutes=max(1,int(self.cfg.research_pv24_confirm_max_minutes)))
+                conn.execute("""INSERT OR IGNORE INTO research_pv24_setups(setup_id,symbol,first_seen_at,last_seen_at,trigger_price,lowest_price,last_price,block_reason,snapshot_json,status,expires_at) VALUES(?,?,?,?,?,?,?,?,?,'WATCH',?)""",
+                    (base_setup,symbol,now.isoformat(),now.isoformat(),price,price,price,str(details.get("p_v23_block_reason") or ""),json.dumps(details,ensure_ascii=False,default=str),expires.isoformat()))
+                append_entry_record(symbol,"RESEARCH_P_V24_WATCH","P_V24",float(details.get("p_v2_score") or 0),price,str(details.get("p_v23_block_reason") or ""),extra={**details,"p_setup_id":base_setup,"p_v24_confirm_state":"WATCH"})
+                return
+        if confirmed_setup:
+            self._open_pv24_confirmed_shadow(symbol, details, confirmed_setup, price, "CONFIRMED_RECOVERY")
 
     def update_research_shadow_reviews(self) -> None:
         """v4.3.58: 연구용 P/준P/near-miss Shadow를 현재 P 관리규칙으로 가상 추적한다.
@@ -4066,6 +4210,12 @@ class DailyBot:
                 if result:
                     result_ts = utc_now()
                     net_pct = (float(result_price) / entry_price - 1) * 100 if entry_price > 0 else 0.0
+                    if result == "BE_EXIT":
+                        with db() as conn:
+                            conn.execute("""INSERT OR IGNORE INTO research_be_shadow_reviews(
+                                shadow_id,variant,symbol,opened_at,shadow_started_at,entry_price,be_exit_price,tp2_price,highest_price,lowest_price,last_price,last_checked_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (str(review["shadow_id"] or ""),variant,symbol,opened_at,result_ts,entry_price,float(result_price),tp2_price,float(result_price),float(result_price),float(result_price),result_ts))
                     details_json = json.dumps({
                         "shadow_id": str(review["shadow_id"] or ""), "variant": variant,
                         "entry_price": entry_price, "old_p_score": float(review["old_p_score"] or 0),
@@ -4096,6 +4246,36 @@ class DailyBot:
                         )
             except Exception as exc:
                 append_entry_record(symbol, "RESEARCH_SHADOW_ERROR", variant, float(review["new_p_score"] or 0), float(review["last_price"] or 0), f"{type(exc).__name__}: {exc}")
+
+    def update_research_be_shadow_reviews(self) -> None:
+        """P_V22/V23/V24 BE 이후를 원래 보유시간까지 계속 가상추적한다."""
+        with db() as conn:
+            pending=conn.execute("SELECT * FROM research_be_shadow_reviews WHERE completed=0 ORDER BY shadow_started_at").fetchall()
+        if not pending: return
+        try:
+            tickers={str(t.get("symbol") or ""):float(t.get("last") or 0) for t in self.client.tickers("SWAP")}
+        except Exception as exc:
+            append_entry_record("","RESEARCH_BE_TRACE_ERROR","",0,0,str(exc)); return
+        now=datetime.now(timezone.utc)
+        for r in pending:
+            symbol=str(r["symbol"] or ""); price=float(tickers.get(symbol) or 0)
+            if price<=0: continue
+            entry=float(r["entry_price"] or 0); tp2=float(r["tp2_price"] or 0); hi=max(float(r["highest_price"] or price),price); lo=min(float(r["lowest_price"] or price),price)
+            opened=datetime.fromisoformat(str(r["opened_at"]));
+            if opened.tzinfo is None: opened=opened.replace(tzinfo=timezone.utc)
+            age_h=(now-opened).total_seconds()/3600.0; result=""; details={}
+            if tp2>0 and price>=tp2: result="TP2_AFTER_BE"; details={"tp2_price":tp2}
+            elif entry>0 and price<=entry*(1-abs(float(self.cfg.structure_emergency_stop_pct))/100): result="EMERGENCY_STOP_AFTER_BE"
+            elif age_h>=float(self.cfg.max_hold_hours): result="TIME_AFTER_BE"
+            if result:
+                ts=utc_now(); mfe=(hi/entry-1)*100 if entry>0 else 0; mae=(lo/entry-1)*100 if entry>0 else 0
+                payload={**details,"mfe_pct":round(mfe,4),"mae_pct":round(mae,4),"age_h":round(age_h,3)}
+                with db() as conn:
+                    conn.execute("UPDATE research_be_shadow_reviews SET highest_price=?,lowest_price=?,last_price=?,last_checked_at=?,result=?,result_ts=?,result_price=?,result_details=?,completed=1 WHERE id=?",(hi,lo,price,ts,result,ts,price,json.dumps(payload,ensure_ascii=False),int(r["id"])))
+                append_entry_record(symbol,f"RESEARCH_{str(r['variant'] or '')}_BE_TRACE_{result}",str(r["variant"] or ""),0,price,f"BE follow-up; mfe={mfe:.3f}%; mae={mae:.3f}%",extra={"shadow_id":str(r["shadow_id"] or ""),"research_variant":str(r["variant"] or ""),"mfe_pct":round(mfe,4),"mae_pct":round(mae,4)})
+            else:
+                with db() as conn:
+                    conn.execute("UPDATE research_be_shadow_reviews SET highest_price=?,lowest_price=?,last_price=?,last_checked_at=? WHERE id=?",(hi,lo,price,utc_now(),int(r["id"])))
 
     def _register_junp_shadow_candidate(self, symbol: str, details: dict[str, Any]) -> None:
         """준P형 후보를 실제 주문 없이 별도 DB/SCAN 기록으로만 등록한다."""
@@ -5038,6 +5218,7 @@ class DailyBot:
             self.update_be_shadow_reviews()
             self.update_junp_shadow_reviews()
             self.update_research_shadow_reviews()
+            self.update_research_be_shadow_reviews()
             state_set("stop_review_worker_status", "IDLE")
             state_set("stop_review_worker_finished_at", datetime.now(timezone.utc).isoformat())
         except Exception as exc:
