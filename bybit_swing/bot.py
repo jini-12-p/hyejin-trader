@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.66-Pv24-4Slot-Pv25-5mTrigger-Shadow"
+BOT_RUNTIME_VERSION = "RC-v4.3.67-Pv26-LossGuard-Shadow"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -278,6 +278,32 @@ class DailyConfig:
     research_pv25_max_entries_per_15m: int = 2
     research_pv25_max_open_positions: int = 4
 
+    # v4.3.67 P_V26 research-only: V25의 5분 재가속 골격/TP/4슬롯/rolling cap은 그대로 유지하고
+    # 손실 꼬리를 만든 3개 유형(A형, STOP 동일종목 재진입, TP1 미도달 장기실패)만 최소 보정한다.
+    research_pv26_enabled: bool = True
+    research_pv26_max_entries_per_15m: int = 2
+    research_pv26_max_open_positions: int = 4
+    research_pv26_stop_reentry_cooldown_minutes: int = 180
+    # A형 사전차단: V25 완료표본에서 APT/TIA/AGI/LIT/CHIP STOP 5건을 잡고 완료 성공거래는 0건 차단.
+    # 동일 데이터에서 찾은 조건이므로 V26에서는 BLOCKED_GHOST를 반드시 병행해 전진검증한다.
+    research_pv26_a_live_gain_max_pct: float = 0.40
+    research_pv26_a_prev2_gain_max_pct: float = 1.00
+    research_pv26_a_prev3_gain_min_pct: float = 0.20
+    research_pv26_a_ema_gap_min_pct: float = 0.50
+    # 장기실패: 단순 시간손절 금지. TP1 미도달 + MFE<1% + 손실확대 + 15분 구조훼손이
+    # 2회 연속 확인될 때만 종료하며, 종료 후 원래 V25 경로를 ghost로 끝까지 추적한다.
+    research_pv26_late_failure_enabled: bool = True
+    research_pv26_late_mfe_max_pct: float = 1.00
+    research_pv26_late_stage1_age_minutes: int = 80
+    research_pv26_late_stage1_pnl_pct: float = -1.50
+    research_pv26_late_stage2_age_minutes: int = 120
+    research_pv26_late_stage2_pnl_pct: float = -1.00
+    research_pv26_late_confirmations: int = 2
+    research_pv26_ghost_tracking_enabled: bool = True
+    # V26 검증 화면/CSV는 V22/V25/V26 중심으로 보기 위해 P_V23/P_V24 신규 연구진입은 기본 OFF.
+    # 코드 자체는 남겨 두어 필요하면 config.json에서 다시 켤 수 있다.
+    research_v23_v24_enabled: bool = False
+
     # 2026-08-11: 손실 사례(BEAT/ARB/H, PUMPFUN/ALT/1000NEIROCTO) 기반 진입 품질 보강
     # RSI 하나만으로 과열을 차단하지 않고, 고점근접+과열/2차급등 조합일 때만 HJ를 차단한다.
     hj_high_zone_max_distance_pct: float = 0.50
@@ -461,6 +487,10 @@ SCAN_REJECTED_FIELDS = [
     # v4.3.66 P_V25 15m-candidate + confirmed-5m execution telemetry
     "p_v25_setup_id", "p_v25_confirm_state", "p_v25_5m_bullish",
     "p_v25_prev_high_break", "p_v25_closed_5m_price",
+    # v4.3.67 P_V26 loss-guard / ghost telemetry
+    "p_v26_confirm_state", "p_v26_block_reason", "p_v26_a_filter",
+    "p_v26_cooldown_active", "p_v26_late_fail_streak", "p_v26_ghost_type",
+    "p_v26_5m_bullish", "p_v26_prev_high_break", "p_v26_closed_5m_price",
     # v4.3.62 telemetry only: 진입 직전 3개 확정 15분봉의 힘이 가속/둔화되는지 추적.
     # P_V22/JUNP_V22 진입 판정에는 사용하지 않는다.
     "prev1_candle_gain_pct", "prev2_candle_gain_pct", "prev3_candle_gain_pct",
@@ -780,6 +810,7 @@ def init_db() -> None:
         _ensure_column(conn, "bot_events", "realized_pnl", "REAL DEFAULT 0")
         _ensure_column(conn, "bot_events", "trade_id", "TEXT")
         _ensure_column(conn, "research_shadow_reviews", "setup_id", "TEXT")
+        _ensure_column(conn, "research_shadow_reviews", "v26_late_fail_streak", "INTEGER DEFAULT 0")
 
 
 def state_get(key: str, default: str = "") -> str:
@@ -1839,7 +1870,7 @@ def candidate_signal(client: BybitSwingClient, symbol: str, cfg: DailyConfig) ->
     if junp_old_shadow_candidate: research_variants.append("JUNP_OLD")
     if junp_new_shadow_candidate: research_variants.append("JUNP_NEW")
     if p_v22_candidate: research_variants.append("P_V22")
-    if p_v23_candidate: research_variants.append("P_V23")
+    if cfg.research_v23_v24_enabled and p_v23_candidate: research_variants.append("P_V23")
     if junp_v22_candidate: research_variants.append("JUNP_V22")
     if research_nearmiss_candidate: research_variants.append("REJECT_NEARMISS")
 
@@ -2777,6 +2808,79 @@ def stalled_weak_exit_signal(
         "rsi": round(rsi, 2),
         "ema9": ema9,
         "ema20": ema20,
+    }
+
+
+
+def pv26_late_failure_signal(
+    client: BybitSwingClient,
+    symbol: str,
+    entry_price: float,
+    live_price: float,
+    age_min: float,
+    mfe_pct: float,
+    cfg: DailyConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """P_V26 TP1 미도달 장기 무진행 실패 감지.
+
+    단순 시간손절/고정손절이 아니다.
+    - TP1 이전 거래만 호출한다.
+    - MFE가 +1% 미만인 '한 번도 제대로 못 간 거래'만 본다.
+    - 80분 이후 -1.5% 이하 또는 120분 이후 -1.0% 이하일 때만 구조를 확인한다.
+    - 확정 15분봉에서 EMA9 하락 + higher_lows=False + higher_highs=False가 동시에 성립해야 한다.
+    호출부에서 2회 연속 확인해야 실제 LATE_FAILURE_EXIT로 종료한다.
+    """
+    if entry_price <= 0 or live_price <= 0:
+        return False, {"reason": "bad_price"}
+    if not cfg.research_pv26_late_failure_enabled:
+        return False, {"reason": "disabled"}
+    if float(mfe_pct) >= float(cfg.research_pv26_late_mfe_max_pct):
+        return False, {
+            "reason": "mfe_progressed",
+            "mfe_pct": round(float(mfe_pct), 4),
+        }
+
+    pnl_pct = (float(live_price) / float(entry_price) - 1.0) * 100.0
+    stage1 = bool(
+        float(age_min) >= float(cfg.research_pv26_late_stage1_age_minutes)
+        and pnl_pct <= float(cfg.research_pv26_late_stage1_pnl_pct)
+    )
+    stage2 = bool(
+        float(age_min) >= float(cfg.research_pv26_late_stage2_age_minutes)
+        and pnl_pct <= float(cfg.research_pv26_late_stage2_pnl_pct)
+    )
+    if not (stage1 or stage2):
+        return False, {
+            "reason": "loss_age_gate_not_met",
+            "age_min": round(float(age_min), 1),
+            "pnl_pct": round(pnl_pct, 4),
+            "mfe_pct": round(float(mfe_pct), 4),
+        }
+
+    m15 = confirmed(indicators(client.candles(symbol, "15m", 80)))
+    if len(m15) < 4:
+        return False, {"reason": "not_enough_15m"}
+
+    c = m15.iloc[-1]
+    b = m15.iloc[-2]
+    pp = m15.iloc[-3]
+
+    ema9_falling = bool(float(c.ema9) < float(b.ema9))
+    higher_lows = bool(float(c.low) > float(b.low) and float(b.low) >= float(pp.low))
+    higher_highs = bool(float(c.high) > float(b.high) and float(b.high) >= float(pp.high))
+    structure_failed = bool(ema9_falling and not higher_lows and not higher_highs)
+
+    return structure_failed, {
+        "reason": "PV26_LATE_STRUCTURE_FAIL" if structure_failed else "pv26_late_structure_hold",
+        "age_min": round(float(age_min), 1),
+        "pnl_pct": round(pnl_pct, 4),
+        "mfe_pct": round(float(mfe_pct), 4),
+        "stage": 2 if stage2 else 1,
+        "ema9_falling": ema9_falling,
+        "higher_lows": higher_lows,
+        "higher_highs": higher_highs,
+        "close": float(c.close),
+        "ema9": float(c.ema9),
     }
 
 
@@ -3963,9 +4067,10 @@ class DailyBot:
                 extra={**details, "shadow_id": shadow_id, "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at)},
             )
 
-        # v4.3.65+: 활성 WATCH는 이후 P_V22 조건에서 빠져도 매 스캔 계속 추적한다.
-        self._handle_pv24_watch(symbol, details)
-        # v4.3.66: P_V25는 P_V22 후보를 별도 WATCH로 받아 확정 5분봉 재가속만 검증한다.
+        # v4.3.65+: P_V24는 코드 보존. V26 검증에서는 V22/V25/V26에 집중하도록 기본 OFF.
+        if self.cfg.research_v23_v24_enabled:
+            self._handle_pv24_watch(symbol, details)
+        # v4.3.66+: P_V25 WATCH를 공통 기준으로 사용하고, 확인 순간 V26도 같은 가격/시점에서 분기한다.
         self._handle_pv25_watch(symbol, details)
 
     def _pv24_has_active_watch(self, symbol: str, now: datetime) -> bool:
@@ -4089,6 +4194,380 @@ class DailyBot:
                 return False, "recent_stop_pause"
         return True, ""
 
+    def _pv26_a_filter_match(self, details: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """V25 표본에서 발견된 A형(확정 5분 재가속 직후 실패) 사전차단 후보."""
+        keys = (
+            "live_candle_gain_pct",
+            "prev2_candle_gain_pct",
+            "prev3_candle_gain_pct",
+            "ema9_ema20_gap_pct",
+        )
+        if any(details.get(k) in (None, "") for k in keys):
+            return False, {"reason": "a_filter_missing_telemetry"}
+        try:
+            live_gain = float(details.get("live_candle_gain_pct"))
+            prev2 = float(details.get("prev2_candle_gain_pct"))
+            prev3 = float(details.get("prev3_candle_gain_pct"))
+            ema_gap = float(details.get("ema9_ema20_gap_pct"))
+        except (TypeError, ValueError):
+            return False, {"reason": "a_filter_bad_telemetry"}
+
+        matched = bool(
+            live_gain <= float(self.cfg.research_pv26_a_live_gain_max_pct)
+            and prev2 <= float(self.cfg.research_pv26_a_prev2_gain_max_pct)
+            and prev3 >= float(self.cfg.research_pv26_a_prev3_gain_min_pct)
+            and ema_gap >= float(self.cfg.research_pv26_a_ema_gap_min_pct)
+        )
+        return matched, {
+            "reason": "PV26_A_FILTER" if matched else "a_filter_pass",
+            "live_gain_pct": round(live_gain, 4),
+            "prev2_gain_pct": round(prev2, 4),
+            "prev3_gain_pct": round(prev3, 4),
+            "ema9_ema20_gap_pct": round(ema_gap, 4),
+            "thresholds": {
+                "live_max": float(self.cfg.research_pv26_a_live_gain_max_pct),
+                "prev2_max": float(self.cfg.research_pv26_a_prev2_gain_max_pct),
+                "prev3_min": float(self.cfg.research_pv26_a_prev3_gain_min_pct),
+                "ema_gap_min": float(self.cfg.research_pv26_a_ema_gap_min_pct),
+            },
+        }
+
+    def _pv26_stop_cooldown_status(self, symbol: str, now: datetime) -> tuple[bool, float, str]:
+        """P_V26에서 STOP/LATE_FAILURE_EXIT 난 종목만 3시간 재진입을 막는다."""
+        minutes = max(0, int(self.cfg.research_pv26_stop_reentry_cooldown_minutes))
+        if minutes <= 0:
+            return False, 0.0, ""
+        with db() as conn:
+            row = conn.execute(
+                """SELECT result,result_ts FROM research_shadow_reviews
+                   WHERE variant='P_V26' AND symbol=? AND completed=1
+                     AND result IN ('STOP','LATE_FAILURE_EXIT')
+                   ORDER BY result_ts DESC LIMIT 1""",
+                (symbol,),
+            ).fetchone()
+        if not row or not row["result_ts"]:
+            return False, 0.0, ""
+        try:
+            last_dt = datetime.fromisoformat(str(row["result_ts"]))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return False, 0.0, ""
+        elapsed = (now - last_dt).total_seconds() / 60.0
+        remaining = max(0.0, float(minutes) - elapsed)
+        return bool(remaining > 0), remaining, str(row["result"] or "")
+
+    def _pv26_can_open_now(self, now: datetime) -> tuple[bool, str]:
+        """P_V26 portfolio guard: V25와 같은 4슬롯 + rolling 15분 2건 제한."""
+        rolling_start = now - timedelta(minutes=15)
+        stop_cut = now - timedelta(minutes=max(1, int(self.cfg.research_pv24_stop_pause_window_minutes)))
+        with db() as conn:
+            cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V26' AND opened_at>=?",
+                (rolling_start.isoformat(),),
+            ).fetchone()
+            if int(cnt["n"] or 0) >= max(1, int(self.cfg.research_pv26_max_entries_per_15m)):
+                return False, "rolling_15m_entry_cap"
+
+            open_cnt = conn.execute(
+                "SELECT COUNT(*) AS n FROM research_shadow_reviews WHERE variant='P_V26' AND completed=0"
+            ).fetchone()
+            if int(open_cnt["n"] or 0) >= max(1, int(self.cfg.research_pv26_max_open_positions)):
+                return False, "max_open_positions"
+
+            # V25의 연구용 recent-stop pause는 그대로 유지한다.
+            stops = conn.execute(
+                """SELECT COUNT(*) AS n FROM research_shadow_reviews
+                   WHERE variant='P_V26' AND completed=1
+                     AND result IN ('STOP','LATE_FAILURE_EXIT') AND result_ts>=?""",
+                (stop_cut.isoformat(),),
+            ).fetchone()
+            if int(stops["n"] or 0) >= max(1, int(self.cfg.research_pv24_stop_pause_count)):
+                return False, "recent_stop_pause"
+        return True, ""
+
+    def _register_pv26_blocked_ghost(
+        self,
+        symbol: str,
+        details: dict[str, Any],
+        setup_id: str,
+        entry_price: float,
+        ghost_variant: str,
+        reason: str,
+        ghost_meta: dict[str, Any] | None = None,
+    ) -> None:
+        """V26이 사전차단한 거래를 슬롯과 무관하게 원래 V25 관리규칙으로 끝까지 추적한다."""
+        if not self.cfg.research_pv26_ghost_tracking_enabled or entry_price <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        meta = dict(ghost_meta or {})
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND setup_id=? LIMIT 1",
+                (ghost_variant, setup_id),
+            ).fetchone()
+            if existing:
+                return
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-{ghost_variant}-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details)
+            snap.update({
+                "p_v26_confirm_state": "BLOCKED_GHOST",
+                "p_v26_block_reason": reason,
+                "p_v26_ghost_type": ghost_variant,
+                **meta,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                    missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
+                    last_checked_at,mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id, ghost_variant, symbol, opened_at, int(now.timestamp() * 1000), entry_price,
+                    float(details.get("p_score") or 0), float(details.get("p_v2_score") or 0), reason,
+                    json.dumps(snap, ensure_ascii=False, default=str), tp2_price, be_price,
+                    entry_price, entry_price, entry_price, opened_at, 0.0, 0.0, setup_id, 0,
+                ),
+            )
+        append_entry_record(
+            symbol, f"RESEARCH_{ghost_variant}_ENTRY", ghost_variant,
+            float(details.get("p_v2_score") or 0), entry_price,
+            f"blocked_by={reason}; ghost_only=1; actual_order=0",
+            extra={
+                **details,
+                "shadow_id": shadow_id,
+                "research_variant": ghost_variant,
+                "shadow_entry_time": _kst_stamp(opened_at),
+                "p_v26_confirm_state": "BLOCKED_GHOST",
+                "p_v26_block_reason": reason,
+                "p_v26_ghost_type": ghost_variant,
+                **meta,
+            },
+        )
+
+    def _clone_pv26_late_ghost(
+        self,
+        review: sqlite3.Row,
+        highest: float,
+        lowest: float,
+        current_price: float,
+        late_meta: dict[str, Any],
+    ) -> None:
+        """V26 장기실패 종료 뒤 원래 V25라면 어떻게 끝났을지 같은 최초진입부터 계속 추적한다."""
+        if not self.cfg.research_pv26_ghost_tracking_enabled:
+            return
+        symbol = str(review["symbol"] or "")
+        opened_at = str(review["opened_at"] or "")
+        setup_id = str(review["setup_id"] or "")
+        with db() as conn:
+            existing = conn.execute(
+                """SELECT 1 FROM research_shadow_reviews
+                   WHERE variant='P_V26_LATE_GHOST' AND symbol=? AND opened_at=? LIMIT 1""",
+                (symbol, opened_at),
+            ).fetchone()
+            if existing:
+                return
+            now = datetime.now(timezone.utc)
+            shadow_id = f"RSH-P_V26_LATE_GHOST-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            try:
+                snap = json.loads(str(review["snapshot_json"] or "{}"))
+            except Exception:
+                snap = {}
+            snap.update({
+                "p_v26_confirm_state": "LATE_EXIT_GHOST_CONTINUE",
+                "p_v26_block_reason": "LATE_FAILURE_EXIT",
+                "p_v26_ghost_type": "P_V26_LATE_GHOST",
+                "v26_late_exit_price": current_price,
+                "v26_late_meta": late_meta,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                    missing_condition,snapshot_json,tp1_done,tp1_ts,tp1_price,tp2_price,be_price,
+                    highest_price,lowest_price,last_price,last_checked_at,last_5m_bucket,last_15m_bucket,
+                    mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id, "P_V26_LATE_GHOST", symbol, opened_at, int(review["entry_ts_ms"] or 0),
+                    float(review["entry_price"] or 0), float(review["old_p_score"] or 0),
+                    float(review["new_p_score"] or 0), "continued_after_v26_late_exit",
+                    json.dumps(snap, ensure_ascii=False, default=str), int(review["tp1_done"] or 0),
+                    review["tp1_ts"], review["tp1_price"], float(review["tp2_price"] or 0),
+                    float(review["be_price"] or 0), highest, lowest, current_price, now.isoformat(),
+                    str(int(now.timestamp()) // 300), str(int(now.timestamp()) // 900),
+                    float(review["mfe_pct"] or 0), float(review["mae_pct"] or 0), setup_id, 0,
+                ),
+            )
+        append_entry_record(
+            symbol, "RESEARCH_P_V26_LATE_GHOST_ENTRY", "P_V26_LATE_GHOST",
+            float(review["new_p_score"] or 0), float(review["entry_price"] or 0),
+            f"continue_after_late_exit_at={current_price}; actual_order=0",
+            extra={
+                "shadow_id": shadow_id,
+                "research_variant": "P_V26_LATE_GHOST",
+                "shadow_entry_time": _kst_stamp(opened_at),
+                "p_v26_confirm_state": "LATE_EXIT_GHOST_CONTINUE",
+                "p_v26_block_reason": "LATE_FAILURE_EXIT",
+                "p_v26_ghost_type": "P_V26_LATE_GHOST",
+            },
+        )
+
+    def _open_pv26_confirmed_shadow(
+        self,
+        symbol: str,
+        details: dict[str, Any],
+        source_setup_id: str,
+        entry_price: float,
+        five_bullish: bool,
+        high_break: bool,
+    ) -> bool:
+        """P_V26: V25와 같은 확인 진입에서 손실 최소화 3가지만 추가한 독립 Shadow."""
+        if not self.cfg.research_pv26_enabled:
+            return False
+        now = datetime.now(timezone.utc)
+        setup_id = str(source_setup_id).replace("P25SET-", "P26SET-", 1)
+
+        # 구현 오류 방지: setup_id가 달라도 같은 종목 P_V26 포지션이 열려 있으면 절대 중복진입하지 않는다.
+        with db() as conn:
+            open_same = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V26' AND symbol=? AND completed=0 LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        if open_same:
+            append_entry_record(
+                symbol, "RESEARCH_P_V26_SKIPPED", "P_V26", float(details.get("p_v2_score") or 0),
+                entry_price, "duplicate_open_symbol",
+                extra={
+                    **details,
+                    "p_v26_confirm_state": "duplicate_open_symbol",
+                    "p_v26_block_reason": "duplicate_open_symbol",
+                },
+            )
+            return False
+
+        # 1) A형은 진입 전에 차단. 차단된 거래는 ghost로 원래 결과를 끝까지 본다.
+        a_block, a_meta = self._pv26_a_filter_match(details)
+        if a_block:
+            self._register_pv26_blocked_ghost(
+                symbol, details, setup_id, entry_price, "P_V26_A_GHOST", "A_FILTER", a_meta
+            )
+            append_entry_record(
+                symbol, "RESEARCH_P_V26_BLOCKED_A", "P_V26", float(details.get("p_v2_score") or 0),
+                entry_price, "A_FILTER",
+                extra={
+                    **details,
+                    "p_v26_confirm_state": "BLOCKED_A",
+                    "p_v26_block_reason": "A_FILTER",
+                    "p_v26_a_filter": True,
+                    "p_v26_5m_bullish": five_bullish,
+                    "p_v26_prev_high_break": high_break,
+                    "p_v26_closed_5m_price": entry_price,
+                    **a_meta,
+                },
+            )
+            return False
+
+        # 2) STOP/LATE 실패종목만 180분 재진입 금지. 역시 ghost로 놓친 TP/피한 STOP을 측정한다.
+        cooldown, remaining, prior_result = self._pv26_stop_cooldown_status(symbol, now)
+        if cooldown:
+            meta = {"cooldown_remaining_min": round(remaining, 1), "prior_failure_result": prior_result}
+            self._register_pv26_blocked_ghost(
+                symbol, details, setup_id, entry_price, "P_V26_COOLDOWN_GHOST", "STOP_COOLDOWN", meta
+            )
+            append_entry_record(
+                symbol, "RESEARCH_P_V26_BLOCKED_COOLDOWN", "P_V26", float(details.get("p_v2_score") or 0),
+                entry_price, f"STOP_COOLDOWN remaining={remaining:.1f}m",
+                extra={
+                    **details,
+                    "p_v26_confirm_state": "BLOCKED_COOLDOWN",
+                    "p_v26_block_reason": "STOP_COOLDOWN",
+                    "p_v26_cooldown_active": True,
+                    "p_v26_5m_bullish": five_bullish,
+                    "p_v26_prev_high_break": high_break,
+                    "p_v26_closed_5m_price": entry_price,
+                    **meta,
+                },
+            )
+            return False
+
+        allowed, why = self._pv26_can_open_now(now)
+        if not allowed:
+            append_entry_record(
+                symbol, "RESEARCH_P_V26_SKIPPED", "P_V26", float(details.get("p_v2_score") or 0),
+                entry_price, why,
+                extra={
+                    **details,
+                    "p_v26_confirm_state": why,
+                    "p_v26_block_reason": why,
+                },
+            )
+            return False
+
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V26' AND setup_id=? LIMIT 1",
+                (setup_id,),
+            ).fetchone()
+            if existing:
+                return False
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V26-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details)
+            snap.update({
+                "p_v26_confirm_state": "CONFIRMED_5M_BREAK",
+                "p_v26_block_reason": "",
+                "p_v26_a_filter": False,
+                "p_v25_setup_id": source_setup_id,
+                "p_v25_5m_bullish": five_bullish,
+                "p_v25_prev_high_break": high_break,
+                "p_v25_closed_5m_price": entry_price,
+                "p_v26_5m_bullish": five_bullish,
+                "p_v26_prev_high_break": high_break,
+                "p_v26_closed_5m_price": entry_price,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                    missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
+                    last_checked_at,mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id, "P_V26", symbol, opened_at, int(now.timestamp() * 1000), entry_price,
+                    float(details.get("p_score") or 0), float(details.get("p_v2_score") or 0),
+                    "confirmed_5m_break_v26", json.dumps(snap, ensure_ascii=False, default=str),
+                    tp2_price, be_price, entry_price, entry_price, entry_price, opened_at,
+                    0.0, 0.0, setup_id, 0,
+                ),
+            )
+        append_entry_record(
+            symbol, "RESEARCH_P_V26_ENTRY", "P_V26", float(details.get("p_v2_score") or 0),
+            entry_price, "V25 confirmed 5m break + V26 loss guards passed; actual_order=0",
+            extra={
+                **details,
+                "shadow_id": shadow_id,
+                "research_variant": "P_V26",
+                "shadow_entry_time": _kst_stamp(opened_at),
+                "p_v26_confirm_state": "CONFIRMED_5M_BREAK",
+                "p_v26_block_reason": "",
+                "p_v26_a_filter": False,
+                "p_v26_cooldown_active": False,
+                "p_v26_late_fail_streak": 0,
+                "p_v25_setup_id": source_setup_id,
+                "p_v25_5m_bullish": five_bullish,
+                "p_v25_prev_high_break": high_break,
+                "p_v25_closed_5m_price": entry_price,
+                "p_v26_5m_bullish": five_bullish,
+                "p_v26_prev_high_break": high_break,
+                "p_v26_closed_5m_price": entry_price,
+            },
+        )
+        return True
+
     def _open_pv25_confirmed_shadow(self, symbol: str, details: dict[str, Any], setup_id: str,
                                      entry_price: float, five_bullish: bool, high_break: bool) -> bool:
         now = datetime.now(timezone.utc)
@@ -4204,7 +4683,10 @@ class DailyBot:
 
         if not (five_bullish and high_break):
             return
+        # 같은 확정 5분봉/같은 가격에서 V25(control)와 V26(loss-guard)을 독립적으로 분기한다.
+        # 각 variant의 4슬롯/rolling cap은 research_shadow_reviews에서 따로 계산된다.
         self._open_pv25_confirmed_shadow(symbol, details, setup_id, closed_price, five_bullish, high_break)
+        self._open_pv26_confirmed_shadow(symbol, details, setup_id, closed_price, five_bullish, high_break)
 
     def update_research_shadow_reviews(self) -> None:
         """v4.3.58: 연구용 P/준P/near-miss Shadow를 현재 P 관리규칙으로 가상 추적한다.
@@ -4275,6 +4757,7 @@ class DailyBot:
                 entry_price = float(review["entry_price"] or 0)
                 opened_at = str(review["opened_at"])
                 tp1_done = bool(int(review["tp1_done"] or 0))
+                v26_late_fail_streak = int(review["v26_late_fail_streak"] or 0)
                 tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
                 tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
                 be_price = float(review["be_price"] or entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100))
@@ -4311,6 +4794,36 @@ class DailyBot:
                 if not result and tp1_done and price <= be_price:
                     result, result_price = "BE_EXIT", be_price
                     result_details = {"be_price": be_price}
+
+                # P_V26 전용 장기 무진행 실패관리.
+                # V25의 공통 STOP 로직은 그대로 남기되, 확정 15분 구조실패 + 손실상태가
+                # 서로 다른 5분 확인시점에서 2회 연속 유지될 때 먼저 작은 손실로 종료한다.
+                if (
+                    not result
+                    and variant == "P_V26"
+                    and not tp1_done
+                    and five_due
+                    and self.cfg.research_pv26_late_failure_enabled
+                ):
+                    try:
+                        late26, late26_details = pv26_late_failure_signal(
+                            self.client, symbol, entry_price, price, age_min, mfe_pct, self.cfg
+                        )
+                    except Exception as exc:
+                        late26, late26_details = False, {"error": str(exc), "reason": "pv26_late_check_error"}
+
+                    v26_late_fail_streak = (v26_late_fail_streak + 1) if late26 else 0
+                    required_confirms = max(1, int(self.cfg.research_pv26_late_confirmations))
+                    if late26 and v26_late_fail_streak >= required_confirms:
+                        result, result_price = "LATE_FAILURE_EXIT", price
+                        result_details = {
+                            "stop_type": "V26_LATE_FAILURE",
+                            "late": late26_details,
+                            "late_fail_streak": v26_late_fail_streak,
+                            "required_confirmations": required_confirms,
+                        }
+                        # 실제 V26은 여기서 종료하지만, 원래 V25였다면 이후 어떻게 끝났을지 ghost로 계속 추적한다.
+                        self._clone_pv26_late_ghost(review, highest, lowest, price, result_details)
 
                 if not result and not tp1_done and five_due:
                     stop_key = (symbol, opened_at, round(entry_price, 12), bucket_5m)
@@ -4403,11 +4916,11 @@ class DailyBot:
                     with db() as conn:
                         conn.execute(
                             """UPDATE research_shadow_reviews SET tp1_done=?,highest_price=?,lowest_price=?,last_price=?,
-                               last_checked_at=?,last_5m_bucket=?,last_15m_bucket=?,mfe_pct=?,mae_pct=?,result=?,result_ts=?,
-                               result_price=?,result_details=?,completed=1 WHERE id=?""",
+                               last_checked_at=?,last_5m_bucket=?,last_15m_bucket=?,mfe_pct=?,mae_pct=?,v26_late_fail_streak=?,
+                               result=?,result_ts=?,result_price=?,result_details=?,completed=1 WHERE id=?""",
                             (1 if tp1_done else 0, highest, lowest, price, result_ts, bucket_5m if five_due else str(review["last_5m_bucket"] or ""),
                              bucket_15m if (fifteen_due or emergency_now) else str(review["last_15m_bucket"] or ""), mfe_pct, mae_pct,
-                             result, result_ts, float(result_price), details_json, int(review["id"])),
+                             v26_late_fail_streak, result, result_ts, float(result_price), details_json, int(review["id"])),
                         )
                     append_entry_record(symbol, f"RESEARCH_{variant}_{result}", variant, float(review["new_p_score"] or 0), float(result_price), f"mfe={mfe_pct:.3f}%; mae={mae_pct:.3f}%; actual_order=0",
                         extra={"shadow_id": str(review["shadow_id"] or ""), "research_variant": variant, "mfe_pct": round(mfe_pct,4), "mae_pct": round(mae_pct,4),
@@ -4416,9 +4929,10 @@ class DailyBot:
                     with db() as conn:
                         conn.execute(
                             """UPDATE research_shadow_reviews SET tp1_done=?,highest_price=?,lowest_price=?,last_price=?,last_checked_at=?,
-                               last_5m_bucket=?,last_15m_bucket=?,mfe_pct=?,mae_pct=? WHERE id=?""",
+                               last_5m_bucket=?,last_15m_bucket=?,mfe_pct=?,mae_pct=?,v26_late_fail_streak=? WHERE id=?""",
                             (1 if tp1_done else 0, highest, lowest, price, utc_now(), bucket_5m if five_due else str(review["last_5m_bucket"] or ""),
-                             bucket_15m if (fifteen_due or emergency_now) else str(review["last_15m_bucket"] or ""), mfe_pct, mae_pct, int(review["id"])),
+                             bucket_15m if (fifteen_due or emergency_now) else str(review["last_15m_bucket"] or ""), mfe_pct, mae_pct,
+                             v26_late_fail_streak, int(review["id"])),
                         )
             except Exception as exc:
                 append_entry_record(symbol, "RESEARCH_SHADOW_ERROR", variant, float(review["new_p_score"] or 0), float(review["last_price"] or 0), f"{type(exc).__name__}: {exc}")
