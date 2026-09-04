@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.69-Pv27-Entry-v27.1-Stop-LivePrice-Shadow"
+BOT_RUNTIME_VERSION = "RC-v4.3.70-Pv27-MarketTelemetryOnly"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -527,6 +527,13 @@ SCAN_REJECTED_FIELDS = [
     "p_v27_a1_high_conf_block", "p_v27_ghost_type", "p_v27_live_entry_price",
     "p_v27_closed_5m_price", "p_v271_confirm_state", "p_v271_source_shadow_id",
     "p_v271_stop_stage_active", "p_v271_stop_signal_price", "p_v271_stop_reason",
+    # v4.3.70 telemetry-only: BTC/ETH 시장상태. 진입/STOP/TP 판정에는 절대 사용하지 않는다.
+    "market_snapshot_time_kst", "market_telemetry_status",
+    "btc_5m_change_pct", "btc_15m_change_pct", "btc_30m_change_pct",
+    "btc_1h_change_pct", "btc_4h_change_pct", "btc_1h_high_pullback_pct",
+    "eth_5m_change_pct", "eth_15m_change_pct", "eth_30m_change_pct",
+    "eth_1h_change_pct", "eth_4h_change_pct", "eth_1h_high_pullback_pct",
+    "btc_eth_both_down_15m",
     # v4.3.62 telemetry only: 진입 직전 3개 확정 15분봉의 힘이 가속/둔화되는지 추적.
     # P_V22/JUNP_V22 진입 판정에는 사용하지 않는다.
     "prev1_candle_gain_pct", "prev2_candle_gain_pct", "prev3_candle_gain_pct",
@@ -2943,6 +2950,84 @@ class DailyBot:
         state_set("runtime_version", BOT_RUNTIME_VERSION)
         state_set("runtime_started_at", datetime.now(timezone.utc).isoformat())
         state_set("runtime_bot_file", str(Path(__file__).resolve()))
+        # v4.3.70: 시장 telemetry 캐시. 스캔 1회에 BTC/ETH 5분봉을 각 1회만 읽고
+        # 모든 종목/Shadow 이벤트가 같은 snapshot을 공유한다. 매매 판정에는 사용하지 않는다.
+        self._market_snapshot: dict[str, Any] = {}
+
+    def _build_market_snapshot(self) -> dict[str, Any]:
+        """BTC/ETH 단기 시장상태를 기록용으로만 계산한다.
+
+        API 부하를 늘리지 않기 위해 자산별 5분봉 60개를 한 번만 읽어서
+        5m/15m/30m/1h/4h 변화율과 최근 1시간 고점 대비 눌림폭을 모두 만든다.
+        이 함수의 반환값은 CSV/Shadow telemetry에만 저장하며 진입/손절 판정에는 쓰지 않는다.
+        """
+        snapshot: dict[str, Any] = {
+            "market_snapshot_time_kst": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "market_telemetry_status": "OK",
+        }
+        errors: list[str] = []
+
+        def asset_snapshot(symbol: str, prefix: str) -> None:
+            try:
+                df = self.client.candles(symbol, "5m", 60)
+                if df is None or len(df) < 50 or not {"close", "high"}.issubset(df.columns):
+                    raise ValueError(f"{symbol} 5m candles insufficient")
+                closes = pd.to_numeric(df["close"], errors="coerce")
+                highs = pd.to_numeric(df["high"], errors="coerce")
+                if closes.isna().any() or highs.isna().any():
+                    raise ValueError(f"{symbol} 5m candles contain NaN")
+                current = float(closes.iloc[-1])
+                if current <= 0:
+                    raise ValueError(f"{symbol} bad current price")
+
+                def change(back_bars: int) -> float:
+                    base = float(closes.iloc[-1 - int(back_bars)])
+                    if base <= 0:
+                        raise ValueError(f"{symbol} bad base price")
+                    return round((current / base - 1.0) * 100.0, 4)
+
+                # 마지막 행은 진행 중 5분봉의 현재 close이므로, 이전 close들과 비교해
+                # '지금' 기준 단기 변화율을 남긴다.
+                snapshot[f"{prefix}_5m_change_pct"] = change(1)
+                snapshot[f"{prefix}_15m_change_pct"] = change(3)
+                snapshot[f"{prefix}_30m_change_pct"] = change(6)
+                snapshot[f"{prefix}_1h_change_pct"] = change(12)
+                snapshot[f"{prefix}_4h_change_pct"] = change(48)
+
+                one_hour_high = float(highs.tail(13).max())
+                snapshot[f"{prefix}_1h_high_pullback_pct"] = round(
+                    (current / one_hour_high - 1.0) * 100.0 if one_hour_high > 0 else 0.0, 4
+                )
+            except Exception as exc:
+                errors.append(f"{prefix}:{type(exc).__name__}:{exc}")
+                for suffix in (
+                    "5m_change_pct", "15m_change_pct", "30m_change_pct",
+                    "1h_change_pct", "4h_change_pct", "1h_high_pullback_pct",
+                ):
+                    snapshot[f"{prefix}_{suffix}"] = ""
+
+        asset_snapshot("BTCUSDT", "btc")
+        asset_snapshot("ETHUSDT", "eth")
+        try:
+            snapshot["btc_eth_both_down_15m"] = bool(
+                float(snapshot.get("btc_15m_change_pct")) < 0
+                and float(snapshot.get("eth_15m_change_pct")) < 0
+            )
+        except (TypeError, ValueError):
+            snapshot["btc_eth_both_down_15m"] = ""
+
+        if errors:
+            snapshot["market_telemetry_status"] = "PARTIAL:" + " | ".join(errors)[:300]
+        return snapshot
+
+    def _refresh_market_snapshot(self) -> dict[str, Any]:
+        # dict 전체를 한 번에 교체해 review thread가 읽을 때 반쪽 snapshot을 보지 않게 한다.
+        self._market_snapshot = self._build_market_snapshot()
+        try:
+            state_set("market_snapshot", json.dumps(self._market_snapshot, ensure_ascii=False, default=str))
+        except Exception:
+            pass
+        return dict(self._market_snapshot)
 
     def _saved_active_symbols(self) -> list[str]:
         try:
@@ -5176,6 +5261,9 @@ class DailyBot:
                 append_entry_record(symbol, "RESEARCH_TICKER_ERROR", "RESEARCH", 0, 0, f"{type(exc).__name__}: {exc}")
 
         now = datetime.now(timezone.utc)
+        # 가장 최근 1분 스캔에서 만든 시장 snapshot을 exit/TP telemetry에도 재사용한다.
+        # 여기서는 BTC/ETH API를 추가 호출하지 않는다.
+        market_snapshot = dict(getattr(self, "_market_snapshot", {}) or {})
         bucket_5m = str(int(now.timestamp()) // 300)
         bucket_15m = str(int(now.timestamp()) // 900)
         # v4.3.69: 5분 버킷마다 최근 5개 확정 1분봉을 한 번만 받아 모든 variant가 공유한다.
@@ -5475,7 +5563,8 @@ class DailyBot:
                             append_entry_record(
                                 symbol,f"RESEARCH_{variant}_TP1",variant,float(review["new_p_score"] or 0),tp1_price,"actual_order=0",
                                 extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":variant,
-                                       "mfe_pct":round(mfe_pct,4),"mae_pct":round(mae_pct,4),"shadow_age_min":round(age_min,1)},
+                                       "mfe_pct":round(mfe_pct,4),"mae_pct":round(mae_pct,4),"shadow_age_min":round(age_min,1),
+                                       **market_snapshot},
                             )
 
                 # V26/V27/V27-1 공통 장기 무진행 실패관리.
@@ -5569,7 +5658,8 @@ class DailyBot:
                                 symbol,"RESEARCH_P_V27_1_STAGE1","P_V27_1",float(review["new_p_score"] or 0),signal_price,
                                 f"50% stop signal={stop_type}; wait={self.cfg.research_pv271_wait_minutes}m; rebound={self.cfg.research_pv271_rebound_from_signal_pct}%",
                                 extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":"P_V27_1",
-                                       "p_v271_stop_stage_active":True,"p_v271_stop_signal_price":signal_price,"p_v271_stop_reason":stop_type},
+                                       "p_v271_stop_stage_active":True,"p_v271_stop_signal_price":signal_price,"p_v271_stop_reason":stop_type,
+                                       **market_snapshot},
                             )
                             v271_stage_active = True
                             v271_stage = stage
@@ -5606,7 +5696,8 @@ class DailyBot:
                                 symbol,"RESEARCH_P_V27_1_STAGE1","P_V27_1",float(review["new_p_score"] or 0),signal_price,
                                 f"50% stop signal=STRUCTURE; wait={self.cfg.research_pv271_wait_minutes}m; rebound={self.cfg.research_pv271_rebound_from_signal_pct}%",
                                 extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":"P_V27_1",
-                                       "p_v271_stop_stage_active":True,"p_v271_stop_signal_price":signal_price,"p_v271_stop_reason":"STRUCTURE"},
+                                       "p_v271_stop_stage_active":True,"p_v271_stop_signal_price":signal_price,"p_v271_stop_reason":"STRUCTURE",
+                                       **market_snapshot},
                             )
                             v271_stage_active = True
                             v271_stage = stage
@@ -5653,7 +5744,8 @@ class DailyBot:
                         "new_p_score": float(review["new_p_score"] or 0), "missing_condition": str(review["missing_condition"] or ""),
                         "highest_price": highest, "lowest_price": lowest, "mfe_pct": round(mfe_pct, 4),
                         "mae_pct": round(mae_pct, 4), "age_min": round(age_min, 1), "net_pct_at_exit": round(net_pct, 4),
-                        "snapshot": json.loads(str(review["snapshot_json"] or "{}")), **result_details,
+                        "snapshot": json.loads(str(review["snapshot_json"] or "{}")),
+                        "market_at_exit": market_snapshot, **result_details,
                     }, ensure_ascii=False, default=str)
                     with db() as conn:
                         conn.execute(
@@ -5666,7 +5758,8 @@ class DailyBot:
                         )
                     append_entry_record(symbol, f"RESEARCH_{variant}_{result}", variant, float(review["new_p_score"] or 0), float(result_price), f"mfe={mfe_pct:.3f}%; mae={mae_pct:.3f}%; actual_order=0",
                         extra={"shadow_id": str(review["shadow_id"] or ""), "research_variant": variant, "mfe_pct": round(mfe_pct,4), "mae_pct": round(mae_pct,4),
-                               "shadow_age_min": round(age_min,1), "shadow_exit_pct": round(net_pct,4), "shadow_stop_type": str(result_details.get("stop_type") or "")})
+                               "shadow_age_min": round(age_min,1), "shadow_exit_pct": round(net_pct,4), "shadow_stop_type": str(result_details.get("stop_type") or ""),
+                               **market_snapshot})
                 else:
                     with db() as conn:
                         conn.execute(
@@ -6516,6 +6609,10 @@ class DailyBot:
         기존처럼 모든 후보를 모은 뒤 별도 진입 루프로 넘기지 않아
         SCAN_OK 이후 발생하던 공통 오류를 우회한다.
         """
+        # v4.3.70 telemetry-only: 스캔 1회에 BTC/ETH 각각 5분봉 1회만 조회.
+        # 아래 market_snapshot은 기록에만 붙이며 진입/STOP 조건에는 사용하지 않는다.
+        market_snapshot = self._refresh_market_snapshot()
+
         live_entry_paused = state_flag("pause_new_entries", False)
         if live_entry_paused:
             # v4.3.57: LIVE 신규진입만 막고 SCAN/JUNP Shadow는 계속 수행한다.
@@ -6549,6 +6646,8 @@ class DailyBot:
                 strategy, score, details = candidate_signal(
                     self.client, symbol, self.cfg
                 )
+                # 동일 스캔의 모든 종목이 정확히 같은 BTC/ETH snapshot을 공유한다.
+                details.update(market_snapshot)
                 price = float(details.get("price", 0) or 0)
                 log_event(
                     symbol,
