@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.70-Pv27-MarketTelemetryOnly"
+BOT_RUNTIME_VERSION = "RC-v4.3.71-Pv27-FilterOnly-MarketTelemetry"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -318,6 +318,10 @@ class DailyConfig:
     research_pv27_a1_score_min: float = 70.0
     research_pv27_a1_prev1_gain_max_pct: float = 1.50
     research_pv27_ghost_tracking_enabled: bool = True
+    # v4.3.71 research-only: V26이 실제로 진입한 거래만 1:1 기준으로 V27 진입필터 효과를 분리한다.
+    # 차단 후 빈 슬롯에 다른 종목을 대체 진입하지 않으며, V26의 슬롯/쿨다운/진입시각/진입가를 그대로 따른다.
+    # 진입/손절/TP/BE 로직은 변경하지 않고 비교 데이터만 추가한다.
+    research_pv27_filter_only_enabled: bool = True
     # V27-1: V26이 실제로 연 Shadow를 1:1 복제하고 손절 엔진만 변경한다.
     # 현재 V26 live-price 표본에서 3분/+0.5%가 5분 대기보다 손실 확대가 작았다.
     research_pv271_enabled: bool = True
@@ -527,6 +531,9 @@ SCAN_REJECTED_FIELDS = [
     "p_v27_a1_high_conf_block", "p_v27_ghost_type", "p_v27_live_entry_price",
     "p_v27_closed_5m_price", "p_v271_confirm_state", "p_v271_source_shadow_id",
     "p_v271_stop_stage_active", "p_v271_stop_signal_price", "p_v271_stop_reason",
+    # v4.3.71 V27 FilterOnly: V26 실제진입을 모체로 필터 자체 효과만 1:1 비교.
+    "p_v27fo_confirm_state", "p_v27fo_block_reason", "p_v27fo_source_shadow_id",
+    "p_v27fo_filter_pass", "p_v27fo_stall_block", "p_v27fo_a1_high_conf_block",
     # v4.3.70 telemetry-only: BTC/ETH 시장상태. 진입/STOP/TP 판정에는 절대 사용하지 않는다.
     "market_snapshot_time_kst", "market_telemetry_status",
     "btc_5m_change_pct", "btc_15m_change_pct", "btc_30m_change_pct",
@@ -4637,6 +4644,125 @@ class DailyBot:
         )
         return True
 
+    def _clone_pv27_filter_only_from_v26(
+        self, symbol: str, details: dict[str, Any], source_shadow_id: str, source_setup_id: str,
+        source_opened_at: str, entry_price: float, closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> None:
+        """V26 실제진입을 기준으로 V27 진입필터 자체만 1:1 비교한다.
+
+        중요: 이 variant는 독립 슬롯/rolling cap/STOP cooldown을 적용하지 않는다.
+        V26이 실제로 연 거래만 보고, V27 필터가 통과하면 같은 시각/가격으로 복제하며
+        차단되면 대체 종목을 새로 잡지 않는다. 따라서 '필터 자체의 제거 효과'만 측정한다.
+        """
+        if not self.cfg.research_pv27_filter_only_enabled or entry_price <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        setup_id = str(source_setup_id).replace("P25SET-", "P27FOSET-", 1)
+        if setup_id == str(source_setup_id):
+            setup_id = f"P27FO-{source_setup_id}"
+
+        blocked, meta = self._pv27_entry_filter_match(details)
+        reason = str(meta.get("reason") or ("V27_ENTRY_FILTER" if blocked else "v27_filter_pass"))
+        common_extra = {
+            **details,
+            "research_variant": "P_V27_FILTER_ONLY",
+            "p_v27fo_source_shadow_id": source_shadow_id,
+            "p_v27fo_filter_pass": not blocked,
+            "p_v27fo_stall_block": bool(meta.get("p_v27_stall_block")),
+            "p_v27fo_a1_high_conf_block": bool(meta.get("p_v27_a1_high_conf_block")),
+            "p_v27_live_entry_price": entry_price,
+            "p_v27_closed_5m_price": closed_5m_price,
+        }
+
+        if blocked:
+            append_entry_record(
+                symbol, "RESEARCH_P_V27_FILTER_ONLY_BLOCKED", "P_V27_FILTER_ONLY",
+                float(details.get("p_v2_score") or 0), entry_price, reason,
+                extra={
+                    **common_extra,
+                    "p_v27fo_confirm_state": "BLOCKED_BY_V27_FILTER",
+                    "p_v27fo_block_reason": reason,
+                },
+            )
+            return
+
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_FILTER_ONLY' AND setup_id=? LIMIT 1",
+                (setup_id,),
+            ).fetchone()
+            if existing:
+                return
+            # 원본 V26과 같은 종목이 이미 열려 있다면 1:1 불변식 위반이므로 새 거래를 만들지 않고 진단만 남긴다.
+            open_same = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_FILTER_ONLY' AND symbol=? AND completed=0 LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            if open_same:
+                append_entry_record(
+                    symbol, "RESEARCH_P_V27_FILTER_ONLY_SYNC_ERROR", "P_V27_FILTER_ONLY",
+                    float(details.get("p_v2_score") or 0), entry_price, "duplicate_open_symbol",
+                    extra={
+                        **common_extra,
+                        "p_v27fo_confirm_state": "SYNC_ERROR",
+                        "p_v27fo_block_reason": "duplicate_open_symbol",
+                    },
+                )
+                return
+
+            opened_at = str(source_opened_at or now.isoformat())
+            try:
+                opened_dt = datetime.fromisoformat(opened_at)
+                if opened_dt.tzinfo is None:
+                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                opened_dt = now
+                opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V27_FILTER_ONLY-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details)
+            snap.update({
+                "p_v27fo_confirm_state": "CLONED_FROM_V26_FILTER_PASS",
+                "p_v27fo_block_reason": "",
+                "p_v27fo_source_shadow_id": source_shadow_id,
+                "p_v27fo_filter_pass": True,
+                "p_v27fo_stall_block": False,
+                "p_v27fo_a1_high_conf_block": False,
+                "p_v27_live_entry_price": entry_price,
+                "p_v27_closed_5m_price": closed_5m_price,
+                "p_v25_setup_id": source_setup_id,
+                "p_v25_5m_bullish": five_bullish,
+                "p_v25_prev_high_break": high_break,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                    tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,last_5m_bucket,last_15m_bucket,
+                    mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id, "P_V27_FILTER_ONLY", symbol, opened_at, int(opened_dt.timestamp() * 1000), entry_price,
+                    float(details.get("p_score") or 0), float(details.get("p_v2_score") or 0),
+                    "v26_entry_v27_filter_pass", json.dumps(snap, ensure_ascii=False, default=str),
+                    tp2_price, be_price, entry_price, entry_price, entry_price, opened_at,
+                    str(int(opened_dt.timestamp()) // 300), str(int(opened_dt.timestamp()) // 900),
+                    0.0, 0.0, setup_id, 0,
+                ),
+            )
+        append_entry_record(
+            symbol, "RESEARCH_P_V27_FILTER_ONLY_ENTRY", "P_V27_FILTER_ONLY",
+            float(details.get("p_v2_score") or 0), entry_price,
+            "same V26 entry/time/price; V27 filter passed; no replacement entries; actual_order=0",
+            extra={
+                **common_extra,
+                "shadow_id": shadow_id,
+                "shadow_entry_time": _kst_stamp(opened_at),
+                "p_v27fo_confirm_state": "CLONED_FROM_V26_FILTER_PASS",
+                "p_v27fo_block_reason": "",
+            },
+        )
+
     def _clone_pv271_from_v26(
         self, symbol: str, details: dict[str, Any], source_shadow_id: str, source_setup_id: str,
         entry_price: float, closed_5m_price: float, five_bullish: bool, high_break: bool,
@@ -5072,6 +5198,9 @@ class DailyBot:
                 "p_v26_prev_high_break": high_break,
                 "p_v26_closed_5m_price": closed_5m_price,
             },
+        )
+        self._clone_pv27_filter_only_from_v26(
+            symbol, details, shadow_id, source_setup_id, opened_at, entry_price, closed_5m_price, five_bullish, high_break
         )
         self._clone_pv271_from_v26(
             symbol, details, shadow_id, source_setup_id, entry_price, closed_5m_price, five_bullish, high_break
@@ -5572,7 +5701,7 @@ class DailyBot:
                 # 서로 다른 5분 확인시점에서 2회 연속 유지될 때 먼저 작은 손실로 종료한다.
                 if (
                     not result
-                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_1")
+                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1")
                     and not tp1_done
                     and not (is_v271 and v271_stage_active)
                     and five_due
