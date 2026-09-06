@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.72-Pv27.2-EntryRefine-Live90-MarketTelemetry"
+BOT_RUNTIME_VERSION = "RC-v4.3.73-Pv27.3-ImpulseSeparation-ForwardTest-Live90-MarketTelemetry"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -328,7 +328,7 @@ class DailyConfig:
     # 2) WEAK_STRUCTURE: P_V2 점수<55 + EMA9-20 gap<0.50% + EMA20 slope<0.20%.
     #    누적 완료표본 3건 모두 음수종료(2 STOP + 1 FLAT-).
     # 기존 V27의 넓은 STALL/A1 차단은 사용하지 않는다. BTC/ETH telemetry는 기록만 하고 진입차단에는 사용하지 않는다.
-    research_pv272_enabled: bool = True
+    research_pv272_enabled: bool = False
     research_pv272_max_entries_per_15m: int = 2
     research_pv272_max_open_positions: int = 4
     research_pv272_high_score_min: float = 89.0
@@ -338,7 +338,22 @@ class DailyConfig:
     research_pv272_weak_ema_gap_max_pct: float = 0.50
     research_pv272_weak_ema20_slope_max_pct: float = 0.20
     research_pv272_ghost_tracking_enabled: bool = True
-    research_pv272_filter_only_enabled: bool = True
+    research_pv272_filter_only_enabled: bool = False
+
+    # v4.3.73 P_V27_3 research-only:
+    # V27-2의 HIGH_SCORE_RSI_LAG / WEAK_STRUCTURE 신규 차단은 종료하고,
+    # 최근 V26 실제 STOP에서 반복된 '직전 강한 impulse + RSI 급등 + EMA 분리 부족' 한 패턴만 전진검증한다.
+    # 조건은 의도적으로 단순하게 유지하고 BTC/ETH telemetry는 계속 기록만 한다.
+    # 과거 데이터에서 고수익 거래까지 차단될 수 있으므로 이 조건은 LIVE 적용이 아니라 Shadow/FilterOnly 검증 전용이다.
+    research_pv273_enabled: bool = True
+    research_pv273_max_entries_per_15m: int = 2
+    research_pv273_max_open_positions: int = 4
+    research_pv273_score_max: float = 80.0
+    research_pv273_prev2_gain_min_pct: float = 1.00
+    research_pv273_rsi_change_prev1_min: float = 5.00
+    research_pv273_ema_gap_max_pct: float = 1.00
+    research_pv273_ghost_tracking_enabled: bool = True
+    research_pv273_filter_only_enabled: bool = True
 
     # 연구 Shadow도 LIVE 기본 동일종목 재진입 제한(모든 종료 후 90분)을 최소 기준으로 맞춘다.
     # STOP/LATE는 기존 V26 연구의 180분 cooldown이 더 강하므로 그대로 유지한다.
@@ -477,6 +492,12 @@ class DailyConfig:
         cfg.research_junp_variants_enabled = False
         cfg.research_legacy_variants_enabled = False
         cfg.research_pv25_control_enabled = False
+        # v4.3.73 비교군 고정: V27-2 신규 생성은 중지하고 기존 열린 포지션만 관리한다.
+        # 신규 진입 비교는 V26 / V27-3 / V27-3 FilterOnly / V27-1 네 축으로 분리한다.
+        cfg.research_pv272_enabled = False
+        cfg.research_pv272_filter_only_enabled = False
+        cfg.research_pv273_enabled = True
+        cfg.research_pv273_filter_only_enabled = True
         return cfg
 
 
@@ -561,6 +582,11 @@ SCAN_REJECTED_FIELDS = [
     "p_v272_closed_5m_price",
     "p_v272fo_confirm_state", "p_v272fo_block_reason", "p_v272fo_source_shadow_id",
     "p_v272fo_filter_pass", "p_v272fo_high_score_rsi_lag_block", "p_v272fo_weak_structure_block",
+    # v4.3.73 V27-3 / FilterOnly: impulse + RSI 급등 대비 EMA 분리 부족 패턴 전진검증.
+    "p_v273_confirm_state", "p_v273_block_reason", "p_v273_impulse_separation_lag_block",
+    "p_v273_ghost_type", "p_v273_live_entry_price", "p_v273_closed_5m_price",
+    "p_v273fo_confirm_state", "p_v273fo_block_reason", "p_v273fo_source_shadow_id",
+    "p_v273fo_filter_pass", "p_v273fo_impulse_separation_lag_block",
     # v4.3.70 telemetry-only: BTC/ETH 시장상태. 진입/STOP/TP 판정에는 절대 사용하지 않는다.
     "market_snapshot_time_kst", "market_telemetry_status",
     "btc_5m_change_pct", "btc_15m_change_pct", "btc_30m_change_pct",
@@ -4535,6 +4561,41 @@ class DailyBot:
             "ema20_slope_pct": round(ema20_slope, 4),
         }
 
+    def _pv273_entry_filter_match(self, details: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        """v4.3.73 V27-3: 강한 직전 impulse 대비 EMA 분리가 따라오지 못한 진입만 차단한다.
+
+        Forward-test 전용이다. BTC/ETH market telemetry와 STOP/TP/BE 로직은 사용/변경하지 않는다.
+        """
+        keys = (
+            "p_v2_score", "prev2_candle_gain_pct",
+            "rsi_change_prev1", "ema9_ema20_gap_pct",
+        )
+        if any(details.get(k) in (None, "") for k in keys):
+            return False, {"reason": "v273_filter_missing_telemetry"}
+        try:
+            score = float(details.get("p_v2_score"))
+            prev2 = float(details.get("prev2_candle_gain_pct"))
+            rsi_chg1 = float(details.get("rsi_change_prev1"))
+            ema_gap = float(details.get("ema9_ema20_gap_pct"))
+        except (TypeError, ValueError):
+            return False, {"reason": "v273_filter_bad_telemetry"}
+
+        impulse_separation_lag = bool(
+            score < float(self.cfg.research_pv273_score_max)
+            and prev2 >= float(self.cfg.research_pv273_prev2_gain_min_pct)
+            and rsi_chg1 >= float(self.cfg.research_pv273_rsi_change_prev1_min)
+            and ema_gap < float(self.cfg.research_pv273_ema_gap_max_pct)
+        )
+
+        return impulse_separation_lag, {
+            "reason": "PV273_IMPULSE_SEPARATION_LAG" if impulse_separation_lag else "v273_filter_pass",
+            "p_v273_impulse_separation_lag_block": impulse_separation_lag,
+            "p_v2_score": round(score, 2),
+            "prev2_gain_pct": round(prev2, 4),
+            "rsi_change_prev1": round(rsi_chg1, 4),
+            "ema9_ema20_gap_pct": round(ema_gap, 4),
+        }
+
     def _research_live_cooldown_status(
         self, variant: str, symbol: str, now: datetime
     ) -> tuple[bool, float, str]:
@@ -5142,6 +5203,284 @@ class DailyBot:
             },
         )
 
+    def _register_pv273_blocked_ghost(
+        self, symbol: str, details: dict[str, Any], setup_id: str, entry_price: float,
+        reason: str, meta: dict[str, Any], closed_5m_price: float,
+    ) -> None:
+        if not self.cfg.research_pv273_ghost_tracking_enabled or entry_price <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_3_BLOCK_GHOST' AND setup_id=? LIMIT 1",
+                (setup_id,),
+            ).fetchone()
+            if existing:
+                return
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V27_3_BLOCK_GHOST-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details)
+            snap.update({
+                "p_v273_confirm_state": "BLOCKED_GHOST",
+                "p_v273_block_reason": reason,
+                "p_v273_ghost_type": "P_V27_3_BLOCK_GHOST",
+                "p_v273_live_entry_price": entry_price,
+                "p_v273_closed_5m_price": closed_5m_price,
+                **meta,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                    missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
+                    last_checked_at,last_5m_bucket,last_15m_bucket,mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id,"P_V27_3_BLOCK_GHOST",symbol,opened_at,int(now.timestamp()*1000),entry_price,
+                    float(details.get("p_score") or 0),float(details.get("p_v2_score") or 0),reason,
+                    json.dumps(snap,ensure_ascii=False,default=str),tp2_price,be_price,entry_price,entry_price,entry_price,
+                    opened_at,str(int(now.timestamp())//300),str(int(now.timestamp())//900),0.0,0.0,setup_id,0,
+                ),
+            )
+        append_entry_record(
+            symbol,"RESEARCH_P_V27_3_BLOCK_GHOST_ENTRY","P_V27_3_BLOCK_GHOST",
+            float(details.get("p_v2_score") or 0),entry_price,
+            f"blocked_by={reason}; ghost_only=1; actual_order=0",
+            extra={**details,"shadow_id":shadow_id,"research_variant":"P_V27_3_BLOCK_GHOST",
+                   "p_v273_confirm_state":"BLOCKED_GHOST","p_v273_block_reason":reason,
+                   "p_v273_ghost_type":"P_V27_3_BLOCK_GHOST","p_v273_live_entry_price":entry_price,
+                   "p_v273_closed_5m_price":closed_5m_price,**meta},
+        )
+
+    def _open_pv273_confirmed_shadow(
+        self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
+        closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> bool:
+        """P_V27_3: impulse+RSI 급등 대비 EMA 분리 부족 패턴만 차단하는 전진검증."""
+        if not self.cfg.research_pv273_enabled or entry_price <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        setup_id = str(source_setup_id).replace("P25SET-", "P273SET-", 1)
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_3' AND symbol=? AND completed=0 LIMIT 1",
+                (symbol,),
+            ).fetchone():
+                return False
+
+        blocked, meta = self._pv273_entry_filter_match(details)
+        if blocked:
+            reason = str(meta.get("reason") or "V273_ENTRY_FILTER")
+            self._register_pv273_blocked_ghost(
+                symbol, details, setup_id, entry_price, reason, meta, closed_5m_price
+            )
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_3_BLOCKED","P_V27_3",float(details.get("p_v2_score") or 0),entry_price,reason,
+                extra={**details,"p_v273_confirm_state":"BLOCKED","p_v273_block_reason":reason,
+                       "p_v273_impulse_separation_lag_block":bool(meta.get("p_v273_impulse_separation_lag_block")),
+                       "p_v273_live_entry_price":entry_price,"p_v273_closed_5m_price":closed_5m_price},
+            )
+            return False
+
+        # LIVE 기본: 모든 종료 후 90분 동일종목 재진입 금지.
+        live_cd, live_remaining, live_prior = self._research_live_cooldown_status("P_V27_3", symbol, now)
+        if live_cd:
+            reason = "LIVE90_COOLDOWN"
+            meta_cd = {"cooldown_remaining_min": round(live_remaining, 1), "prior_result": live_prior}
+            self._register_pv273_blocked_ghost(
+                symbol, details, setup_id, entry_price, reason, meta_cd, closed_5m_price
+            )
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_3_BLOCKED_LIVE90","P_V27_3",
+                float(details.get("p_v2_score") or 0),entry_price,
+                f"LIVE90_COOLDOWN remaining={live_remaining:.1f}m",
+                extra={**details,"p_v273_confirm_state":"BLOCKED_LIVE90","p_v273_block_reason":reason,
+                       "p_v273_live_entry_price":entry_price,"p_v273_closed_5m_price":closed_5m_price,**meta_cd},
+            )
+            return False
+
+        # STOP/LATE 후에는 V26 연구와 같은 180분 강화 cooldown 유지.
+        cooldown, remaining, prior = self._variant_stop_cooldown_status("P_V27_3",symbol,now)
+        if cooldown:
+            reason = "STOP_COOLDOWN"
+            meta_cd = {"cooldown_remaining_min": round(remaining, 1), "prior_failure_result": prior}
+            self._register_pv273_blocked_ghost(
+                symbol, details, setup_id, entry_price, reason, meta_cd, closed_5m_price
+            )
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_3_BLOCKED_COOLDOWN","P_V27_3",
+                float(details.get("p_v2_score") or 0),entry_price,
+                f"STOP_COOLDOWN remaining={remaining:.1f}m",
+                extra={**details,"p_v273_confirm_state":"BLOCKED_COOLDOWN","p_v273_block_reason":reason,
+                       "p_v273_live_entry_price":entry_price,"p_v273_closed_5m_price":closed_5m_price,**meta_cd},
+            )
+            return False
+
+        allowed, why = self._variant_can_open_now(
+            "P_V27_3",now,self.cfg.research_pv273_max_entries_per_15m,self.cfg.research_pv273_max_open_positions
+        )
+        if not allowed:
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_3_SKIPPED","P_V27_3",
+                float(details.get("p_v2_score") or 0),entry_price,why,
+                extra={**details,"p_v273_confirm_state":why,"p_v273_block_reason":why,
+                       "p_v273_live_entry_price":entry_price,"p_v273_closed_5m_price":closed_5m_price},
+            )
+            return False
+
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_3' AND setup_id=? LIMIT 1",(setup_id,)
+            ).fetchone():
+                return False
+            opened_at=now.isoformat()
+            shadow_id=f"RSH-P_V27_3-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price=entry_price*(1+float(self.cfg.tp2_pct)/100)
+            be_price=entry_price*(1+float(self.cfg.breakeven_stop_pct)/100)
+            snap=dict(details)
+            snap.update({
+                "p_v273_confirm_state":"CONFIRMED_5M_BREAK","p_v273_block_reason":"",
+                "p_v273_live_entry_price":entry_price,"p_v273_closed_5m_price":closed_5m_price,
+                "p_v273_impulse_separation_lag_block":False,
+                "p_v25_setup_id":source_setup_id,"p_v25_5m_bullish":five_bullish,
+                "p_v25_prev_high_break":high_break,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                    tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,last_5m_bucket,last_15m_bucket,
+                    mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id,"P_V27_3",symbol,opened_at,int(now.timestamp()*1000),entry_price,
+                    float(details.get("p_score") or 0),float(details.get("p_v2_score") or 0),
+                    "confirmed_5m_break_v273",json.dumps(snap,ensure_ascii=False,default=str),
+                    tp2_price,be_price,entry_price,entry_price,entry_price,opened_at,
+                    str(int(now.timestamp())//300),str(int(now.timestamp())//900),0.0,0.0,setup_id,0,
+                ),
+            )
+        append_entry_record(
+            symbol,"RESEARCH_P_V27_3_ENTRY","P_V27_3",float(details.get("p_v2_score") or 0),entry_price,
+            "live-price entry + V27-3 impulse-separation filter passed; actual_order=0",
+            extra={**details,"shadow_id":shadow_id,"research_variant":"P_V27_3",
+                   "shadow_entry_time":_kst_stamp(opened_at),
+                   "p_v273_confirm_state":"CONFIRMED_5M_BREAK","p_v273_block_reason":"",
+                   "p_v273_live_entry_price":entry_price,"p_v273_closed_5m_price":closed_5m_price},
+        )
+        return True
+
+    def _clone_pv273_filter_only_from_v26(
+        self, symbol: str, details: dict[str, Any], source_shadow_id: str, source_setup_id: str,
+        source_opened_at: str, entry_price: float, closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> None:
+        """V26 실제진입을 기준으로 V27-3 필터 자체만 1:1 비교한다. 대체진입 없음."""
+        if not self.cfg.research_pv273_filter_only_enabled or entry_price <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        setup_id = str(source_setup_id).replace("P25SET-", "P273FOSET-", 1)
+        if setup_id == str(source_setup_id):
+            setup_id = f"P273FO-{source_setup_id}"
+
+        blocked, meta = self._pv273_entry_filter_match(details)
+        reason = str(meta.get("reason") or ("V273_ENTRY_FILTER" if blocked else "v273_filter_pass"))
+        common_extra = {
+            **details,
+            "research_variant": "P_V27_3_FILTER_ONLY",
+            "p_v273fo_source_shadow_id": source_shadow_id,
+            "p_v273fo_filter_pass": not blocked,
+            "p_v273fo_impulse_separation_lag_block": bool(meta.get("p_v273_impulse_separation_lag_block")),
+            "p_v273_live_entry_price": entry_price,
+            "p_v273_closed_5m_price": closed_5m_price,
+        }
+
+        if blocked:
+            append_entry_record(
+                symbol, "RESEARCH_P_V27_3_FILTER_ONLY_BLOCKED", "P_V27_3_FILTER_ONLY",
+                float(details.get("p_v2_score") or 0), entry_price, reason,
+                extra={
+                    **common_extra,
+                    "p_v273fo_confirm_state": "BLOCKED_BY_V273_FILTER",
+                    "p_v273fo_block_reason": reason,
+                },
+            )
+            return
+
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_3_FILTER_ONLY' AND setup_id=? LIMIT 1",
+                (setup_id,),
+            ).fetchone()
+            if existing:
+                return
+            open_same = conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_3_FILTER_ONLY' AND symbol=? AND completed=0 LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            if open_same:
+                append_entry_record(
+                    symbol, "RESEARCH_P_V27_3_FILTER_ONLY_SYNC_ERROR", "P_V27_3_FILTER_ONLY",
+                    float(details.get("p_v2_score") or 0), entry_price, "duplicate_open_symbol",
+                    extra={
+                        **common_extra,
+                        "p_v273fo_confirm_state": "SYNC_ERROR",
+                        "p_v273fo_block_reason": "duplicate_open_symbol",
+                    },
+                )
+                return
+
+            opened_at = str(source_opened_at or now.isoformat())
+            try:
+                opened_dt = datetime.fromisoformat(opened_at)
+                if opened_dt.tzinfo is None:
+                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                opened_dt = now
+                opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V27_3_FILTER_ONLY-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details)
+            snap.update({
+                "p_v273fo_confirm_state": "CLONED_FROM_V26_FILTER_PASS",
+                "p_v273fo_block_reason": "",
+                "p_v273fo_source_shadow_id": source_shadow_id,
+                "p_v273fo_filter_pass": True,
+                "p_v273fo_impulse_separation_lag_block": False,
+                "p_v273_live_entry_price": entry_price,
+                "p_v273_closed_5m_price": closed_5m_price,
+                "p_v25_setup_id": source_setup_id,
+                "p_v25_5m_bullish": five_bullish,
+                "p_v25_prev_high_break": high_break,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                    tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,last_5m_bucket,last_15m_bucket,
+                    mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id, "P_V27_3_FILTER_ONLY", symbol, opened_at, int(opened_dt.timestamp() * 1000), entry_price,
+                    float(details.get("p_score") or 0), float(details.get("p_v2_score") or 0),
+                    "v26_entry_v273_filter_pass", json.dumps(snap, ensure_ascii=False, default=str),
+                    tp2_price, be_price, entry_price, entry_price, entry_price, opened_at,
+                    str(int(opened_dt.timestamp()) // 300), str(int(opened_dt.timestamp()) // 900),
+                    0.0, 0.0, setup_id, 0,
+                ),
+            )
+        append_entry_record(
+            symbol, "RESEARCH_P_V27_3_FILTER_ONLY_ENTRY", "P_V27_3_FILTER_ONLY",
+            float(details.get("p_v2_score") or 0), entry_price,
+            "same V26 entry/time/price; V27-3 filter passed; no replacement entries; actual_order=0",
+            extra={
+                **common_extra,
+                "shadow_id": shadow_id,
+                "shadow_entry_time": _kst_stamp(opened_at),
+                "p_v273fo_confirm_state": "CLONED_FROM_V26_FILTER_PASS",
+                "p_v273fo_block_reason": "",
+            },
+        )
+
     def _clone_pv271_from_v26(
         self, symbol: str, details: dict[str, Any], source_shadow_id: str, source_setup_id: str,
         entry_price: float, closed_5m_price: float, five_bullish: bool, high_break: bool,
@@ -5608,6 +5947,9 @@ class DailyBot:
         self._clone_pv272_filter_only_from_v26(
             symbol, details, shadow_id, source_setup_id, opened_at, entry_price, closed_5m_price, five_bullish, high_break
         )
+        self._clone_pv273_filter_only_from_v26(
+            symbol, details, shadow_id, source_setup_id, opened_at, entry_price, closed_5m_price, five_bullish, high_break
+        )
         self._clone_pv271_from_v26(
             symbol, details, shadow_id, source_setup_id, entry_price, closed_5m_price, five_bullish, high_break
         )
@@ -5729,7 +6071,7 @@ class DailyBot:
         if not (five_bullish and high_break):
             return
         # v4.3.69: 확정 5분봉은 신호 판정에만 사용하고, Shadow 평단은 확인 순간 live_price를 사용한다.
-        # V25 신규 control은 OFF. V26(control), V27(entry-only), V27-1(stop-only clone)을 같은 live 가격축에서 비교한다.
+        # V25 신규 control은 OFF. v4.3.73부터 V26(control), V27-3(entry), V27-3 FilterOnly, V27-1(stop-only)을 같은 live 가격축에서 비교한다.
         live_entry_price = float(details.get("live_price") or live_price or 0)
         if live_entry_price <= 0:
             return
@@ -5742,6 +6084,9 @@ class DailyBot:
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
         )
         self._open_pv272_confirmed_shadow(
+            symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
+        )
+        self._open_pv273_confirmed_shadow(
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
         )
         if not self.cfg.research_pv25_control_enabled:
@@ -6110,7 +6455,7 @@ class DailyBot:
                 # 서로 다른 5분 확인시점에서 2회 연속 유지될 때 먼저 작은 손실로 종료한다.
                 if (
                     not result
-                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY")
+                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY")
                     and not tp1_done
                     and not (is_v271 and v271_stage_active)
                     and five_due
