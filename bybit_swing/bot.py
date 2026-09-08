@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.74-Pv27.4-WeakStructure4of4-ForwardTest-StopGhost"
+BOT_RUNTIME_VERSION = "RC-v4.3.75-Pv27.4.1-NoHardBlock-WeakWatch-ForwardTest"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -376,6 +376,21 @@ class DailyConfig:
     research_pv274_stop_ghost_enabled: bool = True
     research_pv274_post_track_minutes: int = 180
 
+    # v4.3.75 P_V27_4_1 research-only:
+    # V25의 확정 5분 재가속 진입은 그대로 사용하고, V27-4의 4-of-4 hard block은 사용하지 않는다.
+    # 과거/전진 재분석에서 slope+gap+persistence 약세군은 위험도는 높지만 TP도 다수 포함되어 hard block이 부적합했다.
+    # 따라서 세 핵심 구조지표가 모두 약하면 진입은 유지하되 WEAK_WATCH로 표시하고 5/10/15분 경로를 자동 기록한다.
+    # STOP은 별도 STOP_GHOST로 180분 추적해 진입실패와 손절문제를 계속 분리한다. LIVE 적용 금지.
+    research_pv2741_enabled: bool = True
+    research_pv2741_max_entries_per_15m: int = 2
+    research_pv2741_max_open_positions: int = 4
+    research_pv2741_ema20_slope_max_pct: float = 0.25
+    research_pv2741_ema_gap_max_pct: float = 0.80
+    research_pv2741_persistence_max: float = 55.0
+    research_pv2741_watch_checkpoints_min: tuple[int, ...] = (5, 10, 15)
+    research_pv2741_stop_ghost_enabled: bool = True
+    research_pv2741_post_track_minutes: int = 180
+
     # 연구 Shadow도 LIVE 기본 동일종목 재진입 제한(모든 종료 후 90분)을 최소 기준으로 맞춘다.
     # STOP/LATE는 기존 V26 연구의 180분 cooldown이 더 강하므로 그대로 유지한다.
     research_live_same_symbol_cooldown_minutes: int = 90
@@ -524,6 +539,8 @@ class DailyConfig:
         cfg.research_pv274_enabled = True
         cfg.research_pv274_filter_only_enabled = True
         cfg.research_pv274_stop_ghost_enabled = True
+        cfg.research_pv2741_enabled = True
+        cfg.research_pv2741_stop_ghost_enabled = True
         return cfg
 
 
@@ -6111,6 +6128,198 @@ class DailyBot:
                     "P_V26_STOP_GHOST", 0, float(row["result_price"] or 0), f"{type(exc).__name__}: {exc}"
                 )
 
+    def _pv2741_weak_watch_meta(self, details: dict[str, Any]) -> dict[str, Any]:
+        """V27-4.1: hard block 없이 core weak 3-of-3 위험도만 표시한다."""
+        vals = {}
+        for k in ("ema20_slope_pct", "ema9_ema20_gap_pct", "p_v21_persistence_score"):
+            try:
+                vals[k] = float(details.get(k))
+            except (TypeError, ValueError):
+                vals[k] = None
+        flags: list[str] = []
+        if vals["ema20_slope_pct"] is not None and vals["ema20_slope_pct"] < float(self.cfg.research_pv2741_ema20_slope_max_pct):
+            flags.append("EMA20_SLOPE")
+        if vals["ema9_ema20_gap_pct"] is not None and vals["ema9_ema20_gap_pct"] < float(self.cfg.research_pv2741_ema_gap_max_pct):
+            flags.append("EMA_GAP")
+        if vals["p_v21_persistence_score"] is not None and vals["p_v21_persistence_score"] < float(self.cfg.research_pv2741_persistence_max):
+            flags.append("PERSISTENCE")
+        core_weak = len(flags) == 3
+        return {
+            "p_v2741_weak_watch": core_weak,
+            "p_v2741_weak_count": len(flags),
+            "p_v2741_weak_flags": ",".join(flags),
+            "p_v2741_watch_logged": [],
+            "p_v2741_thresholds": {
+                "ema20_slope_max": float(self.cfg.research_pv2741_ema20_slope_max_pct),
+                "ema_gap_max": float(self.cfg.research_pv2741_ema_gap_max_pct),
+                "persistence_max": float(self.cfg.research_pv2741_persistence_max),
+            },
+        }
+
+    def _open_pv2741_confirmed_shadow(
+        self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
+        closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> bool:
+        """P_V27_4_1: V25 재가속 진입을 그대로 쓰고 hard block 없이 weak-watch telemetry만 추가한다."""
+        if not self.cfg.research_pv2741_enabled or entry_price <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        setup_id = str(source_setup_id).replace("P25SET-", "P2741SET-", 1)
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_4_1' AND symbol=? AND completed=0 LIMIT 1",
+                (symbol,),
+            ).fetchone():
+                return False
+
+        meta = self._pv2741_weak_watch_meta(details)
+        live_cd, live_remaining, live_prior = self._research_live_cooldown_status("P_V27_4_1", symbol, now)
+        if live_cd:
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_4_1_BLOCKED_LIVE90","P_V27_4_1",
+                float(details.get("p_v2_score") or 0),entry_price,
+                f"LIVE90_COOLDOWN remaining={live_remaining:.1f}m",
+                extra={**details,**meta,"p_v2741_confirm_state":"BLOCKED_LIVE90",
+                       "p_v2741_live_entry_price":entry_price,"p_v2741_closed_5m_price":closed_5m_price,
+                       "cooldown_remaining_min":round(live_remaining,1),"prior_result":live_prior},
+            )
+            return False
+        cooldown, remaining, prior = self._variant_stop_cooldown_status("P_V27_4_1",symbol,now)
+        if cooldown:
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_4_1_BLOCKED_COOLDOWN","P_V27_4_1",
+                float(details.get("p_v2_score") or 0),entry_price,
+                f"STOP_COOLDOWN remaining={remaining:.1f}m",
+                extra={**details,**meta,"p_v2741_confirm_state":"BLOCKED_COOLDOWN",
+                       "p_v2741_live_entry_price":entry_price,"p_v2741_closed_5m_price":closed_5m_price,
+                       "cooldown_remaining_min":round(remaining,1),"prior_failure_result":prior},
+            )
+            return False
+        allowed, why = self._variant_can_open_now(
+            "P_V27_4_1",now,self.cfg.research_pv2741_max_entries_per_15m,self.cfg.research_pv2741_max_open_positions
+        )
+        if not allowed:
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_4_1_SKIPPED","P_V27_4_1",
+                float(details.get("p_v2_score") or 0),entry_price,why,
+                extra={**details,**meta,"p_v2741_confirm_state":why,
+                       "p_v2741_live_entry_price":entry_price,"p_v2741_closed_5m_price":closed_5m_price},
+            )
+            return False
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_4_1' AND setup_id=? LIMIT 1",(setup_id,)
+            ).fetchone():
+                return False
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V27_4_1-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price*(1+float(self.cfg.tp2_pct)/100)
+            be_price = entry_price*(1+float(self.cfg.breakeven_stop_pct)/100)
+            snap = dict(details)
+            snap.update({
+                **meta,
+                "p_v2741_confirm_state":"CONFIRMED_5M_BREAK",
+                "p_v2741_live_entry_price":entry_price,
+                "p_v2741_closed_5m_price":closed_5m_price,
+                "p_v25_setup_id":source_setup_id,"p_v25_5m_bullish":five_bullish,"p_v25_prev_high_break":high_break,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                    tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,last_5m_bucket,last_15m_bucket,
+                    mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id,"P_V27_4_1",symbol,opened_at,int(now.timestamp()*1000),entry_price,
+                    float(details.get("p_score") or 0),float(details.get("p_v2_score") or 0),
+                    "confirmed_5m_break_v2741_no_hard_block",json.dumps(snap,ensure_ascii=False,default=str),
+                    tp2_price,be_price,entry_price,entry_price,entry_price,opened_at,
+                    str(int(now.timestamp())//300),str(int(now.timestamp())//900),0.0,0.0,setup_id,0,
+                ),
+            )
+        append_entry_record(
+            symbol,"RESEARCH_P_V27_4_1_ENTRY","P_V27_4_1",float(details.get("p_v2_score") or 0),entry_price,
+            "V25 live-price entry; no hard block; weak-watch telemetry only; actual_order=0",
+            extra={**details,**meta,"shadow_id":shadow_id,"research_variant":"P_V27_4_1",
+                   "shadow_entry_time":_kst_stamp(opened_at),"p_v2741_confirm_state":"CONFIRMED_5M_BREAK",
+                   "p_v2741_live_entry_price":entry_price,"p_v2741_closed_5m_price":closed_5m_price},
+        )
+        return True
+
+    def _clone_pv2741_stop_ghost(
+        self, review: sqlite3.Row, stop_ts: str, stop_price: float, result_details: dict[str, Any], *, backfilled: bool = False,
+    ) -> None:
+        """P_V27_4_1 STOP 뒤 180분 raw path 추적."""
+        if not self.cfg.research_pv2741_stop_ghost_enabled:
+            return
+        source_shadow_id = str(review["shadow_id"] or "")
+        symbol = str(review["symbol"] or "")
+        entry_price = float(review["entry_price"] or 0)
+        if not source_shadow_id or not symbol or entry_price <= 0 or stop_price <= 0:
+            return
+        ghost_variant = "P_V27_4_1_STOP_GHOST"
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND missing_condition=? LIMIT 1",
+                (ghost_variant, f"source={source_shadow_id}"),
+            ).fetchone():
+                return
+            try:
+                stop_dt = datetime.fromisoformat(str(stop_ts))
+                if stop_dt.tzinfo is None:
+                    stop_dt = stop_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                stop_dt = datetime.now(timezone.utc)
+            try:
+                source_snap = json.loads(str(review["snapshot_json"] or "{}"))
+            except Exception:
+                source_snap = {}
+            stop_pct = (float(stop_price)/entry_price-1.0)*100.0
+            stop_type = str(result_details.get("stop_type") or "STOP")
+            snap = dict(source_snap)
+            snap.update({
+                "p_v2741_confirm_state":"STOP_GHOST_TRACKING","p_v2741_ghost_type":ghost_variant,
+                "p_v2741_source_shadow_id":source_shadow_id,"source_stop_ts":str(stop_ts),
+                "source_stop_price":float(stop_price),"source_stop_pct":round(stop_pct,4),"source_stop_type":stop_type,
+                "raw_path_milestones":{},"stop_ghost_backfilled":bool(backfilled),
+            })
+            shadow_id=f"RSH-{ghost_variant}-{stop_dt.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price=entry_price*(1+float(self.cfg.tp2_pct)/100)
+            be_price=entry_price*(1+float(self.cfg.breakeven_stop_pct)/100)
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                    missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
+                    last_checked_at,last_5m_bucket,last_15m_bucket,mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (shadow_id,ghost_variant,symbol,stop_dt.isoformat(),int(stop_dt.timestamp()*1000),entry_price,
+                 float(review["old_p_score"] or 0),float(review["new_p_score"] or 0),f"source={source_shadow_id}",
+                 json.dumps(snap,ensure_ascii=False,default=str),tp2_price,be_price,float(stop_price),float(stop_price),float(stop_price),
+                 datetime.now(timezone.utc).isoformat(),str(int(stop_dt.timestamp())//300),str(int(stop_dt.timestamp())//900),
+                 stop_pct,stop_pct,str(review["setup_id"] or ""),0),
+            )
+        append_entry_record(
+            symbol,"RESEARCH_P_V27_4_1_STOP_GHOST_ENTRY",ghost_variant,float(review["new_p_score"] or 0),float(stop_price),
+            f"source_stop={stop_type}; stop_pct={stop_pct:.3f}%; actual_order=0",
+            extra={"shadow_id":shadow_id,"research_variant":ghost_variant,"p_v2741_ghost_type":ghost_variant,
+                   "p_v2741_source_shadow_id":source_shadow_id},
+        )
+
+    def _backfill_pv2741_stop_ghosts(self) -> None:
+        if not self.cfg.research_pv2741_stop_ghost_enabled:
+            return
+        with db() as conn:
+            rows=conn.execute("SELECT * FROM research_shadow_reviews WHERE variant='P_V27_4_1' AND completed=1 AND result='STOP' ORDER BY result_ts").fetchall()
+        for row in rows:
+            try:
+                details=json.loads(str(row["result_details"] or "{}"))
+            except Exception:
+                details={}
+            try:
+                self._clone_pv2741_stop_ghost(row,str(row["result_ts"] or utc_now()),float(row["result_price"] or 0),details,backfilled=True)
+            except Exception as exc:
+                append_entry_record(str(row["symbol"] or ""),"RESEARCH_P_V27_4_1_STOP_GHOST_BACKFILL_ERROR","P_V27_4_1_STOP_GHOST",0,float(row["result_price"] or 0),f"{type(exc).__name__}: {exc}")
+
     def _clone_pv274_stop_ghost(
         self,
         review: sqlite3.Row,
@@ -6545,6 +6754,9 @@ class DailyBot:
         self._open_pv274_confirmed_shadow(
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
         )
+        self._open_pv2741_confirmed_shadow(
+            symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
+        )
         if not self.cfg.research_pv25_control_enabled:
             with db() as conn:
                 conn.execute(
@@ -6560,6 +6772,7 @@ class DailyBot:
         """
         self._backfill_pv26_stop_ghosts()
         self._backfill_pv274_stop_ghosts()
+        self._backfill_pv2741_stop_ghosts()
         with db() as conn:
             if self.cfg.research_junp_variants_enabled:
                 pending = conn.execute(
@@ -6641,8 +6854,9 @@ class DailyBot:
             variant = str(review["variant"] or "")
             is_pv26_stop_ghost = variant == "P_V26_STOP_GHOST"
             is_pv274_stop_ghost = variant == "P_V27_4_STOP_GHOST"
+            is_pv2741_stop_ghost = variant == "P_V27_4_1_STOP_GHOST"
             is_pv274_block_ghost = variant == "P_V27_4_BLOCK_GHOST"
-            is_raw_path_ghost = bool(is_pv26_stop_ghost or is_pv274_stop_ghost or is_pv274_block_ghost)
+            is_raw_path_ghost = bool(is_pv26_stop_ghost or is_pv274_stop_ghost or is_pv2741_stop_ghost or is_pv274_block_ghost)
             is_v271 = variant == "P_V27_1"
             try:
                 try:
@@ -6678,6 +6892,31 @@ class DailyBot:
                 result_price = price
                 result_details: dict[str, Any] = {}
 
+                # V27-4.1 weak-watch: 추가 API 호출 없이 현재 ticker/MFE/MAE만 5/10/15분 체크포인트로 남긴다.
+                if variant == "P_V27_4_1" and bool(review_snap.get("p_v2741_weak_watch")):
+                    logged = list(review_snap.get("p_v2741_watch_logged") or [])
+                    added = False
+                    for minute in tuple(self.cfg.research_pv2741_watch_checkpoints_min):
+                        key = int(minute)
+                        if age_min >= key and key not in logged:
+                            logged.append(key)
+                            added = True
+                            append_entry_record(
+                                symbol,f"RESEARCH_P_V27_4_1_WEAK_WATCH_{key}M","P_V27_4_1",
+                                float(review["new_p_score"] or 0),price,
+                                f"pct_from_entry={(price/entry_price-1)*100:.3f}%; actual_order=0",
+                                extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":"P_V27_4_1",
+                                       "p_v2741_weak_watch":True,"p_v2741_weak_count":int(review_snap.get("p_v2741_weak_count") or 0),
+                                       "p_v2741_weak_flags":str(review_snap.get("p_v2741_weak_flags") or ""),
+                                       "shadow_age_min":round(age_min,1),"mfe_pct":round(mfe_pct,4),"mae_pct":round(mae_pct,4),
+                                       "pct_from_entry":round((price/entry_price-1)*100,4)},
+                            )
+                    if added:
+                        review_snap["p_v2741_watch_logged"] = logged
+                        with db() as conn:
+                            conn.execute("UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
+                                         (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])))
+
                 if is_raw_path_ghost:
                     try:
                         ghost_snap = json.loads(str(review["snapshot_json"] or "{}"))
@@ -6687,11 +6926,13 @@ class DailyBot:
                     backfilled_ghost = bool(ghost_snap.get("stop_ghost_backfilled"))
                     track_minutes = float(
                         self.cfg.research_pv26_stop_ghost_minutes
-                        if is_pv26_stop_ghost else self.cfg.research_pv274_post_track_minutes
+                        if is_pv26_stop_ghost else (self.cfg.research_pv2741_post_track_minutes if is_pv2741_stop_ghost else self.cfg.research_pv274_post_track_minutes)
                     )
-                    ghost_type_field = "p_v26_ghost_type" if is_pv26_stop_ghost else "p_v274_ghost_type"
+                    ghost_type_field = "p_v26_ghost_type" if is_pv26_stop_ghost else ("p_v2741_ghost_type" if is_pv2741_stop_ghost else "p_v274_ghost_type")
                     ghost_extra = {ghost_type_field: variant}
-                    if not is_pv26_stop_ghost:
+                    if is_pv2741_stop_ghost:
+                        ghost_extra["p_v2741_source_shadow_id"] = str(ghost_snap.get("p_v2741_source_shadow_id") or "")
+                    elif not is_pv26_stop_ghost:
                         ghost_extra["p_v274_source_shadow_id"] = str(ghost_snap.get("p_v274_source_shadow_id") or "")
                     milestone_added = False
                     for minute in (15, 30, 60, 120, 180):
@@ -6933,7 +7174,7 @@ class DailyBot:
                 # 서로 다른 5분 확인시점에서 2회 연속 유지될 때 먼저 작은 손실로 종료한다.
                 if (
                     not result
-                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY", "P_V27_4", "P_V27_4_FILTER_ONLY")
+                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY", "P_V27_4", "P_V27_4_FILTER_ONLY", "P_V27_4_1")
                     and not tp1_done
                     and not (is_v271 and v271_stage_active)
                     and five_due
@@ -7099,6 +7340,14 @@ class DailyBot:
                         except Exception as exc:
                             append_entry_record(
                                 symbol, "RESEARCH_P_V27_4_STOP_GHOST_REGISTER_ERROR", "P_V27_4_STOP_GHOST",
+                                float(review["new_p_score"] or 0), float(result_price), f"{type(exc).__name__}: {exc}"
+                            )
+                    if variant == "P_V27_4_1" and result == "STOP":
+                        try:
+                            self._clone_pv2741_stop_ghost(review, result_ts, float(result_price), result_details, backfilled=False)
+                        except Exception as exc:
+                            append_entry_record(
+                                symbol, "RESEARCH_P_V27_4_1_STOP_GHOST_REGISTER_ERROR", "P_V27_4_1_STOP_GHOST",
                                 float(review["new_p_score"] or 0), float(result_price), f"{type(exc).__name__}: {exc}"
                             )
                     if result == "BE_EXIT":
