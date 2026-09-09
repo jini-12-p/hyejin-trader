@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.76-Pv27.4.1-FailType35-Stage05-TagOnly"
+BOT_RUNTIME_VERSION = "RC-v4.3.76-Pv27.4.1-FailType35-Stage05-TagOnly-DBLockGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -799,9 +799,28 @@ def append_entry_record(
 
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=20)
+    """SQLite connection with lock tolerance.
+
+    Trading/entry logic is untouched.  This only prevents short-lived SQLite
+    write contention from terminating the bot process.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
+
+
+_DB_FALLBACK_LOG = "/tmp/bybit_swing_fallback.log"
+
+
+def _db_fallback_log(tag: str, message: str) -> None:
+    """Best-effort file fallback; logging failure must never stop the bot."""
+    try:
+        stamp = datetime.now(timezone.utc).isoformat()
+        with open(_DB_FALLBACK_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{stamp}\t{tag}\t{message}\n")
+    except Exception:
+        pass
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
@@ -985,12 +1004,28 @@ def state_get(key: str, default: str = "") -> str:
 
 
 def state_set(key: str, value: str) -> None:
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO bot_state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO bot_state(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+            return
+        except sqlite3.OperationalError as exc:
+            # A transient SQLite writer lock must not terminate the bot loop.
+            if "locked" not in str(exc).lower():
+                raise
+            last_exc = exc
+            if attempt < 4:
+                time.sleep(0.25 * (attempt + 1))
+
+    _db_fallback_log(
+        "STATE_SET_DB_LOCK",
+        f"key={key!r} value={value!r} error={last_exc!r}",
+    )
 
 
 def state_flag(key: str, default: bool = False) -> bool:
@@ -1084,11 +1119,39 @@ def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: s
               details: str = "", strategy: str = "", realized_pnl: float = 0.0,
               trade_id: str = "") -> None:
     ts = utc_now()
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO bot_events(ts,symbol,event,price,qty,mode,details,strategy,realized_pnl,trade_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (ts, symbol, event, float(price), float(qty), mode, details, strategy, float(realized_pnl), trade_id),
+    db_error: Exception | None = None
+    written = False
+
+    for attempt in range(5):
+        try:
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO bot_events(ts,symbol,event,price,qty,mode,details,strategy,realized_pnl,trade_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (ts, symbol, event, float(price), float(qty), mode, details, strategy, float(realized_pnl), trade_id),
+                )
+            written = True
+            break
+        except sqlite3.OperationalError as exc:
+            db_error = exc
+            if "locked" in str(exc).lower() and attempt < 4:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            break
+        except Exception as exc:
+            db_error = exc
+            break
+
+    if not written:
+        _db_fallback_log(
+            "LOG_EVENT_DB_FAIL",
+            (
+                f"symbol={symbol!r} event={event!r} price={float(price)!r} "
+                f"qty={float(qty)!r} mode={mode!r} strategy={strategy!r} "
+                f"trade_id={trade_id!r} error={db_error!r} details={details!r}"
+            ),
         )
+
+    # Telegram notification remains best-effort and independent of DB logging.
     msg = _telegram_event_message(symbol, event, float(price), details, float(realized_pnl))
     if msg:
         telegram_notify(msg)
