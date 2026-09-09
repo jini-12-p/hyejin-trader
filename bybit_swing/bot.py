@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.75-Pv27.4.1-NoHardBlock-WeakWatch-ForwardTest"
+BOT_RUNTIME_VERSION = "RC-v4.3.76-Pv27.4.1-FailType35-Stage05-TagOnly"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -390,6 +390,10 @@ class DailyConfig:
     research_pv2741_watch_checkpoints_min: tuple[int, ...] = (5, 10, 15)
     research_pv2741_stop_ghost_enabled: bool = True
     research_pv2741_post_track_minutes: int = 180
+    # v4.3.76: 실패유형 01~35는 전부 TAG-ONLY. 진입/STOP/TP에는 절대 사용하지 않는다.
+    # 01~05를 1차 집중검증군으로 표시하고, 이후 config에서 10/15...로 숫자만 올릴 수 있다.
+    research_pv2741_fail_type_tag_enabled: bool = True
+    research_pv2741_type_active_max: int = 5
 
     # 연구 Shadow도 LIVE 기본 동일종목 재진입 제한(모든 종료 후 90분)을 최소 기준으로 맞춘다.
     # STOP/LATE는 기존 V26 연구의 180분 cooldown이 더 강하므로 그대로 유지한다.
@@ -638,6 +642,13 @@ SCAN_REJECTED_FIELDS = [
     "p_v274fo_confirm_state", "p_v274fo_block_reason", "p_v274fo_source_shadow_id",
     "p_v274fo_filter_pass", "p_v274fo_weak_structure_block",
     "p_v274fo_weak_count", "p_v274fo_weak_flags",
+    # v4.3.75~76 V27-4.1: no-hard-block + 실패유형 번호 TAG-ONLY telemetry.
+    "p_v2741_confirm_state", "p_v2741_weak_watch", "p_v2741_weak_count", "p_v2741_weak_flags",
+    "p_v2741_ghost_type", "p_v2741_source_shadow_id", "p_v2741_ghost_classification",
+    "p_v2741_live_entry_price", "p_v2741_closed_5m_price",
+    "p_v2741_fail_type_ids", "p_v2741_fail_type_names", "p_v2741_fail_type_count",
+    "p_v2741_fail_type_primary", "p_v2741_active_type_ids", "p_v2741_active_type_match",
+    "p_v2741_type_stage_max", "p_v2741_type_mode", "p_v2741_type_version",
     # v4.3.70 telemetry-only: BTC/ETH 시장상태. 진입/STOP/TP 판정에는 절대 사용하지 않는다.
     "market_snapshot_time_kst", "market_telemetry_status",
     "btc_5m_change_pct", "btc_15m_change_pct", "btc_30m_change_pct",
@@ -6156,6 +6167,102 @@ class DailyBot:
             },
         }
 
+    def _pv2741_fail_type_meta(self, details: dict[str, Any]) -> dict[str, Any]:
+        """V27-4.1 실패유형 01~35 TAG-ONLY 분류.
+
+        중요: 이 함수의 결과는 진입/STOP/TP 판단에 사용하지 않는다.
+        모든 Shadow는 기존 V25 확정-5분 재가속 진입 그대로 열리고,
+        유형 번호는 forward 성적(TP2/BE/STOP/회복STOP)을 나중에 유형별 집계하기 위한 라벨이다.
+        """
+        if not bool(getattr(self.cfg, "research_pv2741_fail_type_tag_enabled", True)):
+            return {
+                "p_v2741_fail_type_ids": "",
+                "p_v2741_fail_type_names": "",
+                "p_v2741_fail_type_count": 0,
+                "p_v2741_fail_type_primary": "",
+                "p_v2741_active_type_ids": "",
+                "p_v2741_active_type_match": False,
+                "p_v2741_type_stage_max": int(getattr(self.cfg, "research_pv2741_type_active_max", 5)),
+                "p_v2741_type_mode": "TAG_ONLY_NO_BLOCK",
+                "p_v2741_type_version": "FAILTYPE35_V1",
+            }
+
+        def f(key: str) -> float | None:
+            try:
+                v = details.get(key)
+                if v in (None, ""):
+                    return None
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        def ge(v: float | None, x: float) -> bool: return v is not None and v >= x
+        def le(v: float | None, x: float) -> bool: return v is not None and v <= x
+        def between(v: float | None, lo: float, hi: float) -> bool: return v is not None and lo <= v <= hi
+
+        p1=f("prev1_candle_gain_pct"); p2=f("prev2_candle_gain_pct"); p3=f("prev3_candle_gain_pct")
+        rd=f("rsi_change_prev1"); rsi=f("rsi"); vol=f("volume_ratio"); lvol=f("live_volume_ratio")
+        lg=f("live_candle_gain_pct"); es=f("ema20_slope_pct"); gap=f("ema9_ema20_gap_pct")
+        pers=f("p_v21_persistence_score"); v2=f("p_v2_score"); reb=f("rebound_from_low_pct")
+        h1=f("one_hour_signed_move_pct"); ps=f("p_score")
+        b15=f("btc_15m_change_pct"); e15=f("eth_15m_change_pct"); b1h=f("btc_1h_change_pct"); e1h=f("eth_1h_change_pct")
+        both_down = details.get("btc_eth_both_down_15m") is True or str(details.get("btc_eth_both_down_15m")).lower() == "true"
+
+        tests: list[tuple[int, str, bool]] = [
+            (1,  "OVERHEAT_ACCUM",              ge(p2,0.9) and ge(rsi,80) and le(reb,8)),
+            (2,  "RSI_REACCEL_LOW_REBOUND",     ge(rd,7.5) and le(reb,4) and ge(p3,0.2)),
+            (3,  "ETH_UP_RSI_ACCEL_LOW_VOL",     ge(e1h,0.30) and ge(rd,5) and le(vol,1.50)),
+            (4,  "COUNTER_MKT_EXPLOSIVE",        both_down and ge(p1,1) and ge(lg,2) and ge(vol,2)),
+            (5,  "LOW_VOL_WIDE_GAP_STALL",       le(vol,0.50) and ge(gap,2) and between(reb,8,15) and le(h1,2.0)),
+            (6,  "HIGH_RSI_SHALLOW_REBOUND",     le(p2,0) and ge(rsi,70) and le(reb,5)),
+            (7,  "OLD_SPIKE_CURRENT_WEAK",       ge(p3,1) and le(rsi,60) and le(reb,5)),
+            (8,  "BIG_REBOUND_MOMENTUM_ROLLOVER",le(rd,-1) and ge(reb,10) and le(h1,1.5)),
+            (9,  "MKT_WEAK_LIVEVOL_SPIKE",       le(p2,0.3) and ge(lvol,1.0) and le(e15,-0.10)),
+            (10, "MKT_UP_ALT_VOL_DRY",           le(vol,0.50) and ge(e15,0.10) and ge(e1h,0.30)),
+            (11, "HIGH_SCORE_NO_LIVE_PARTICIP",  le(lvol,0.10) and le(reb,6) and ge(v2,85)),
+            # 12~35는 TAG-ONLY 보조유형. 1~11보다 표본이 작아 차단용으로 쓰지 않는다.
+            (12, "PREV1_SHARP_DROP",             ge(p1,-1.5) and le(p1,-1.0) and le(p3,1.0)),
+            (13, "OLD_DROP_RSI_REACCEL",         le(p3,-0.5) and ge(rd,7.5) and ge(rsi,60)),
+            (14, "OLD_GREEN_HIGH_RSI_LOW_VOL",   ge(p3,1.0) and ge(rsi,70) and le(vol,0.7)),
+            (15, "HIGH_RSI_POS_LIVE_LOW_LIVEVOL",ge(rsi,80) and le(lvol,1.0) and ge(lg,0.3)),
+            (16, "LIVE_RED_HIGH_PSCORE",         le(lg,-0.5) and ge(ps,110)),
+            (17, "OLD_DEEP_DROP_HIGH_V2",        le(p1,1.0) and le(p3,-1.5) and ge(v2,80)),
+            (18, "PRIOR_SPIKE_LIVE_SPIKE",       ge(p1,2.0) and le(p2,0.3) and ge(lg,2.0)),
+            (19, "RSI_REACCEL_BTC1H_WEAK",       le(p2,1.5) and ge(rd,5) and le(b1h,-0.2)),
+            (20, "PREV2_STRONG_HIGH_V2",         ge(p2,1.5) and ge(v2,95) and le(ps,100)),
+            (21, "LOW_RSI_HIGH_V2_ETH1H_UP",     le(rsi,65) and ge(v2,90) and ge(e1h,0.2)),
+            (22, "HIGH_RSI_HIGH_V2_BTC15_OK",    ge(rsi,75) and ge(v2,85) and ge(b15,0)),
+            (23, "EMA_SLOPE_GAP_LOW_PSCORE",     ge(es,0.3) and le(gap,1.0) and le(ps,70)),
+            (24, "LIVEVOL_UP_LOW_V2_HIGH_P",     ge(lvol,1.0) and le(v2,75) and ge(ps,90)),
+            (25, "PREV1_NEG_PREV3_FLAT_BTC_UP",  le(p1,-0.5) and le(p3,0.5) and ge(b15,0.05)),
+            (26, "RSI_REACCEL_LOW_RSI_LOW_VOL",  ge(rd,5) and le(rsi,60) and le(vol,0.7)),
+            (27, "PREV1_NEG_1H_MID",             le(p1,-0.5) and between(h1,1.0,1.5)),
+            (28, "EXPLOSIVE_LOW_REBOUND",        ge(p1,2.0) and ge(lg,2.0) and le(reb,8)),
+            (29, "HIGH_PERSIST_MID_V2",          le(p3,0.5) and ge(pers,70) and le(v2,95)),
+            (30, "RSI_REACCEL_HIGH_PERSIST",     ge(rd,5) and ge(pers,60) and le(h1,2)),
+            (31, "RSI_SURGE_WIDE_GAP",           ge(rd,10) and ge(gap,1) and le(h1,3)),
+            (32, "LOW_VOL_HIGH_V2_ETH15_NONPOS", le(vol,0.5) and ge(v2,85) and le(e15,0)),
+            (33, "LOW_LIVEVOL_HIGH_V2_ETH1H_OK", le(lvol,0.5) and ge(v2,95) and ge(e1h,0)),
+            (34, "EMA_UP_LOW_PERSIST_LOW_REBOUND",ge(es,0.3) and le(pers,50) and le(reb,5)),
+            (35, "PREV2_DEEP_NEG_HIGH_RSI",      le(p2,-1) and ge(rd,-7.5) and ge(rsi,65)),
+        ]
+        matched=[(i,n) for i,n,ok in tests if ok]
+        ids=[i for i,_ in matched]
+        names=[n for _,n in matched]
+        active_max=max(0, min(35, int(getattr(self.cfg, "research_pv2741_type_active_max", 5))))
+        active=[i for i in ids if i <= active_max]
+        return {
+            "p_v2741_fail_type_ids": ",".join(f"{i:02d}" for i in ids),
+            "p_v2741_fail_type_names": "|".join(names),
+            "p_v2741_fail_type_count": len(ids),
+            "p_v2741_fail_type_primary": (f"TYPE_{ids[0]:02d}" if ids else "TYPE_NONE"),
+            "p_v2741_active_type_ids": ",".join(f"{i:02d}" for i in active),
+            "p_v2741_active_type_match": bool(active),
+            "p_v2741_type_stage_max": active_max,
+            "p_v2741_type_mode": "TAG_ONLY_NO_BLOCK",
+            "p_v2741_type_version": "FAILTYPE35_V1",
+        }
+
     def _open_pv2741_confirmed_shadow(
         self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
         closed_5m_price: float, five_bullish: bool, high_break: bool,
@@ -6173,6 +6280,8 @@ class DailyBot:
                 return False
 
         meta = self._pv2741_weak_watch_meta(details)
+        # 실패유형 번호는 TAG-ONLY. 이 값으로 return/block 하지 않는다.
+        meta.update(self._pv2741_fail_type_meta(details))
         live_cd, live_remaining, live_prior = self._research_live_cooldown_status("P_V27_4_1", symbol, now)
         if live_cd:
             append_entry_record(
@@ -6239,7 +6348,7 @@ class DailyBot:
             )
         append_entry_record(
             symbol,"RESEARCH_P_V27_4_1_ENTRY","P_V27_4_1",float(details.get("p_v2_score") or 0),entry_price,
-            "V25 live-price entry; no hard block; weak-watch telemetry only; actual_order=0",
+            f"V25 live-price entry; no hard block; fail_types={meta.get('p_v2741_fail_type_ids') or 'NONE'}; active<=TYPE_{int(meta.get('p_v2741_type_stage_max') or 0):02d}; actual_order=0",
             extra={**details,**meta,"shadow_id":shadow_id,"research_variant":"P_V27_4_1",
                    "shadow_entry_time":_kst_stamp(opened_at),"p_v2741_confirm_state":"CONFIRMED_5M_BREAK",
                    "p_v2741_live_entry_price":entry_price,"p_v2741_closed_5m_price":closed_5m_price},
@@ -6302,7 +6411,16 @@ class DailyBot:
             symbol,"RESEARCH_P_V27_4_1_STOP_GHOST_ENTRY",ghost_variant,float(review["new_p_score"] or 0),float(stop_price),
             f"source_stop={stop_type}; stop_pct={stop_pct:.3f}%; actual_order=0",
             extra={"shadow_id":shadow_id,"research_variant":ghost_variant,"p_v2741_ghost_type":ghost_variant,
-                   "p_v2741_source_shadow_id":source_shadow_id},
+                   "p_v2741_source_shadow_id":source_shadow_id,
+                   "p_v2741_fail_type_ids":str(source_snap.get("p_v2741_fail_type_ids") or ""),
+                   "p_v2741_fail_type_names":str(source_snap.get("p_v2741_fail_type_names") or ""),
+                   "p_v2741_fail_type_count":int(source_snap.get("p_v2741_fail_type_count") or 0),
+                   "p_v2741_fail_type_primary":str(source_snap.get("p_v2741_fail_type_primary") or "TYPE_NONE"),
+                   "p_v2741_active_type_ids":str(source_snap.get("p_v2741_active_type_ids") or ""),
+                   "p_v2741_active_type_match":bool(source_snap.get("p_v2741_active_type_match")),
+                   "p_v2741_type_stage_max":int(source_snap.get("p_v2741_type_stage_max") or 0),
+                   "p_v2741_type_mode":str(source_snap.get("p_v2741_type_mode") or "TAG_ONLY_NO_BLOCK"),
+                   "p_v2741_type_version":str(source_snap.get("p_v2741_type_version") or "FAILTYPE35_V1")},
         )
 
     def _backfill_pv2741_stop_ghosts(self) -> None:
@@ -7380,6 +7498,15 @@ class DailyBot:
                                "p_v274_ghost_type": variant if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_source_shadow_id": str(review_snap.get("p_v274_source_shadow_id") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_ghost_classification": str(result_details.get("classification") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
+                               "p_v2741_fail_type_ids": str(review_snap.get("p_v2741_fail_type_ids") or ""),
+                               "p_v2741_fail_type_names": str(review_snap.get("p_v2741_fail_type_names") or ""),
+                               "p_v2741_fail_type_count": int(review_snap.get("p_v2741_fail_type_count") or 0),
+                               "p_v2741_fail_type_primary": str(review_snap.get("p_v2741_fail_type_primary") or ""),
+                               "p_v2741_active_type_ids": str(review_snap.get("p_v2741_active_type_ids") or ""),
+                               "p_v2741_active_type_match": bool(review_snap.get("p_v2741_active_type_match")),
+                               "p_v2741_type_stage_max": int(review_snap.get("p_v2741_type_stage_max") or 0),
+                               "p_v2741_type_mode": str(review_snap.get("p_v2741_type_mode") or ""),
+                               "p_v2741_type_version": str(review_snap.get("p_v2741_type_version") or ""),
                                **market_snapshot})
                 else:
                     with db() as conn:
