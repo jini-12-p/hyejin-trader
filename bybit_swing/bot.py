@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.78-Pv27.4.2-AdjustedEntryFilter-NoLegacyType35-SeparateV271-ForwardTest"
+BOT_RUNTIME_VERSION = "RC-v4.3.78-Pv27.4.2-AdjustedEntryFilter-NoLegacyType35-SeparateV271-ForwardTest-DBLight1"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -1138,6 +1138,12 @@ def _telegram_event_message(symbol: str, event: str, price: float, details: str,
 def log_event(symbol: str, event: str, price: float = 0, qty: float = 0, mode: str = "",
               details: str = "", strategy: str = "", realized_pnl: float = 0.0,
               trade_id: str = "") -> None:
+    # DBLight1: SCAN telemetry is already preserved in scan_rejected.csv.
+    # Avoid duplicating the large SCAN_OK/SCAN_WAIT details JSON in bot_events.
+    # Trading / Shadow / entry / exit logic is unchanged.
+    if event in {"SCAN_OK", "SCAN_WAIT"}:
+        return
+
     ts = utc_now()
     db_error: Exception | None = None
     written = False
