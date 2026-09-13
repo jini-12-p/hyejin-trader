@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.11-LiveStable"
+APP_VERSION = "STABLE-v4.3.11-LiveStable-DBLight1"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -1686,27 +1686,54 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
                 conn.row_factory = sqlite3.Row
                 stats_mode = str(bs_cfg.get("mode", "paper")).strip().lower()
                 positions = conn.execute("SELECT * FROM bot_positions WHERE status='OPEN' ORDER BY opened_at").fetchall()
+
+                # DBLight1: bot_events is multi-GB because old SCAN_OK/SCAN_WAIT rows
+                # duplicated the same large telemetry already written to scan_rejected.csv.
+                # Never scan the whole legacy table during a Streamlit refresh.
+                max_event_id = int(conn.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM bot_events"
+                ).fetchone()[0] or 0)
+                event_floor_id = max(0, max_event_id - 5000)
+
                 recent_events = conn.execute(
-                    "SELECT * FROM bot_events WHERE lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 60",
-                    (stats_mode,),
+                    """SELECT * FROM bot_events
+                       WHERE id>=?
+                         AND event NOT IN ('SCAN_WAIT','SCAN_OK')
+                         AND lower(COALESCE(mode,''))=?
+                       ORDER BY id DESC LIMIT 60""",
+                    (event_floor_id, stats_mode),
                 ).fetchall()
                 history = conn.execute(
-                    "SELECT * FROM bot_events WHERE COALESCE(trade_id,'')<>'' AND lower(COALESCE(mode,''))=? ORDER BY id DESC LIMIT 500",
-                    (stats_mode,),
+                    """SELECT * FROM bot_events
+                       WHERE id>=?
+                         AND COALESCE(trade_id,'')<>''
+                         AND lower(COALESCE(mode,''))=?
+                       ORDER BY id DESC LIMIT 500""",
+                    (event_floor_id, stats_mode),
                 ).fetchall()
-                today = conn.execute(
-                    """SELECT SUM(CASE WHEN event='ENTRY' THEN 1 ELSE 0 END), COALESCE(SUM(realized_pnl),0)
-                       FROM bot_events
-                       WHERE substr(ts,1,10)=date('now')
-                         AND lower(COALESCE(mode,''))=?""",
-                    (stats_mode,),
-                ).fetchone()
-                cumulative = conn.execute(
-                    """SELECT COUNT(DISTINCT CASE WHEN event='ENTRY' THEN trade_id END), COALESCE(SUM(realized_pnl),0)
-                       FROM bot_events
-                       WHERE lower(COALESCE(mode,''))=?""",
-                    (stats_mode,),
-                ).fetchone()
+
+            # DBLight1: derive lightweight display stats only from the bounded recent history.
+            # Lifetime totals are intentionally not full-scanned until the legacy DB is safely archived/compacted.
+            kst = timezone(timedelta(hours=9))
+            today_kst = datetime.now(kst).date()
+            today_entries = 0
+            today_pnl = 0.0
+            recent_history_pnl = 0.0
+            for _e in history:
+                _pnl = float(_e["realized_pnl"] or 0)
+                recent_history_pnl += _pnl
+                try:
+                    _ts = str(_e["ts"] or "")
+                    _dt = datetime.fromisoformat(_ts.replace("Z", "+00:00"))
+                    if _dt.tzinfo is None:
+                        _dt = _dt.replace(tzinfo=timezone.utc)
+                    _is_today = _dt.astimezone(kst).date() == today_kst
+                except Exception:
+                    _is_today = False
+                if _is_today:
+                    if str(_e["event"] or "") == "ENTRY":
+                        today_entries += 1
+                    today_pnl += _pnl
 
             paused = _bs_state_get("pause_new_entries", "0") == "1"
             shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
@@ -1722,10 +1749,11 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
 
             m0,m1,m2,m3=st.columns(4)
             stats_label = "LIVE" if str(bs_cfg.get("mode", "paper")).strip().lower() == "live" else "PAPER"
-            m0.metric(f"{stats_label} 누적 확정손익",f"{float(cumulative[1] or 0):+.2f} USDT")
-            m1.metric(f"오늘 {stats_label} 진입",f"{int(today[0] or 0)}회")
-            m2.metric(f"오늘 {stats_label} 확정손익",f"{float(today[1] or 0):+.2f} USDT")
+            m0.metric(f"{stats_label} 최근기록 확정손익",f"{recent_history_pnl:+.2f} USDT")
+            m1.metric(f"오늘 {stats_label} 진입",f"{today_entries}회")
+            m2.metric(f"오늘 {stats_label} 확정손익",f"{today_pnl:+.2f} USDT")
             m3.metric("현재 포지션",str(len(positions)))
+            st.caption("DBLight1: 기존 4.7GB bot_events 전체 누적 조회는 임시 중단 · 최근 기록/오늘 통계만 빠르게 표시")
 
             symbol_types = cached_symbol_types()
             for row in positions:
