@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.80-Pv271R-StagedReboundRecovery-Pv27.4.3-Pv27.4.4-DBLight1"
+BOT_RUNTIME_VERSION = "RC-v4.3.81-Pv271R-StagedReboundRecovery-Pv27.4.5-BERecovery15m-Pv27.4.3-Pv27.4.4-DBLight1"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -424,6 +424,19 @@ class DailyConfig:
     research_pv2744_max_open_positions: int = 4
     research_pv2744_be_close_fraction_of_remaining: float = 0.50
 
+    # v4.3.81 P_V27_4_5 research-only:
+    # 진입은 V25/V27.4.1과 동일하고, TP1 전 손절은 V27-1 staged/disaster 엔진을 그대로 사용한다.
+    # TP1(+1.5%) 50% 익절 후 BE(+0.15%) 도달 시 원포지션 25%를 보호청산하고,
+    # 마지막 25%만 최대 15분 Recovery: +1.0% 회복익절 / -2.5% 재난컷 / 15분 timeout.
+    # LIVE 주문에는 절대 적용하지 않는 Shadow 비교군이다.
+    research_pv2745_enabled: bool = True
+    research_pv2745_max_entries_per_15m: int = 2
+    research_pv2745_max_open_positions: int = 4
+    research_pv2745_be_close_fraction_of_remaining: float = 0.50
+    research_pv2745_recovery_target_pct: float = 1.00
+    research_pv2745_recovery_hard_stop_pct: float = 2.50
+    research_pv2745_recovery_timeout_minutes: float = 15.0
+
     # 연구 Shadow도 LIVE 기본 동일종목 재진입 제한(모든 종료 후 90분)을 최소 기준으로 맞춘다.
     # STOP/LATE는 기존 V26 연구의 180분 cooldown이 더 강하므로 그대로 유지한다.
     research_live_same_symbol_cooldown_minutes: int = 90
@@ -595,6 +608,8 @@ class DailyConfig:
         cfg.research_pv2743_block_ghost_enabled = True
         cfg.research_pv2743_stop_ghost_enabled = True
         cfg.research_pv2744_enabled = True
+        # v4.3.81: 4.5는 V25 진입 + V27-1 동일손절 + BE Recovery(+1/-2.5/15m) 비교군.
+        cfg.research_pv2745_enabled = True
         # v4.3.80: 기존 P_V27_1은 대조군으로 유지하고, staged REBOUND recovery 전용 P_V27_1R을 병렬 실행.
         cfg.research_pv271r_enabled = True
         return cfg
@@ -721,6 +736,13 @@ SCAN_REJECTED_FIELDS = [
     "p_v2744_be_partial_done", "p_v2744_be_partial_price",
     "p_v2744_be_partial_original_fraction", "p_v2744_final_original_fraction",
     "p_v2744_strategy_gross_pct",
+    # v4.3.81 V27-4.5: V25 entry + V27-1 stop + 15m BE Recovery telemetry.
+    "p_v2745_confirm_state", "p_v2745_live_entry_price", "p_v2745_closed_5m_price",
+    "p_v2745_be_partial_done", "p_v2745_be_partial_price",
+    "p_v2745_be_partial_original_fraction", "p_v2745_final_original_fraction",
+    "p_v2745_be_recovery_active", "p_v2745_be_recovery_started_at",
+    "p_v2745_be_recovery_finish_reason", "p_v2745_be_recovery_exit_pct",
+    "p_v2745_strategy_gross_pct",
     # v4.3.70 telemetry-only: BTC/ETH 시장상태. 진입/STOP/TP 판정에는 절대 사용하지 않는다.
     "market_snapshot_time_kst", "market_telemetry_status",
     "btc_5m_change_pct", "btc_15m_change_pct", "btc_30m_change_pct",
@@ -7247,6 +7269,106 @@ class DailyBot:
         )
         return True
 
+    def _open_pv2745_confirmed_shadow(
+        self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
+        closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> bool:
+        """P_V27_4_5: V25 진입 + V27-1 동일손절 + TP1 후 15분 BE Recovery 연구군."""
+        if not self.cfg.research_pv2745_enabled or entry_price <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        setup_id = str(source_setup_id).replace("P25SET-", "P2745SET-", 1)
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_4_5' AND symbol=? AND completed=0 LIMIT 1",
+                (symbol,),
+            ).fetchone():
+                return False
+
+        live_cd, live_remaining, live_prior = self._research_live_cooldown_status("P_V27_4_5", symbol, now)
+        if live_cd:
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_4_5_BLOCKED_LIVE90","P_V27_4_5",
+                float(details.get("p_v2_score") or 0),entry_price,
+                f"LIVE90_COOLDOWN remaining={live_remaining:.1f}m",
+                extra={**details,"p_v2745_confirm_state":"BLOCKED_LIVE90",
+                       "p_v2745_live_entry_price":entry_price,"p_v2745_closed_5m_price":closed_5m_price,
+                       "cooldown_remaining_min":round(live_remaining,1),"prior_result":live_prior},
+            )
+            return False
+        cooldown, remaining, prior = self._variant_stop_cooldown_status("P_V27_4_5",symbol,now)
+        if cooldown:
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_4_5_BLOCKED_COOLDOWN","P_V27_4_5",
+                float(details.get("p_v2_score") or 0),entry_price,
+                f"STOP_COOLDOWN remaining={remaining:.1f}m",
+                extra={**details,"p_v2745_confirm_state":"BLOCKED_COOLDOWN",
+                       "p_v2745_live_entry_price":entry_price,"p_v2745_closed_5m_price":closed_5m_price,
+                       "cooldown_remaining_min":round(remaining,1),"prior_failure_result":prior},
+            )
+            return False
+        allowed, why = self._variant_can_open_now(
+            "P_V27_4_5",now,self.cfg.research_pv2745_max_entries_per_15m,self.cfg.research_pv2745_max_open_positions
+        )
+        if not allowed:
+            append_entry_record(
+                symbol,"RESEARCH_P_V27_4_5_SKIPPED","P_V27_4_5",
+                float(details.get("p_v2_score") or 0),entry_price,why,
+                extra={**details,"p_v2745_confirm_state":why,
+                       "p_v2745_live_entry_price":entry_price,"p_v2745_closed_5m_price":closed_5m_price},
+            )
+            return False
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant='P_V27_4_5' AND setup_id=? LIMIT 1",(setup_id,)
+            ).fetchone():
+                return False
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-P_V27_4_5-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price*(1+float(self.cfg.tp2_pct)/100)
+            be_price = entry_price*(1+float(self.cfg.breakeven_stop_pct)/100)
+            be_frac_remaining = min(0.95,max(0.05,float(self.cfg.research_pv2745_be_close_fraction_of_remaining)))
+            be_frac_original = 0.50 * be_frac_remaining
+            final_frac_original = 0.50 * (1.0 - be_frac_remaining)
+            snap = dict(details)
+            snap.update({
+                "p_v2745_confirm_state":"CONFIRMED_5M_BREAK",
+                "p_v2745_live_entry_price":entry_price,
+                "p_v2745_closed_5m_price":closed_5m_price,
+                "p_v2745_be_partial_done":False,
+                "p_v2745_be_partial_price":None,
+                "p_v2745_be_partial_original_fraction":round(be_frac_original,4),
+                "p_v2745_final_original_fraction":round(final_frac_original,4),
+                "p_v2745_be_recovery":{"active":False},
+                "p_v2745_be_mode":"V271_STOP_THEN_QUARTER_RECOVERY_15M",
+                "p_v25_setup_id":source_setup_id,"p_v25_5m_bullish":five_bullish,"p_v25_prev_high_break":high_break,
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                    tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,last_5m_bucket,last_15m_bucket,
+                    mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id,"P_V27_4_5",symbol,opened_at,int(now.timestamp()*1000),entry_price,
+                    float(details.get("p_score") or 0),float(details.get("p_v2_score") or 0),
+                    "confirmed_5m_break_v271_stop_be_recovery",json.dumps(snap,ensure_ascii=False,default=str),
+                    tp2_price,be_price,entry_price,entry_price,entry_price,opened_at,
+                    str(int(now.timestamp())//300),str(int(now.timestamp())//900),0.0,0.0,setup_id,0,
+                ),
+            )
+        append_entry_record(
+            symbol,"RESEARCH_P_V27_4_5_ENTRY","P_V27_4_5",float(details.get("p_v2_score") or 0),entry_price,
+            "V25 live-price entry; V27-1 pre-TP1 stop; TP1 50% + BE 25% + final 25% recovery(+1/-2.5/15m); actual_order=0",
+            extra={**details,"shadow_id":shadow_id,"research_variant":"P_V27_4_5",
+                   "shadow_entry_time":_kst_stamp(opened_at),"p_v2745_confirm_state":"CONFIRMED_5M_BREAK",
+                   "p_v2745_live_entry_price":entry_price,"p_v2745_closed_5m_price":closed_5m_price,
+                   "p_v2745_be_partial_done":False,"p_v2745_be_partial_original_fraction":round(be_frac_original,4),
+                   "p_v2745_final_original_fraction":round(final_frac_original,4),
+                   "p_v2745_be_recovery_active":False},
+        )
+        return True
+
     def _clone_pv2741_stop_ghost(
         self, review: sqlite3.Row, stop_ts: str, stop_price: float, result_details: dict[str, Any], *, backfilled: bool = False,
     ) -> None:
@@ -7737,7 +7859,7 @@ class DailyBot:
         if not (five_bullish and high_break):
             return
         # v4.3.69: 확정 5분봉은 신호 판정에만 사용하고, Shadow 평단은 확인 순간 live_price를 사용한다.
-        # V25 신규 control은 OFF. v4.3.79부터 V27.4.1(V25 control), V27.4.3(range-refined entry), V27.4.4(partial-BE), V27-1(stop-only)을 분리 비교한다.
+        # V25 신규 control은 OFF. v4.3.81부터 V27.4.1(V25 control), 4.3(entry filter), 4.4(partial-BE), 4.5(V25+V27-1 stop+BE recovery), V27-1/1R을 분리 비교한다.
         live_entry_price = float(details.get("live_price") or live_price or 0)
         if live_entry_price <= 0:
             return
@@ -7761,11 +7883,14 @@ class DailyBot:
         self._open_pv2741_confirmed_shadow(
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
         )
-        # 4.2 신규는 동결. 4.3(범위보정 진입)과 4.4(V25진입+부분BE)를 같은 V25 기회에서 병렬 관찰한다.
+        # 4.2 신규는 동결. 4.3/4.4/4.5를 같은 V25 기회에서 병렬 관찰한다.
         self._open_pv2743_confirmed_shadow(
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
         )
         self._open_pv2744_confirmed_shadow(
+            symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
+        )
+        self._open_pv2745_confirmed_shadow(
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
         )
         if not self.cfg.research_pv25_control_enabled:
@@ -7846,9 +7971,14 @@ class DailyBot:
                     tail = cm1.tail(5)
                     bars: list[dict[str, float]] = []
                     for _, br in tail.iterrows():
+                        br_ts = ""
+                        try:
+                            br_ts = br.name.isoformat() if hasattr(br.name, "isoformat") else str(br.name)
+                        except Exception:
+                            br_ts = ""
                         bars.append({
                             "open": float(br.open), "high": float(br.high),
-                            "low": float(br.low), "close": float(br.close),
+                            "low": float(br.low), "close": float(br.close), "ts": br_ts,
                         })
                     minute_bars_map[symbol] = bars
                     if bars:
@@ -7872,11 +8002,13 @@ class DailyBot:
             is_pv2743_stop_ghost = variant == "P_V27_4_3_STOP_GHOST"
             is_pv274_block_ghost = variant == "P_V27_4_BLOCK_GHOST"
             is_raw_path_ghost = bool(is_pv26_stop_ghost or is_pv274_stop_ghost or is_pv2741_stop_ghost or is_pv2742_stop_ghost or is_pv2743_stop_ghost or is_pv274_block_ghost)
-            # V27-1 / V27-1R은 같은 V26 진입과 staged-stop 골격을 공유한다.
-            # V27-1R만 staged REBOUND 뒤 Recovery Watch가 추가된다. 4.3/4.4에는 절대 섞지 않는다.
+            # V27-1 / V27-1R / 4.5는 같은 staged/disaster 손절 골격을 공유한다.
+            # V27-1R은 staged REBOUND recovery, 4.5는 TP1 후 BE Recovery만 별도로 추가한다.
+            # 4.3/4.4에는 V27-1 stop을 섞지 않는다.
             is_v271 = variant == "P_V27_1"
             is_v271r = variant == "P_V27_1R"
-            is_v271_like = bool(is_v271 or is_v271r)
+            is_pv2745 = variant == "P_V27_4_5"
+            is_v271_like = bool(is_v271 or is_v271r or is_pv2745)
             is_pv2744 = variant == "P_V27_4_4"
             try:
                 try:
@@ -7889,6 +8021,9 @@ class DailyBot:
                 v271r_recovery_active = bool(v271r_recovery.get("active"))
                 v271r_recovery_confirmed = bool(v271r_recovery.get("confirmed"))
                 v2744_be_partial_done = bool(review_snap.get("p_v2744_be_partial_done")) if is_pv2744 else False
+                v2745_be_partial_done = bool(review_snap.get("p_v2745_be_partial_done")) if is_pv2745 else False
+                v2745_be_recovery = dict(review_snap.get("p_v2745_be_recovery") or {}) if is_pv2745 else {}
+                v2745_be_recovery_active = bool(v2745_be_recovery.get("active"))
                 price = float(ticker_map.get(symbol) or 0)
                 if price <= 0:
                     continue
@@ -8074,9 +8209,97 @@ class DailyBot:
                     tp1_was_done = tp1_done
                     minute_bars = list(minute_bars_map.get(symbol) or []) if five_due else []
 
+                    # P_V27_4_5 BE Recovery 관리.
+                    # TP1 50% + BE에서 원포지션 25%는 이미 확보된 상태이며 마지막 25%만 관리한다.
+                    if is_pv2745 and v2745_be_recovery_active:
+                        recovery_target = entry_price * (1 + float(self.cfg.research_pv2745_recovery_target_pct) / 100)
+                        recovery_hard = entry_price * (1 - abs(float(self.cfg.research_pv2745_recovery_hard_stop_pct)) / 100)
+                        try:
+                            recovery_started = datetime.fromisoformat(str(v2745_be_recovery.get("started_at") or utc_now()))
+                            if recovery_started.tzinfo is None:
+                                recovery_started = recovery_started.replace(tzinfo=timezone.utc)
+                        except Exception:
+                            recovery_started = now
+                        recovery_age = (now - recovery_started).total_seconds() / 60.0
+
+                        def _finish_pv2745_recovery(final_price: float, reason: str) -> None:
+                            nonlocal result, result_price, result_details, v2745_be_recovery_active
+                            final_pct = (float(final_price) / entry_price - 1.0) * 100.0
+                            partial_frac = float(review_snap.get("p_v2745_be_partial_original_fraction") or 0.25)
+                            final_frac = float(review_snap.get("p_v2745_final_original_fraction") or 0.25)
+                            strategy_gross = (
+                                0.50 * float(self.cfg.tp1_pct)
+                                + partial_frac * float(self.cfg.breakeven_stop_pct)
+                                + final_frac * final_pct
+                            )
+                            result = "BE_RECOVERY_EXIT"
+                            result_price = float(final_price)
+                            result_details = {
+                                "p_v2745_finish_reason": reason,
+                                "p_v2745_be_partial_done": True,
+                                "p_v2745_be_partial_price": review_snap.get("p_v2745_be_partial_price"),
+                                "p_v2745_be_partial_original_fraction": partial_frac,
+                                "p_v2745_final_original_fraction": final_frac,
+                                "p_v2745_be_recovery_exit_pct": round(final_pct, 4),
+                                "p_v2745_strategy_gross_pct": round(strategy_gross, 4),
+                                "p_v2745_recovery_target_pct": float(self.cfg.research_pv2745_recovery_target_pct),
+                                "p_v2745_recovery_hard_stop_pct": float(self.cfg.research_pv2745_recovery_hard_stop_pct),
+                                "p_v2745_recovery_timeout_minutes": float(self.cfg.research_pv2745_recovery_timeout_minutes),
+                                "p_v2745_be_recovery_started_at": str(v2745_be_recovery.get("started_at") or ""),
+                            }
+                            v2745_be_recovery["active"] = False
+                            v2745_be_recovery["finished_at"] = utc_now()
+                            v2745_be_recovery["finish_reason"] = reason
+                            v2745_be_recovery["exit_price"] = float(final_price)
+                            review_snap["p_v2745_be_recovery"] = v2745_be_recovery
+                            review_snap["p_v2745_be_recovery_active"] = False
+                            review_snap["p_v2745_be_recovery_finish_reason"] = reason
+                            with db() as conn:
+                                conn.execute(
+                                    "UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
+                                    (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])),
+                                )
+                            v2745_be_recovery_active = False
+
+                        recovery_decision = ""
+                        recovery_decision_price = 0.0
+                        # 5분 단위로 가져온 완성 1분봉을 BE 발생 다음 봉부터 시간순으로 확인한다.
+                        for rb in minute_bars:
+                            rb_dt = None
+                            try:
+                                rb_dt = datetime.fromisoformat(str(rb.get("ts") or ""))
+                                if rb_dt.tzinfo is None:
+                                    rb_dt = rb_dt.replace(tzinfo=timezone.utc)
+                            except Exception:
+                                rb_dt = None
+                            if rb_dt is not None and rb_dt <= recovery_started:
+                                continue
+                            hit_hard = float(rb["low"]) <= recovery_hard
+                            hit_target = float(rb["high"]) >= recovery_target
+                            if hit_hard and hit_target:
+                                recovery_decision, recovery_decision_price = "HARD_STOP_AMBIGUOUS_1M", recovery_hard
+                                break
+                            if hit_hard:
+                                recovery_decision, recovery_decision_price = "HARD_STOP_1M", recovery_hard
+                                break
+                            if hit_target:
+                                recovery_decision, recovery_decision_price = "RECOVERY_TARGET_1M", recovery_target
+                                break
+
+                        if not recovery_decision:
+                            if price <= recovery_hard:
+                                recovery_decision, recovery_decision_price = "HARD_STOP_TICKER", recovery_hard
+                            elif price >= recovery_target:
+                                recovery_decision, recovery_decision_price = "RECOVERY_TARGET_TICKER", recovery_target
+                            elif recovery_age >= float(self.cfg.research_pv2745_recovery_timeout_minutes):
+                                recovery_decision, recovery_decision_price = "RECOVERY_TIMEOUT", price
+
+                        if recovery_decision:
+                            _finish_pv2745_recovery(recovery_decision_price, recovery_decision)
+
                     # P_V27_1R Recovery Watch / Recovery Confirm 관리.
                     # 첫 50% staged signal은 기존 V27-1과 동일하게 이미 signal_price에서 손절된 것으로 계산한다.
-                    if is_v271r and v271r_recovery_active:
+                    elif is_v271r and v271r_recovery_active:
                         first_frac = min(0.95, max(0.05, float(self.cfg.research_pv271_stage_fraction)))
                         first_pct = float(v271r_recovery.get("first_pct") or 0.0)
                         recovery_hard = entry_price * (1 - abs(float(self.cfg.research_pv271r_hard_stop_pct)) / 100)
@@ -8296,7 +8519,7 @@ class DailyBot:
                                 gross_pct = frac * first_pct + (1 - frac) * second_pct
                                 result, result_price = "STOP", entry_price * (1 + gross_pct / 100)
                                 result_details = {
-                                    "stop_type": "V27_1_STAGED_STOP" if is_v271 else "V27_1R_STAGED_STOP",
+                                    "stop_type": ("V27_1_STAGED_STOP" if is_v271 else ("V27_4_5_V271_STAGED_STOP" if is_pv2745 else "V27_1R_STAGED_STOP")),
                                     "v271_stage_reason": stage_reason,
                                     "v271_first_fraction": frac,
                                     "v271_signal_price": signal_price,
@@ -8325,11 +8548,11 @@ class DailyBot:
                                 if hit_tp1 and hit_hard:
                                     # 같은 1분봉 안의 순서는 알 수 없어 V27-1에서는 보수적으로 재난선 우선.
                                     result, result_price = "STOP", hard_price
-                                    result_details = {"stop_type":("V27_1R_DISASTER" if is_v271r else "V27_1_DISASTER"),"minute_order_ambiguous":True}
+                                    result_details = {"stop_type":("V27_1R_DISASTER" if is_v271r else ("V27_4_5_V271_DISASTER" if is_pv2745 else "V27_1_DISASTER")),"minute_order_ambiguous":True}
                                     break
                                 if hit_hard:
                                     result, result_price = "STOP", hard_price
-                                    result_details = {"stop_type":("V27_1R_DISASTER" if is_v271r else "V27_1_DISASTER"),"source":"confirmed_1m_low"}
+                                    result_details = {"stop_type":("V27_1R_DISASTER" if is_v271r else ("V27_4_5_V271_DISASTER" if is_pv2745 else "V27_1_DISASTER")),"source":"confirmed_1m_low"}
                                     break
                                 if hit_tp1:
                                     tp1_done = True
@@ -8386,6 +8609,50 @@ class DailyBot:
                                                    "p_v2744_be_partial_done":True,"p_v2744_be_partial_price":be_price,
                                                    "p_v2744_be_partial_original_fraction":round(orig_frac,4),
                                                    "p_v2744_final_original_fraction":round(final_frac,4),**market_snapshot})
+                                elif is_pv2745:
+                                    if hit_tp2 and not hit_be:
+                                        result, result_price = "TP2", tp2_price
+                                        result_details = {"tp2_price":tp2_price,"source":"confirmed_1m_high"}
+                                    elif hit_be and not v2745_be_partial_done:
+                                        v2745_be_partial_done = True
+                                        frac_rem = min(0.95,max(0.05,float(self.cfg.research_pv2745_be_close_fraction_of_remaining)))
+                                        orig_frac = 0.50 * frac_rem
+                                        final_frac = 0.50 * (1.0 - frac_rem)
+                                        be_started_at = str(mb.get("ts") or utc_now())
+                                        try:
+                                            be_dt = datetime.fromisoformat(be_started_at)
+                                            if be_dt.tzinfo is None:
+                                                be_dt = be_dt.replace(tzinfo=timezone.utc)
+                                            be_started_at = be_dt.isoformat()
+                                        except Exception:
+                                            be_started_at = utc_now()
+                                        v2745_be_recovery = {
+                                            "active":True,"started_at":be_started_at,"source":"confirmed_1m_low",
+                                            "target_pct":float(self.cfg.research_pv2745_recovery_target_pct),
+                                            "hard_stop_pct":float(self.cfg.research_pv2745_recovery_hard_stop_pct),
+                                            "timeout_minutes":float(self.cfg.research_pv2745_recovery_timeout_minutes),
+                                        }
+                                        review_snap.update({
+                                            "p_v2745_be_partial_done":True,"p_v2745_be_partial_ts":be_started_at,
+                                            "p_v2745_be_partial_price":be_price,"p_v2745_be_partial_original_fraction":round(orig_frac,4),
+                                            "p_v2745_final_original_fraction":round(final_frac,4),
+                                            "p_v2745_be_recovery":v2745_be_recovery,"p_v2745_be_recovery_active":True,
+                                            "p_v2745_be_partial_source":("confirmed_1m_ambiguous" if hit_tp2 else "confirmed_1m_low"),
+                                        })
+                                        with db() as conn:
+                                            conn.execute("UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
+                                                (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])))
+                                        append_entry_record(symbol,"RESEARCH_P_V27_4_5_BE_PARTIAL","P_V27_4_5",float(review["new_p_score"] or 0),be_price,
+                                            "TP1 후 BE: 원포지션 25% 보호청산; final 25% recovery +1/-2.5/15m",
+                                            extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":"P_V27_4_5",
+                                                   "p_v2745_be_partial_done":True,"p_v2745_be_partial_price":be_price,
+                                                   "p_v2745_be_partial_original_fraction":round(orig_frac,4),
+                                                   "p_v2745_final_original_fraction":round(final_frac,4),
+                                                   "p_v2745_be_recovery_active":True,
+                                                   "p_v2745_be_recovery_started_at":be_started_at,**market_snapshot})
+                                        # BE가 발생한 같은 1분봉은 recovery target/stop 판정에 다시 쓰지 않는다.
+                                        v2745_be_recovery_active = True
+                                        break
                                 else:
                                     if hit_tp2 and hit_be:
                                         result, result_price = "BE_EXIT", be_price
@@ -8400,13 +8667,13 @@ class DailyBot:
                         # 분봉 사이의 현재가도 보조 확인한다.
                         if not result and not tp1_done and is_v271_like and price <= hard_price:
                             result, result_price = "STOP", hard_price
-                            result_details = {"stop_type":("V27_1R_DISASTER" if is_v271r else "V27_1_DISASTER"),"source":"ticker"}
+                            result_details = {"stop_type":("V27_1R_DISASTER" if is_v271r else ("V27_4_5_V271_DISASTER" if is_pv2745 else "V27_1_DISASTER")),"source":"ticker"}
                         if not result and not tp1_done and price >= tp1_price:
                             tp1_done = True
-                        if not result and tp1_done and price >= tp2_price:
+                        if not result and tp1_done and not (is_pv2745 and v2745_be_recovery_active) and price >= tp2_price:
                             result, result_price = "TP2", tp2_price
                             result_details = {"tp2_price":tp2_price,"source":"ticker"}
-                        if not result and tp1_done and price <= be_price:
+                        if not result and tp1_done and not (is_pv2745 and v2745_be_recovery_active) and price <= be_price:
                             if is_pv2744:
                                 if not v2744_be_partial_done:
                                     v2744_be_partial_done = True
@@ -8427,6 +8694,38 @@ class DailyBot:
                                                "p_v2744_be_partial_done":True,"p_v2744_be_partial_price":be_price,
                                                "p_v2744_be_partial_original_fraction":round(orig_frac,4),
                                                "p_v2744_final_original_fraction":round(final_frac,4),**market_snapshot})
+                            elif is_pv2745:
+                                if not v2745_be_partial_done:
+                                    v2745_be_partial_done = True
+                                    frac_rem = min(0.95,max(0.05,float(self.cfg.research_pv2745_be_close_fraction_of_remaining)))
+                                    orig_frac = 0.50 * frac_rem
+                                    final_frac = 0.50 * (1.0 - frac_rem)
+                                    be_started_at = utc_now()
+                                    v2745_be_recovery = {
+                                        "active":True,"started_at":be_started_at,"source":"ticker",
+                                        "target_pct":float(self.cfg.research_pv2745_recovery_target_pct),
+                                        "hard_stop_pct":float(self.cfg.research_pv2745_recovery_hard_stop_pct),
+                                        "timeout_minutes":float(self.cfg.research_pv2745_recovery_timeout_minutes),
+                                    }
+                                    review_snap.update({
+                                        "p_v2745_be_partial_done":True,"p_v2745_be_partial_ts":be_started_at,
+                                        "p_v2745_be_partial_price":be_price,"p_v2745_be_partial_original_fraction":round(orig_frac,4),
+                                        "p_v2745_final_original_fraction":round(final_frac,4),
+                                        "p_v2745_be_recovery":v2745_be_recovery,"p_v2745_be_recovery_active":True,
+                                        "p_v2745_be_partial_source":"ticker",
+                                    })
+                                    with db() as conn:
+                                        conn.execute("UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
+                                            (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])))
+                                    append_entry_record(symbol,"RESEARCH_P_V27_4_5_BE_PARTIAL","P_V27_4_5",float(review["new_p_score"] or 0),be_price,
+                                        "TP1 후 BE: 원포지션 25% 보호청산; final 25% recovery +1/-2.5/15m",
+                                        extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":"P_V27_4_5",
+                                               "p_v2745_be_partial_done":True,"p_v2745_be_partial_price":be_price,
+                                               "p_v2745_be_partial_original_fraction":round(orig_frac,4),
+                                               "p_v2745_final_original_fraction":round(final_frac,4),
+                                               "p_v2745_be_recovery_active":True,
+                                               "p_v2745_be_recovery_started_at":be_started_at,**market_snapshot})
+                                    v2745_be_recovery_active = True
                             else:
                                 result, result_price = "BE_EXIT", be_price
                                 result_details = {"be_price":be_price,"source":"ticker"}
@@ -8449,7 +8748,7 @@ class DailyBot:
                 # 서로 다른 5분 확인시점에서 2회 연속 유지될 때 먼저 작은 손실로 종료한다.
                 if (
                     not result
-                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_1R", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY", "P_V27_4", "P_V27_4_FILTER_ONLY", "P_V27_4_1", "P_V27_4_2", "P_V27_4_2_BLOCK_GHOST", "P_V27_4_3", "P_V27_4_3_BLOCK_GHOST", "P_V27_4_4")
+                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_1R", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY", "P_V27_4", "P_V27_4_FILTER_ONLY", "P_V27_4_1", "P_V27_4_2", "P_V27_4_2_BLOCK_GHOST", "P_V27_4_3", "P_V27_4_3_BLOCK_GHOST", "P_V27_4_4", "P_V27_4_5")
                     and not tp1_done
                     and not (is_v271_like and v271_stage_active)
                     and not v271r_recovery_active
@@ -8648,8 +8947,8 @@ class DailyBot:
                                 shadow_id,variant,symbol,opened_at,shadow_started_at,entry_price,be_exit_price,tp2_price,highest_price,lowest_price,last_price,last_checked_at
                             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (str(review["shadow_id"] or ""),variant,symbol,opened_at,result_ts,entry_price,float(result_price),tp2_price,float(result_price),float(result_price),float(result_price),result_ts))
+                    final_exit_pct = (float(result_price) / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
                     if is_pv2744:
-                        final_exit_pct = (float(result_price) / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
                         partial_done = bool(review_snap.get("p_v2744_be_partial_done"))
                         if tp1_done:
                             if partial_done:
@@ -8666,6 +8965,28 @@ class DailyBot:
                             "p_v2744_be_partial_original_fraction":review_snap.get("p_v2744_be_partial_original_fraction"),
                             "p_v2744_final_original_fraction":review_snap.get("p_v2744_final_original_fraction"),
                             "p_v2744_strategy_gross_pct":round(strategy_gross,4),
+                        })
+                    if is_pv2745:
+                        partial_done = bool(review_snap.get("p_v2745_be_partial_done"))
+                        if "p_v2745_strategy_gross_pct" in result_details:
+                            strategy_gross = float(result_details.get("p_v2745_strategy_gross_pct") or 0.0)
+                        elif tp1_done:
+                            if partial_done:
+                                partial_frac = float(review_snap.get("p_v2745_be_partial_original_fraction") or 0.25)
+                                final_frac = float(review_snap.get("p_v2745_final_original_fraction") or 0.25)
+                                strategy_gross = 0.50 * float(self.cfg.tp1_pct) + partial_frac * float(self.cfg.breakeven_stop_pct) + final_frac * final_exit_pct
+                            else:
+                                strategy_gross = 0.50 * float(self.cfg.tp1_pct) + 0.50 * final_exit_pct
+                        else:
+                            strategy_gross = final_exit_pct
+                        result_details.update({
+                            "p_v2745_be_partial_done":partial_done,
+                            "p_v2745_be_partial_price":review_snap.get("p_v2745_be_partial_price"),
+                            "p_v2745_be_partial_original_fraction":review_snap.get("p_v2745_be_partial_original_fraction"),
+                            "p_v2745_final_original_fraction":review_snap.get("p_v2745_final_original_fraction"),
+                            "p_v2745_be_recovery_active":bool((review_snap.get("p_v2745_be_recovery") or {}).get("active")),
+                            "p_v2745_be_recovery_finish_reason":str((review_snap.get("p_v2745_be_recovery") or {}).get("finish_reason") or result_details.get("p_v2745_finish_reason") or ""),
+                            "p_v2745_strategy_gross_pct":round(strategy_gross,4),
                         })
                     details_json = json.dumps({
                         "shadow_id": str(review["shadow_id"] or ""), "variant": variant,
@@ -8709,6 +9030,15 @@ class DailyBot:
                                "p_v2744_be_partial_original_fraction": review_snap.get("p_v2744_be_partial_original_fraction") if variant == "P_V27_4_4" else "",
                                "p_v2744_final_original_fraction": review_snap.get("p_v2744_final_original_fraction") if variant == "P_V27_4_4" else "",
                                "p_v2744_strategy_gross_pct": result_details.get("p_v2744_strategy_gross_pct","") if variant == "P_V27_4_4" else "",
+                               "p_v2745_be_partial_done": bool(review_snap.get("p_v2745_be_partial_done")) if variant == "P_V27_4_5" else "",
+                               "p_v2745_be_partial_price": review_snap.get("p_v2745_be_partial_price") if variant == "P_V27_4_5" else "",
+                               "p_v2745_be_partial_original_fraction": review_snap.get("p_v2745_be_partial_original_fraction") if variant == "P_V27_4_5" else "",
+                               "p_v2745_final_original_fraction": review_snap.get("p_v2745_final_original_fraction") if variant == "P_V27_4_5" else "",
+                               "p_v2745_be_recovery_active": bool((review_snap.get("p_v2745_be_recovery") or {}).get("active")) if variant == "P_V27_4_5" else "",
+                               "p_v2745_be_recovery_started_at": (review_snap.get("p_v2745_be_recovery") or {}).get("started_at") if variant == "P_V27_4_5" else "",
+                               "p_v2745_be_recovery_finish_reason": result_details.get("p_v2745_be_recovery_finish_reason","") if variant == "P_V27_4_5" else "",
+                               "p_v2745_be_recovery_exit_pct": result_details.get("p_v2745_be_recovery_exit_pct","") if variant == "P_V27_4_5" else "",
+                               "p_v2745_strategy_gross_pct": result_details.get("p_v2745_strategy_gross_pct","") if variant == "P_V27_4_5" else "",
                                **market_snapshot})
                 else:
                     with db() as conn:
