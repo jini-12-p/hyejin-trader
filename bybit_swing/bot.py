@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.82-Pv27.4.6-EntryRiskGuard-Pv271R-StagedReboundRecovery-Pv27.4.5-BERecovery15m-Pv27.4.3-Pv27.4.4-DBLight1"
+BOT_RUNTIME_VERSION = "RC-v4.3.83-ParallelEntryStopLab-V25Master-SharedAPI"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -470,6 +470,30 @@ class DailyConfig:
     research_pv271r_confirm_drawdown_pct: float = 1.00
     research_pv271r_hard_stop_pct: float = 2.60
     research_pv271r_max_hold_minutes: float = 120.0
+
+    # v4.3.83 Parallel Entry/Stop Lab (research-only, LIVE order untouched)
+    # 한 V25 confirmed opportunity에서 손절 5경로와 진입 7경로를 병렬 비교한다.
+    # 손절 경로는 P_STOP_CONTROL의 portfolio schedule을 공통으로 사용해 진입표본을 동일하게 유지한다.
+    # 진입 경로는 각 필터별 독립 portfolio schedule(15m 2-cap / 4 slots / LIVE90 / STOP180)을 사용한다.
+    research_parallel_lab_enabled: bool = True
+    research_parallel_max_entries_per_15m: int = 2
+    research_parallel_max_open_positions: int = 4
+
+    # STOP EARLY50: 현재 TIER1보다 한 단계 빠른 50% Stage1 후보.
+    research_parallel_early_min_age_minutes: float = 15.0
+    research_parallel_early_max_age_minutes: float = 45.0
+    research_parallel_early_drawdown_pct: float = 1.50
+    research_parallel_early_mfe_max_pct: float = 0.50
+
+    # STOP DISASTER50: 기존 Stage1 없이 -3% 직행하는 경로의 중간 50% 축소.
+    research_parallel_disaster_stage_pct: float = 2.50
+
+    # STOP LATE50: 오래 못 가는 저-MFE 실패를 기존 80m LATE보다 앞에서 50% 축소.
+    research_parallel_late_min_age_minutes: float = 60.0
+    research_parallel_late_pnl_pct: float = -1.00
+    research_parallel_late_mfe_max_pct: float = 0.75
+    research_parallel_late_confirmations: int = 2
+
     # V26 검증 화면/CSV는 V22/V25/V26 중심으로 보기 위해 P_V23/P_V24 신규 연구진입은 기본 OFF.
     # 코드 자체는 남겨 두어 필요하면 config.json에서 다시 켤 수 있다.
     research_v23_v24_enabled: bool = False
@@ -597,12 +621,9 @@ class DailyConfig:
         cfg.research_junp_variants_enabled = False
         cfg.research_legacy_variants_enabled = False
         cfg.research_pv25_control_enabled = False
-        # v4.3.78 비교군 고정:
-        # - V26: V27-1의 원본 진입 source/control이라 유지
-        # - P_V27_4_1: V25 순수 진입 control (hard block 없음)
-        # - P_V27_4_2: V25 순수 진입 + 이번에 고정한 보정 진입필터만 적용
-        # - P_V27_1: V26 진입을 1:1 복제하는 stop-only 비교군으로 별도 유지
-        # 구형 V27-3/V27-4 진입 비교군의 신규 생성은 중지하되, 이미 열린 Shadow 관리는 계속한다.
+        # v4.3.83: 기존 연구 variant는 신규진입을 중지하고 열린 Shadow만 끝까지 관리한다.
+        # 새 데이터는 V25 Master 기반 Parallel Entry/Stop Lab 한 축으로 통일한다.
+        cfg.research_pv26_enabled = False
         cfg.research_pv272_enabled = False
         cfg.research_pv272_filter_only_enabled = False
         cfg.research_pv273_enabled = False
@@ -610,25 +631,21 @@ class DailyConfig:
         cfg.research_pv274_enabled = False
         cfg.research_pv274_filter_only_enabled = False
         cfg.research_pv274_stop_ghost_enabled = True
-        cfg.research_pv2741_enabled = True
+        cfg.research_pv2741_enabled = False
         cfg.research_pv2741_stop_ghost_enabled = True
-        # 4.2는 기존 열린 Shadow/STOP_GHOST 관리만 계속하고 신규 진입은 중지한다.
         cfg.research_pv2742_enabled = False
         cfg.research_pv2742_block_ghost_enabled = True
         cfg.research_pv2742_stop_ghost_enabled = True
-        # 새 비교축: 4.3=범위보정 진입필터 / 4.4=V25 진입 + 부분 BE.
-        cfg.research_pv2743_enabled = True
+        cfg.research_pv2743_enabled = False
         cfg.research_pv2743_block_ghost_enabled = True
         cfg.research_pv2743_stop_ghost_enabled = True
-        cfg.research_pv2744_enabled = True
-        # v4.3.81: 4.5는 V25 진입 + V27-1 동일손절 + BE Recovery(+1/-2.5/15m) 비교군.
-        cfg.research_pv2745_enabled = True
-        # v4.3.82: 4.6은 4.3을 덮지 않는 신규 Entry Risk Guard Shadow 비교군.
-        cfg.research_pv2746_enabled = True
+        cfg.research_pv2744_enabled = False
+        cfg.research_pv2745_enabled = False
+        cfg.research_pv2746_enabled = False
         cfg.research_pv2746_block_ghost_enabled = True
         cfg.research_pv2746_stop_ghost_enabled = True
-        # v4.3.80: 기존 P_V27_1은 대조군으로 유지하고, staged REBOUND recovery 전용 P_V27_1R을 병렬 실행.
-        cfg.research_pv271r_enabled = True
+        cfg.research_pv271r_enabled = False
+        cfg.research_parallel_lab_enabled = True
         return cfg
 
 
@@ -789,6 +806,10 @@ SCAN_REJECTED_FIELDS = [
     "live_quality_ok", "live_quality_reason", "live_quality_bullish", "live_quality_body_ok",
     "live_quality_wick_ok", "live_quality_prev_bearish", "live_quality_prev_body_recovery",
     "live_quality_recovery_ok", "live_quality_5m_bullish",
+    # v4.3.83 parallel entry/stop lab telemetry
+    "parallel_lab_group", "parallel_lab_rule", "parallel_lab_filter_block",
+    "parallel_lab_filter_flags", "parallel_lab_source_setup_id", "parallel_lab_master_variant",
+    "parallel_lab_stop_trigger", "parallel_lab_stop_signal_pct", "parallel_lab_late_streak",
     "shadow_id", "research_variant", "shadow_entry_time", "mfe_pct", "mae_pct",
     "shadow_age_min", "shadow_exit_pct", "shadow_stop_type",
 ]
@@ -7257,6 +7278,231 @@ class DailyBot:
             "p_v2746_filter_frozen": True,
         }
 
+    def _parallel_insert_shadow(
+        self,
+        *,
+        variant: str,
+        group: str,
+        rule: str,
+        symbol: str,
+        details: dict[str, Any],
+        source_setup_id: str,
+        entry_price: float,
+        closed_5m_price: float,
+        five_bullish: bool,
+        high_break: bool,
+        extra_snap: dict[str, Any] | None = None,
+    ) -> bool:
+        """v4.3.83: V25 confirmed opportunity를 병렬 연구 Shadow 한 경로로 복제한다."""
+        if entry_price <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        setup_id = f"{source_setup_id}|{variant}"
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND setup_id=? LIMIT 1",
+                (variant, setup_id),
+            ).fetchone():
+                return False
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND symbol=? AND completed=0 LIMIT 1",
+                (variant, symbol),
+            ).fetchone():
+                return False
+
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-{variant}-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            tp2_price = entry_price * (1 + float(self.cfg.tp2_pct) / 100)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100)
+            snap = dict(details)
+            snap.update({
+                "parallel_lab_group": group,
+                "parallel_lab_rule": rule,
+                "parallel_lab_source_setup_id": source_setup_id,
+                "parallel_lab_master_variant": "P_STOP_CONTROL" if group == "STOP" else variant,
+                "p_v25_setup_id": source_setup_id,
+                "p_v25_5m_bullish": bool(five_bullish),
+                "p_v25_prev_high_break": bool(high_break),
+                "p_v25_closed_5m_price": closed_5m_price,
+                "parallel_live_entry_price": entry_price,
+            })
+            if extra_snap:
+                snap.update(extra_snap)
+
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,missing_condition,snapshot_json,
+                    tp2_price,be_price,highest_price,lowest_price,last_price,last_checked_at,last_5m_bucket,last_15m_bucket,
+                    mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id,variant,symbol,opened_at,int(now.timestamp()*1000),entry_price,
+                    float(details.get("p_score") or 0),float(details.get("p_v2_score") or 0),
+                    f"parallel_{group.lower()}_{rule}",json.dumps(snap,ensure_ascii=False,default=str),
+                    tp2_price,be_price,entry_price,entry_price,entry_price,opened_at,
+                    str(int(now.timestamp())//300),str(int(now.timestamp())//900),0.0,0.0,setup_id,0,
+                ),
+            )
+        append_entry_record(
+            symbol,f"RESEARCH_{variant}_ENTRY",variant,float(details.get("p_v2_score") or 0),entry_price,
+            f"parallel {group} rule={rule}; V25 master confirmed; actual_order=0",
+            extra={
+                **details,
+                "shadow_id":shadow_id,"research_variant":variant,"shadow_entry_time":_kst_stamp(opened_at),
+                "parallel_lab_group":group,"parallel_lab_rule":rule,
+                "parallel_lab_source_setup_id":source_setup_id,
+                "parallel_lab_master_variant":"P_STOP_CONTROL" if group=="STOP" else variant,
+            },
+        )
+        return True
+
+    def _open_parallel_stop_bundle(
+        self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
+        closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> bool:
+        """손절 5경로는 P_STOP_CONTROL의 동일 V25 portfolio schedule을 공유한다."""
+        if not self.cfg.research_parallel_lab_enabled or entry_price <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        master = "P_STOP_CONTROL"
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND symbol=? AND completed=0 LIMIT 1",
+                (master, symbol),
+            ).fetchone():
+                return False
+
+        live_cd, live_remaining, live_prior = self._research_live_cooldown_status(master, symbol, now)
+        if live_cd:
+            append_entry_record(
+                symbol,"RESEARCH_P_STOP_BUNDLE_SKIPPED",master,float(details.get("p_v2_score") or 0),entry_price,
+                f"LIVE90_COOLDOWN remaining={live_remaining:.1f}m",
+                extra={**details,"parallel_lab_group":"STOP","parallel_lab_rule":"BUNDLE",
+                       "parallel_lab_source_setup_id":source_setup_id,"parallel_lab_master_variant":master},
+            )
+            return False
+        stop_cd, remaining, prior = self._variant_stop_cooldown_status(master, symbol, now)
+        if stop_cd:
+            append_entry_record(
+                symbol,"RESEARCH_P_STOP_BUNDLE_SKIPPED",master,float(details.get("p_v2_score") or 0),entry_price,
+                f"STOP180_COOLDOWN remaining={remaining:.1f}m",
+                extra={**details,"parallel_lab_group":"STOP","parallel_lab_rule":"BUNDLE",
+                       "parallel_lab_source_setup_id":source_setup_id,"parallel_lab_master_variant":master},
+            )
+            return False
+        allowed, why = self._variant_can_open_now(
+            master, now, self.cfg.research_parallel_max_entries_per_15m, self.cfg.research_parallel_max_open_positions
+        )
+        if not allowed:
+            append_entry_record(
+                symbol,"RESEARCH_P_STOP_BUNDLE_SKIPPED",master,float(details.get("p_v2_score") or 0),entry_price,why,
+                extra={**details,"parallel_lab_group":"STOP","parallel_lab_rule":"BUNDLE",
+                       "parallel_lab_source_setup_id":source_setup_id,"parallel_lab_master_variant":master},
+            )
+            return False
+
+        variants = (
+            ("P_STOP_CONTROL","CONTROL"),
+            ("P_STOP_EARLY50","EARLY50"),
+            ("P_STOP_DISASTER50","DISASTER50"),
+            ("P_STOP_LATE50","LATE50"),
+            ("P_STOP_COMBO","COMBO"),
+        )
+        opened_any = False
+        for variant, rule in variants:
+            opened_any = self._parallel_insert_shadow(
+                variant=variant,group="STOP",rule=rule,symbol=symbol,details=details,
+                source_setup_id=source_setup_id,entry_price=entry_price,closed_5m_price=closed_5m_price,
+                five_bullish=five_bullish,high_break=high_break,
+            ) or opened_any
+        return opened_any
+
+    def _open_parallel_entry_bundle(
+        self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
+        closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> None:
+        """진입 7경로: V25 control / A / B / C3 / C5 / B+C3+C5 / current4.6."""
+        if not self.cfg.research_parallel_lab_enabled or entry_price <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        meta = self._pv2746_entry_risk_filter_meta(details)
+        a = bool(meta.get("p_v2746_a_gap_rsi_h1"))
+        b = bool(meta.get("p_v2746_b_ema9_eth"))
+        c3 = bool(meta.get("p_v2746_c3_adj"))
+        c5 = bool(meta.get("p_v2746_c5_adj"))
+        flag_text = ",".join(k for k,v in (
+            ("A",a),("B",b),("C3",c3),("C5",c5)
+        ) if v)
+
+        specs = (
+            ("P_ENTRY_CONTROL","CONTROL",False),
+            ("P_ENTRY_A","A",a),
+            ("P_ENTRY_B","B",b),
+            ("P_ENTRY_C3","C3",c3),
+            ("P_ENTRY_C5","C5",c5),
+            ("P_ENTRY_COMBO","B+C3+C5",bool(b or c3 or c5)),
+            ("P_ENTRY_46","A+B+C3+C5",bool(a or b or c3 or c5)),
+        )
+        for variant, rule, blocked in specs:
+            if blocked:
+                append_entry_record(
+                    symbol,f"RESEARCH_{variant}_BLOCKED_FILTER",variant,float(details.get("p_v2_score") or 0),entry_price,
+                    f"parallel entry block={rule}; matched={flag_text or 'NONE'}; actual_order=0",
+                    extra={
+                        **details,**meta,"parallel_lab_group":"ENTRY","parallel_lab_rule":rule,
+                        "parallel_lab_filter_block":True,"parallel_lab_filter_flags":flag_text,
+                        "parallel_lab_source_setup_id":source_setup_id,"parallel_lab_master_variant":variant,
+                    },
+                )
+                continue
+
+            with db() as conn:
+                if conn.execute(
+                    "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND symbol=? AND completed=0 LIMIT 1",
+                    (variant, symbol),
+                ).fetchone():
+                    continue
+            live_cd, live_remaining, live_prior = self._research_live_cooldown_status(variant, symbol, now)
+            if live_cd:
+                append_entry_record(
+                    symbol,f"RESEARCH_{variant}_SKIPPED",variant,float(details.get("p_v2_score") or 0),entry_price,
+                    f"LIVE90_COOLDOWN remaining={live_remaining:.1f}m",
+                    extra={**details,**meta,"parallel_lab_group":"ENTRY","parallel_lab_rule":rule,
+                           "parallel_lab_filter_block":False,"parallel_lab_filter_flags":flag_text,
+                           "parallel_lab_source_setup_id":source_setup_id,"parallel_lab_master_variant":variant},
+                )
+                continue
+            stop_cd, remaining, prior = self._variant_stop_cooldown_status(variant, symbol, now)
+            if stop_cd:
+                append_entry_record(
+                    symbol,f"RESEARCH_{variant}_SKIPPED",variant,float(details.get("p_v2_score") or 0),entry_price,
+                    f"STOP180_COOLDOWN remaining={remaining:.1f}m",
+                    extra={**details,**meta,"parallel_lab_group":"ENTRY","parallel_lab_rule":rule,
+                           "parallel_lab_filter_block":False,"parallel_lab_filter_flags":flag_text,
+                           "parallel_lab_source_setup_id":source_setup_id,"parallel_lab_master_variant":variant},
+                )
+                continue
+            allowed, why = self._variant_can_open_now(
+                variant, now, self.cfg.research_parallel_max_entries_per_15m, self.cfg.research_parallel_max_open_positions
+            )
+            if not allowed:
+                append_entry_record(
+                    symbol,f"RESEARCH_{variant}_SKIPPED",variant,float(details.get("p_v2_score") or 0),entry_price,why,
+                    extra={**details,**meta,"parallel_lab_group":"ENTRY","parallel_lab_rule":rule,
+                           "parallel_lab_filter_block":False,"parallel_lab_filter_flags":flag_text,
+                           "parallel_lab_source_setup_id":source_setup_id,"parallel_lab_master_variant":variant},
+                )
+                continue
+
+            self._parallel_insert_shadow(
+                variant=variant,group="ENTRY",rule=rule,symbol=symbol,details=details,
+                source_setup_id=source_setup_id,entry_price=entry_price,closed_5m_price=closed_5m_price,
+                five_bullish=five_bullish,high_break=high_break,
+                extra_snap={
+                    **meta,"parallel_lab_filter_block":False,"parallel_lab_filter_flags":flag_text,
+                },
+            )
+
     def _register_pv2746_block_ghost(
         self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
         closed_5m_price: float, five_bullish: bool, high_break: bool, meta: dict[str, Any],
@@ -8196,6 +8442,17 @@ class DailyBot:
             return
         if self.cfg.research_pv25_control_enabled:
             self._open_pv25_confirmed_shadow(symbol, details, setup_id, live_entry_price, five_bullish, high_break)
+
+        # v4.3.83: 한 V25 confirmed opportunity에서 손절/진입 병렬 연구를 동시에 시작한다.
+        # 손절은 P_STOP_CONTROL schedule을 공통으로 사용하고, 진입은 각 경로별 독립 portfolio schedule을 사용한다.
+        self._open_parallel_stop_bundle(
+            symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
+        )
+        self._open_parallel_entry_bundle(
+            symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
+        )
+
+        # 구형 연구 신규진입 함수는 config에서 OFF이며, 기존 열린 Shadow 관리만 유지한다.
         self._open_pv26_confirmed_shadow(
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
         )
@@ -8327,6 +8584,46 @@ class DailyBot:
         structure_cache: dict[tuple[Any, ...], tuple[bool, dict[str, Any]]] = {}
         flat_cache: dict[tuple[Any, ...], tuple[bool, dict[str, Any]]] = {}
         late26_cache: dict[tuple[Any, ...], tuple[bool, dict[str, Any]]] = {}
+
+        # v4.3.83: 병렬 경로가 같은 symbol/timeframe 데이터를 중복 호출하지 않도록 공유한다.
+        parallel_m5_cache: dict[str, pd.DataFrame | None] = {}
+        parallel_m15_cache: dict[str, pd.DataFrame | None] = {}
+        recent_1m_cache: dict[str, pd.DataFrame | None] = {}
+
+        def _parallel_m5(symbol_: str) -> pd.DataFrame | None:
+            if symbol_ not in parallel_m5_cache:
+                try:
+                    raw = self.client.candles(symbol_, "5m", 80)
+                    parallel_m5_cache[symbol_] = confirmed(indicators(raw)) if raw is not None and len(raw) else raw
+                except Exception:
+                    parallel_m5_cache[symbol_] = None
+            return parallel_m5_cache[symbol_]
+
+        def _parallel_m15(symbol_: str) -> pd.DataFrame | None:
+            if symbol_ not in parallel_m15_cache:
+                try:
+                    raw = self.client.candles(symbol_, "15m", 80)
+                    parallel_m15_cache[symbol_] = confirmed(indicators(raw)) if raw is not None and len(raw) else raw
+                except Exception:
+                    parallel_m15_cache[symbol_] = None
+            return parallel_m15_cache[symbol_]
+
+        def _recent_1m(symbol_: str, limit_: int) -> pd.DataFrame | None:
+            # 병렬 variant가 5/7개 분봉을 각각 재요청하지 않도록 symbol당 7개를 한 번만 공유한다.
+            if symbol_ not in recent_1m_cache:
+                try:
+                    raw = self.client.candles(symbol_, "1m", max(7, int(limit_)))
+                    recent_1m_cache[symbol_] = confirmed(raw) if raw is not None and len(raw) else raw
+                except Exception:
+                    recent_1m_cache[symbol_] = None
+            df = recent_1m_cache[symbol_]
+            if df is None:
+                return None
+            try:
+                return df.tail(max(1, int(limit_)))
+            except Exception:
+                return df
+
         for review in pending:
             symbol = str(review["symbol"] or "")
             variant = str(review["variant"] or "")
@@ -8338,11 +8635,19 @@ class DailyBot:
             is_pv2746_stop_ghost = variant == "P_V27_4_6_STOP_GHOST"
             is_pv274_block_ghost = variant == "P_V27_4_BLOCK_GHOST"
             is_raw_path_ghost = bool(is_pv26_stop_ghost or is_pv274_stop_ghost or is_pv2741_stop_ghost or is_pv2742_stop_ghost or is_pv2743_stop_ghost or is_pv2746_stop_ghost or is_pv274_block_ghost)
-            # V27-1 / V27-1R / 4.5는 같은 staged/disaster 손절 골격을 공유한다.
-            # V27-1R은 staged REBOUND recovery, 4.5는 TP1 후 BE Recovery만 별도로 추가한다.
-            # 4.3/4.4/4.6에는 V27-1 stop을 섞지 않는다.
+            # V27-1 계열 + v4.3.83 병렬 연구경로는 같은 staged/disaster + 1R recovery 골격을 공유한다.
+            # 새 병렬 경로는 LIVE 주문과 완전히 분리된 research-only Shadow다.
+            parallel_stop_variants = {
+                "P_STOP_CONTROL","P_STOP_EARLY50","P_STOP_DISASTER50","P_STOP_LATE50","P_STOP_COMBO",
+            }
+            parallel_entry_variants = {
+                "P_ENTRY_CONTROL","P_ENTRY_A","P_ENTRY_B","P_ENTRY_C3","P_ENTRY_C5","P_ENTRY_COMBO","P_ENTRY_46",
+            }
+            is_parallel_stop = variant in parallel_stop_variants
+            is_parallel_entry = variant in parallel_entry_variants
+            is_parallel_recovery = bool(is_parallel_stop or is_parallel_entry)
             is_v271 = variant == "P_V27_1"
-            is_v271r = variant == "P_V27_1R"
+            is_v271r = bool(variant == "P_V27_1R" or is_parallel_recovery)
             is_pv2745 = variant == "P_V27_4_5"
             is_v271_like = bool(is_v271 or is_v271r or is_pv2745)
             is_pv2744 = variant == "P_V27_4_4"
@@ -8703,7 +9008,7 @@ class DailyBot:
                             elif watch_age >= float(self.cfg.research_pv271r_watch_minutes):
                                 # 5분 watch 동안 hard/confirm touch 순서를 1분봉으로 소급 확인한다.
                                 try:
-                                    hist = confirmed(self.client.candles(symbol, "1m", 7))
+                                    hist = _recent_1m(symbol, 7)
                                     need = max(1, int(math.ceil(float(self.cfg.research_pv271r_watch_minutes))))
                                     hist = hist.tail(need) if hist is not None else hist
                                     if hist is not None and len(hist) > 0:
@@ -8740,10 +9045,12 @@ class DailyBot:
                                         (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])),
                                     )
                                 append_entry_record(
-                                    symbol,"RESEARCH_P_V27_1R_RECOVERY_CONFIRMED","P_V27_1R",
+                                    symbol,f"RESEARCH_{variant}_RECOVERY_CONFIRMED",variant,
                                     float(review["new_p_score"] or 0),confirm_price,
                                     "staged REBOUND recovery confirmed; remaining 50% targets TP1",
-                                    extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":"P_V27_1R",
+                                    extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":variant,
+                                           "parallel_lab_group":str(review_snap.get("parallel_lab_group") or ""),
+                                           "parallel_lab_rule":str(review_snap.get("parallel_lab_rule") or ""),
                                            "p_v271r_recovery_watch_active":True,"p_v271r_recovery_confirmed":True,
                                            "p_v271r_recovery_reason":recovery_decision,**market_snapshot},
                                 )
@@ -8789,7 +9096,7 @@ class DailyBot:
                             second_price, stage_reason = rebound_target, "REBOUND"
                         elif stage_age >= float(self.cfg.research_pv271_wait_minutes):
                             try:
-                                hist = confirmed(self.client.candles(symbol, "1m", 5))
+                                hist = _recent_1m(symbol, 5)
                                 need = max(1, int(math.ceil(float(self.cfg.research_pv271_wait_minutes))))
                                 hist = hist.tail(need) if hist is not None else hist
                                 if hist is not None and len(hist) > 0:
@@ -8836,10 +9143,12 @@ class DailyBot:
                                         (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])),
                                     )
                                 append_entry_record(
-                                    symbol,"RESEARCH_P_V27_1R_RECOVERY_WATCH","P_V27_1R",
+                                    symbol,f"RESEARCH_{variant}_RECOVERY_WATCH",variant,
                                     float(review["new_p_score"] or 0),second_price,
                                     f"staged {stage_reason}; keep remaining 50%; watch={self.cfg.research_pv271r_watch_minutes}m; confirm=-{self.cfg.research_pv271r_confirm_drawdown_pct}%; hard=-{self.cfg.research_pv271r_hard_stop_pct}%",
-                                    extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":"P_V27_1R",
+                                    extra={"shadow_id":str(review["shadow_id"] or ""),"research_variant":variant,
+                                           "parallel_lab_group":str(review_snap.get("parallel_lab_group") or ""),
+                                           "parallel_lab_rule":str(review_snap.get("parallel_lab_rule") or ""),
                                            "p_v271r_recovery_watch_active":True,"p_v271r_recovery_confirmed":False,
                                            "p_v271r_recovery_reason":stage_reason,"p_v271r_recovery_started_at":str(v271r_recovery["started_at"]),
                                            **market_snapshot},
@@ -8873,13 +9182,163 @@ class DailyBot:
                                     "v271_signal_started_at": str(v271_stage.get("started_at") or ""),
                                 }
                     else:
-                        if age_min >= float(self.cfg.max_hold_hours) * 60.0:
+                        # v4.3.83 Parallel STOP Lab.
+                        # CONTROL은 기존 V27-1R 그대로. EARLY/DISASTER/LATE/COMBO만 첫 50% Stage1 시점을 달리한다.
+                        # COMBO에서는 한 번 Stage1이 시작되면 다른 병렬 손절이 중복 발동하지 않는다.
+                        if is_parallel_stop and not tp1_done and not result:
+                            pnl_pct_now = (price / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+                            parallel_trigger = ""
+                            parallel_signal_price = 0.0
+                            parallel_details: dict[str, Any] = {}
+                            trade_low_candidates = [price]
+                            opened_floor = opened.replace(second=0, microsecond=0)
+                            for _mb in minute_bars:
+                                try:
+                                    _ts = datetime.fromisoformat(str(_mb.get("ts") or ""))
+                                    if _ts.tzinfo is None:
+                                        _ts = _ts.replace(tzinfo=timezone.utc)
+                                    if _ts >= opened_floor:
+                                        trade_low_candidates.append(float(_mb.get("low") or price))
+                                except Exception:
+                                    if age_min >= 5.0:
+                                        trade_low_candidates.append(float(_mb.get("low") or price))
+                            observed_low_now = min(trade_low_candidates)
+                            full_hard_price = entry_price * (1 - abs(float(self.cfg.research_pv271_disaster_stop_pct)) / 100)
+
+                            # DISASTER50: -2.5%를 먼저 통과하면 첫 50%를 정확히 -2.5%로 축소.
+                            # 같은 관측 구간에서 -3%까지 함께 통과했다면 보수적으로 나머지 50%도 -3% 처리한다.
+                            if variant in ("P_STOP_DISASTER50","P_STOP_COMBO"):
+                                disaster_stage_price = entry_price * (1 - abs(float(self.cfg.research_parallel_disaster_stage_pct)) / 100)
+                                if observed_low_now <= disaster_stage_price:
+                                    if observed_low_now <= full_hard_price:
+                                        frac = min(0.95, max(0.05, float(self.cfg.research_pv271_stage_fraction)))
+                                        first_pct = -abs(float(self.cfg.research_parallel_disaster_stage_pct))
+                                        second_pct = -abs(float(self.cfg.research_pv271_disaster_stop_pct))
+                                        gross_pct = frac * first_pct + (1 - frac) * second_pct
+                                        result = "STOP"
+                                        result_price = entry_price * (1 + gross_pct / 100)
+                                        result_details = {
+                                            "stop_type":"PARALLEL_DISASTER50_DIRECT",
+                                            "parallel_lab_stop_trigger":"DISASTER50",
+                                            "parallel_first_fraction":frac,
+                                            "parallel_first_pct":round(first_pct,4),
+                                            "parallel_second_pct":round(second_pct,4),
+                                            "parallel_total_gross_pct":round(gross_pct,4),
+                                            "source":"shared_1m_low_or_ticker",
+                                        }
+                                    else:
+                                        parallel_trigger = "DISASTER50"
+                                        parallel_signal_price = disaster_stage_price
+                                        parallel_details = {
+                                            "reason":"PARALLEL_DISASTER50",
+                                            "drawdown_pct":round(-abs(float(self.cfg.research_parallel_disaster_stage_pct)),3),
+                                            "observed_low_pct":round((observed_low_now/entry_price-1)*100,3),
+                                        }
+
+                            # EARLY50: 15~45m, -1.5% 이하, MFE<=0.5%, 현재 TIER2형 5m 구조약화.
+                            if (
+                                not result and not parallel_trigger
+                                and variant in ("P_STOP_EARLY50","P_STOP_COMBO")
+                                and five_due
+                                and float(self.cfg.research_parallel_early_min_age_minutes) <= age_min <= float(self.cfg.research_parallel_early_max_age_minutes)
+                                and pnl_pct_now <= -abs(float(self.cfg.research_parallel_early_drawdown_pct))
+                                and mfe_pct <= float(self.cfg.research_parallel_early_mfe_max_pct)
+                            ):
+                                m5p = _parallel_m5(symbol)
+                                if m5p is not None and len(m5p) >= 3:
+                                    aa, bb, cc = m5p.iloc[-3], m5p.iloc[-2], m5p.iloc[-1]
+                                    two_below = bool(float(bb.close) < float(bb.ema9) and float(cc.close) < float(cc.ema9))
+                                    ema9_fall = bool(float(cc.ema9) < float(bb.ema9) < float(aa.ema9))
+                                    below20 = bool(float(cc.close) < float(cc.ema20) * 0.998)
+                                    lower_lows = bool(float(cc.low) < float(bb.low) <= float(aa.low))
+                                    rsi_weak = bool(float(cc.rsi) < float(bb.rsi) and float(cc.rsi) <= 50.0)
+                                    sscore = int(below20) + int(lower_lows) + int(rsi_weak)
+                                    if two_below and ema9_fall and sscore >= 1:
+                                        parallel_trigger = "EARLY50"
+                                        parallel_signal_price = price
+                                        parallel_details = {
+                                            "reason":"PARALLEL_EARLY50","age_min":round(age_min,2),
+                                            "drawdown_pct":round(pnl_pct_now,3),"mfe_pct":round(mfe_pct,3),
+                                            "two_below_ema9":two_below,"ema9_falling":ema9_fall,
+                                            "close_below_ema20":below20,"lower_lows":lower_lows,
+                                            "rsi_weakening":rsi_weak,"structure_score":sscore,
+                                        }
+
+                            # LATE50: 60m+, TP1 미도달, 저-MFE/손실상태 + 15m EMA9/HL/HH 동시 붕괴를 2회 확인.
+                            if (
+                                not result and not parallel_trigger
+                                and variant in ("P_STOP_LATE50","P_STOP_COMBO")
+                                and five_due
+                                and age_min >= float(self.cfg.research_parallel_late_min_age_minutes)
+                                and pnl_pct_now <= float(self.cfg.research_parallel_late_pnl_pct)
+                                and mfe_pct <= float(self.cfg.research_parallel_late_mfe_max_pct)
+                            ):
+                                m15p = _parallel_m15(symbol)
+                                late_ok = False
+                                late_meta: dict[str, Any] = {}
+                                if m15p is not None and len(m15p) >= 3:
+                                    aa, bb, cc = m15p.iloc[-3], m15p.iloc[-2], m15p.iloc[-1]
+                                    ema9_fall15 = bool(float(cc.ema9) < float(bb.ema9) < float(aa.ema9))
+                                    hl_fail = bool(float(cc.low) <= float(bb.low))
+                                    hh_fail = bool(float(cc.high) <= float(bb.high))
+                                    late_ok = bool(ema9_fall15 and hl_fail and hh_fail)
+                                    late_meta = {
+                                        "ema9_falling":ema9_fall15,"higher_low_failed":hl_fail,
+                                        "higher_high_failed":hh_fail,"pnl_pct":round(pnl_pct_now,3),
+                                        "mfe_pct":round(mfe_pct,3),"age_min":round(age_min,2),
+                                    }
+                                streak = int(review_snap.get("parallel_late50_streak") or 0)
+                                streak = streak + 1 if late_ok else 0
+                                review_snap["parallel_late50_streak"] = streak
+                                review_snap["parallel_lab_late_streak"] = streak
+                                with db() as conn:
+                                    conn.execute(
+                                        "UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
+                                        (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])),
+                                    )
+                                if late_ok and streak >= max(1,int(self.cfg.research_parallel_late_confirmations)):
+                                    parallel_trigger = "LATE50"
+                                    parallel_signal_price = price
+                                    parallel_details = {"reason":"PARALLEL_LATE50","streak":streak,**late_meta}
+
+                            if parallel_trigger and not result:
+                                stage = {
+                                    "active":True,"started_at":utc_now(),"signal_price":parallel_signal_price,
+                                    "stop_type":f"PARALLEL_{parallel_trigger}","stop_details":parallel_details,
+                                }
+                                review_snap["v271_stop_stage"] = stage
+                                review_snap["p_v271_stop_stage_active"] = True
+                                review_snap["p_v271_stop_signal_price"] = parallel_signal_price
+                                review_snap["p_v271_stop_reason"] = f"PARALLEL_{parallel_trigger}"
+                                review_snap["parallel_lab_stop_trigger"] = parallel_trigger
+                                review_snap["parallel_lab_stop_signal_pct"] = round((parallel_signal_price/entry_price-1)*100,4)
+                                with db() as conn:
+                                    conn.execute(
+                                        "UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
+                                        (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])),
+                                    )
+                                append_entry_record(
+                                    symbol,f"RESEARCH_{variant}_STAGE1",variant,float(review["new_p_score"] or 0),parallel_signal_price,
+                                    f"parallel {parallel_trigger}; 50% Stage1; wait={self.cfg.research_pv271_wait_minutes}m; 1R enabled",
+                                    extra={
+                                        "shadow_id":str(review["shadow_id"] or ""),"research_variant":variant,
+                                        "parallel_lab_group":"STOP","parallel_lab_rule":str(review_snap.get("parallel_lab_rule") or ""),
+                                        "parallel_lab_stop_trigger":parallel_trigger,
+                                        "parallel_lab_stop_signal_pct":round((parallel_signal_price/entry_price-1)*100,4),
+                                        "parallel_lab_late_streak":int(review_snap.get("parallel_late50_streak") or 0),
+                                        **market_snapshot,
+                                    },
+                                )
+                                v271_stage = stage
+                                v271_stage_active = True
+
+                        if not result and not v271_stage_active and age_min >= float(self.cfg.max_hold_hours) * 60.0:
                             result = "TIME_EXIT"
                             result_details = {"age_min": round(age_min, 1)}
 
                         # 최근 5개 확정 1분봉을 시간순으로 읽어 TP2/BE 순서를 최대한 보존한다.
                         hard_price = entry_price * (1 - abs(float(self.cfg.research_pv271_disaster_stop_pct)) / 100) if is_v271_like else 0.0
-                        for mb in minute_bars:
+                        for mb in ([] if (is_v271_like and v271_stage_active) else minute_bars):
                             if result:
                                 break
                             if not tp1_done:
@@ -9088,7 +9547,10 @@ class DailyBot:
                 # 서로 다른 5분 확인시점에서 2회 연속 유지될 때 먼저 작은 손실로 종료한다.
                 if (
                     not result
-                    and variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_1R", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY", "P_V27_4", "P_V27_4_FILTER_ONLY", "P_V27_4_1", "P_V27_4_2", "P_V27_4_2_BLOCK_GHOST", "P_V27_4_3", "P_V27_4_3_BLOCK_GHOST", "P_V27_4_4", "P_V27_4_5", "P_V27_4_6", "P_V27_4_6_BLOCK_GHOST")
+                    and (
+                        variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_1R", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY", "P_V27_4", "P_V27_4_FILTER_ONLY", "P_V27_4_1", "P_V27_4_2", "P_V27_4_2_BLOCK_GHOST", "P_V27_4_3", "P_V27_4_3_BLOCK_GHOST", "P_V27_4_4", "P_V27_4_5", "P_V27_4_6", "P_V27_4_6_BLOCK_GHOST")
+                        or is_parallel_recovery
+                    )
                     and not tp1_done
                     and not (is_v271_like and v271_stage_active)
                     and not v271r_recovery_active
@@ -9342,7 +9804,7 @@ class DailyBot:
                         "new_p_score": float(review["new_p_score"] or 0), "missing_condition": str(review["missing_condition"] or ""),
                         "highest_price": highest, "lowest_price": lowest, "mfe_pct": round(mfe_pct, 4),
                         "mae_pct": round(mae_pct, 4), "age_min": round(age_min, 1), "net_pct_at_exit": round(net_pct, 4),
-                        "snapshot": json.loads(str(review["snapshot_json"] or "{}")),
+                        "snapshot": review_snap,
                         "market_at_exit": market_snapshot, **result_details,
                     }, ensure_ascii=False, default=str)
                     with db() as conn:
@@ -9357,6 +9819,15 @@ class DailyBot:
                     append_entry_record(symbol, f"RESEARCH_{variant}_{result}", variant, float(review["new_p_score"] or 0), float(result_price), f"mfe={mfe_pct:.3f}%; mae={mae_pct:.3f}%; actual_order=0",
                         extra={"shadow_id": str(review["shadow_id"] or ""), "research_variant": variant, "mfe_pct": round(mfe_pct,4), "mae_pct": round(mae_pct,4),
                                "shadow_age_min": round(age_min,1), "shadow_exit_pct": round(net_pct,4), "shadow_stop_type": str(result_details.get("stop_type") or ""),
+                               "parallel_lab_group": str(review_snap.get("parallel_lab_group") or ""),
+                               "parallel_lab_rule": str(review_snap.get("parallel_lab_rule") or ""),
+                               "parallel_lab_filter_block": review_snap.get("parallel_lab_filter_block",""),
+                               "parallel_lab_filter_flags": str(review_snap.get("parallel_lab_filter_flags") or ""),
+                               "parallel_lab_source_setup_id": str(review_snap.get("parallel_lab_source_setup_id") or ""),
+                               "parallel_lab_master_variant": str(review_snap.get("parallel_lab_master_variant") or ""),
+                               "parallel_lab_stop_trigger": str(review_snap.get("parallel_lab_stop_trigger") or result_details.get("parallel_lab_stop_trigger") or ""),
+                               "parallel_lab_stop_signal_pct": review_snap.get("parallel_lab_stop_signal_pct",""),
+                               "parallel_lab_late_streak": review_snap.get("parallel_lab_late_streak",""),
                                "p_v274_ghost_type": variant if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_source_shadow_id": str(review_snap.get("p_v274_source_shadow_id") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_ghost_classification": str(result_details.get("classification") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
