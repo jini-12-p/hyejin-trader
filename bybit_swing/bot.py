@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.83-ParallelEntryStopLab-V25Master-SharedAPI"
+BOT_RUNTIME_VERSION = "RC-v4.3.84-ParallelEntryStopLab-IntraminuteGuard-SharedAPI"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -8585,7 +8585,7 @@ class DailyBot:
         flat_cache: dict[tuple[Any, ...], tuple[bool, dict[str, Any]]] = {}
         late26_cache: dict[tuple[Any, ...], tuple[bool, dict[str, Any]]] = {}
 
-        # v4.3.83: 병렬 경로가 같은 symbol/timeframe 데이터를 중복 호출하지 않도록 공유한다.
+        # v4.3.84: 병렬 경로가 같은 symbol/timeframe 데이터를 중복 호출하지 않도록 공유한다.
         parallel_m5_cache: dict[str, pd.DataFrame | None] = {}
         parallel_m15_cache: dict[str, pd.DataFrame | None] = {}
         recent_1m_cache: dict[str, pd.DataFrame | None] = {}
@@ -8623,6 +8623,35 @@ class DailyBot:
                 return df.tail(max(1, int(limit_)))
             except Exception:
                 return df
+
+        # v4.3.84: 진입이 03:10:22라면 03:10 1분봉에는 진입 전 22초의 high/low도 섞여 있다.
+        # 따라서 MFE/MAE/TP/STOP 재생에는 진입분 전체를 쓰지 않고, 03:11:00 이후의
+        # '완전히 진입 뒤에 형성된 확정 1분봉'만 사용한다. 현재 ticker 가격은 계속 즉시 반영한다.
+        def _bar_open_dt(bar_: dict[str, Any]) -> datetime | None:
+            try:
+                raw_ts = str(bar_.get("ts") or "")
+                if not raw_ts:
+                    return None
+                dt = datetime.fromisoformat(raw_ts)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except Exception:
+                return None
+
+        def _full_post_entry_minute_bars(symbol_: str, opened_: datetime, five_due_: bool) -> list[dict[str, float]]:
+            if not five_due_:
+                return []
+            opened_utc = opened_.astimezone(timezone.utc) if opened_.tzinfo is not None else opened_.replace(tzinfo=timezone.utc)
+            first_full_minute = opened_utc.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            out: list[dict[str, float]] = []
+            for bar in list(minute_bars_map.get(symbol_) or []):
+                bar_dt = _bar_open_dt(bar)
+                # timestamp를 확인할 수 없는 봉은 보수적으로 제외한다.
+                # 그래야 진입 전 high/low가 손절/TP 판정에 섞이지 않는다.
+                if bar_dt is not None and bar_dt >= first_full_minute:
+                    out.append(bar)
+            return out
 
         for review in pending:
             symbol = str(review["symbol"] or "")
@@ -8675,17 +8704,23 @@ class DailyBot:
                 tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
                 tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
                 be_price = float(review["be_price"] or entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100))
-                highest = max(float(review["highest_price"] or price), price, float(observed_high_map.get(symbol) or 0))
-                observed_low = float(observed_low_map.get(symbol) or price)
-                lowest = min(float(review["lowest_price"] or price), price, observed_low)
-                mfe_pct = (highest / entry_price - 1) * 100 if entry_price > 0 else 0.0
-                mae_pct = (lowest / entry_price - 1) * 100 if entry_price > 0 else 0.0
                 opened = datetime.fromisoformat(opened_at)
                 if opened.tzinfo is None:
                     opened = opened.replace(tzinfo=timezone.utc)
                 age_min = (now - opened).total_seconds() / 60.0
                 five_due = str(review["last_5m_bucket"] or "") != bucket_5m
                 fifteen_due = str(review["last_15m_bucket"] or "") != bucket_15m
+
+                # v4.3.84 intraminute guard:
+                # 같은 1분봉의 진입 전 high/low가 경로에 섞이지 않도록 진입분을 통째로 제외한다.
+                # 현재 ticker와 DB에 이미 저장된 진입 이후 관측값은 그대로 반영한다.
+                minute_bars = _full_post_entry_minute_bars(symbol, opened, five_due)
+                post_entry_bar_high = max((float(x["high"]) for x in minute_bars), default=price)
+                post_entry_bar_low = min((float(x["low"]) for x in minute_bars), default=price)
+                highest = max(float(review["highest_price"] or entry_price or price), price, post_entry_bar_high)
+                lowest = min(float(review["lowest_price"] or entry_price or price), price, post_entry_bar_low)
+                mfe_pct = (highest / entry_price - 1) * 100 if entry_price > 0 else 0.0
+                mae_pct = (lowest / entry_price - 1) * 100 if entry_price > 0 else 0.0
                 observed_high = highest
 
                 result = ""
@@ -8852,7 +8887,8 @@ class DailyBot:
                         result_details["p_v274_ghost_classification"] = str(result_details.get("classification") or "")
                 else:
                     tp1_was_done = tp1_done
-                    minute_bars = list(minute_bars_map.get(symbol) or []) if five_due else []
+                    # minute_bars는 위에서 v4.3.84 intraminute guard를 적용한
+                    # '진입 다음 완성 1분봉부터'의 경로만 재사용한다.
 
                     # P_V27_4_5 BE Recovery 관리.
                     # TP1 50% + BE에서 원포지션 25%는 이미 확보된 상태이며 마지막 25%만 관리한다.
