@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.84-ParallelEntryStopLab-IntraminuteGuard-SharedAPI"
+BOT_RUNTIME_VERSION = "RC-v4.3.85-ParallelEntryStopLab-SharedStageClock-IntraminuteGuard-SharedAPI"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -9070,7 +9070,7 @@ class DailyBot:
 
                             if recovery_decision.startswith("CONFIRMED"):
                                 v271r_recovery["confirmed"] = True
-                                v271r_recovery["confirmed_at"] = utc_now()
+                                v271r_recovery["confirmed_at"] = now.isoformat()
                                 v271r_recovery["confirm_price"] = confirm_price
                                 review_snap["v271r_recovery"] = v271r_recovery
                                 review_snap["p_v271r_recovery_confirmed"] = True
@@ -9161,7 +9161,7 @@ class DailyBot:
                                 v271_stage["finished_at"] = utc_now()
                                 v271_stage["finish_reason"] = stage_reason
                                 v271r_recovery = {
-                                    "active": True, "confirmed": False, "started_at": utc_now(),
+                                    "active": True, "confirmed": False, "started_at": now.isoformat(),
                                     "stage_signal_price": signal_price, "rebound_price": second_price,
                                     "stage_reason": stage_reason, "first_fraction": frac,
                                     "first_pct": first_pct,
@@ -9339,7 +9339,7 @@ class DailyBot:
 
                             if parallel_trigger and not result:
                                 stage = {
-                                    "active":True,"started_at":utc_now(),"signal_price":parallel_signal_price,
+                                    "active":True,"started_at":now.isoformat(),"signal_price":parallel_signal_price,
                                     "stop_type":f"PARALLEL_{parallel_trigger}","stop_details":parallel_details,
                                 }
                                 review_snap["v271_stop_stage"] = stage
@@ -9659,7 +9659,7 @@ class DailyBot:
                         if is_v271_like:
                             signal_price = price
                             stage = {
-                                "active": True, "started_at": utc_now(), "signal_price": signal_price,
+                                "active": True, "started_at": now.isoformat(), "signal_price": signal_price,
                                 "stop_type": stop_type, "stop_details": stop_details,
                             }
                             review_snap["v271_stop_stage"] = stage
@@ -9697,7 +9697,7 @@ class DailyBot:
                         signal_price = float(structure.get("price") or price)
                         if is_v271_like:
                             stage = {
-                                "active": True, "started_at": utc_now(), "signal_price": signal_price,
+                                "active": True, "started_at": now.isoformat(), "signal_price": signal_price,
                                 "stop_type": "STRUCTURE", "stop_details": structure,
                             }
                             review_snap["v271_stop_stage"] = stage
