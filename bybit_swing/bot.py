@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.86-FinalForward4-SAFE-TP18-NewStop-MarketGuard"
+BOT_RUNTIME_VERSION = "RC-v4.3.87-FinalForward4-TP18FullLogFix"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -8947,7 +8947,7 @@ class DailyBot:
                 v26_late_fail_streak = int(review["v26_late_fail_streak"] or 0)
                 if is_final_new:
                     tp1_price = entry_price * (1 + float(self.cfg.research_final_tp_pct) / 100)
-                    tp2_price = tp1_price  # +1.8% 전량익절: generic TP1/TP2 path를 같은 가격으로 수렴시킨다.
+                    tp2_price = tp1_price  # +1.8% 전량익절 기준값. final-new는 TP18_FULL 단일 이벤트로 종료한다.
                 else:
                     tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
                     tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
@@ -9747,6 +9747,11 @@ class DailyBot:
                                     break
                                 if hit_tp1:
                                     tp1_done = True
+                                    if is_final_new:
+                                        # v4.3.87: NEW 3경로는 +1.8% 전량익절을 TP18_FULL 한 줄로만 기록한다.
+                                        result, result_price = "TP18_FULL", tp1_price
+                                        result_details = {"tp18_price":tp1_price,"source":"confirmed_1m_high","final_full_tp":True}
+                                        break
                                     if mb["high"] >= tp2_price:
                                         result, result_price = "TP2", tp2_price
                                         result_details = {"tp2_price":tp2_price,"source":"confirmed_1m_high"}
@@ -9756,6 +9761,12 @@ class DailyBot:
                             else:
                                 hit_tp2 = mb["high"] >= tp2_price
                                 hit_be = mb["low"] <= be_price
+                                if is_final_new:
+                                    # 이전 v4.3.86에서 tp1_done=1 상태로 남아 있던 미완료 row도 단일 TP18로 정리한다.
+                                    if hit_tp2:
+                                        result, result_price = "TP18_FULL", tp2_price
+                                        result_details = {"tp18_price":tp2_price,"source":"confirmed_1m_high","final_full_tp":True}
+                                    continue
                                 if is_pv2744:
                                     if hit_tp2 and hit_be and not v2744_be_partial_done:
                                         # 같은 1분봉 안 순서는 불명확하므로 보수적으로 BE 부분청산을 먼저 기록하고
@@ -9861,10 +9872,17 @@ class DailyBot:
                             result_details = {"stop_type":("V27_1R_DISASTER" if is_v271r else ("V27_4_5_V271_DISASTER" if is_pv2745 else "V27_1_DISASTER")),"source":"ticker"}
                         if not result and not tp1_done and price >= tp1_price:
                             tp1_done = True
+                            if is_final_new:
+                                result, result_price = "TP18_FULL", tp1_price
+                                result_details = {"tp18_price":tp1_price,"source":"ticker","final_full_tp":True}
                         if not result and tp1_done and not (is_pv2745 and v2745_be_recovery_active) and price >= tp2_price:
-                            result, result_price = "TP2", tp2_price
-                            result_details = {"tp2_price":tp2_price,"source":"ticker"}
-                        if not result and tp1_done and not (is_pv2745 and v2745_be_recovery_active) and price <= be_price:
+                            if is_final_new:
+                                result, result_price = "TP18_FULL", tp2_price
+                                result_details = {"tp18_price":tp2_price,"source":"ticker","final_full_tp":True}
+                            else:
+                                result, result_price = "TP2", tp2_price
+                                result_details = {"tp2_price":tp2_price,"source":"ticker"}
+                        if not result and not is_final_new and tp1_done and not (is_pv2745 and v2745_be_recovery_active) and price <= be_price:
                             if is_pv2744:
                                 if not v2744_be_partial_done:
                                     v2744_be_partial_done = True
@@ -9921,7 +9939,7 @@ class DailyBot:
                                 result, result_price = "BE_EXIT", be_price
                                 result_details = {"be_price":be_price,"source":"ticker"}
 
-                        if tp1_done and not tp1_was_done:
+                        if tp1_done and not tp1_was_done and not is_final_new:
                             with db() as conn:
                                 conn.execute(
                                     "UPDATE research_shadow_reviews SET tp1_done=1,tp1_ts=?,tp1_price=? WHERE id=?",
