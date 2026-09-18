@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.85-ParallelEntryStopLab-SharedStageClock-IntraminuteGuard-SharedAPI"
+BOT_RUNTIME_VERSION = "RC-v4.3.86-FinalForward4-SAFE-TP18-NewStop-MarketGuard"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -475,9 +475,27 @@ class DailyConfig:
     # 한 V25 confirmed opportunity에서 손절 5경로와 진입 7경로를 병렬 비교한다.
     # 손절 경로는 P_STOP_CONTROL의 portfolio schedule을 공통으로 사용해 진입표본을 동일하게 유지한다.
     # 진입 경로는 각 필터별 독립 portfolio schedule(15m 2-cap / 4 slots / LIVE90 / STOP180)을 사용한다.
-    research_parallel_lab_enabled: bool = True
+    research_parallel_lab_enabled: bool = False
     research_parallel_max_entries_per_15m: int = 2
     research_parallel_max_open_positions: int = 4
+
+    # v4.3.86 Final Forward 4-way research-only comparison. LIVE 주문에는 절대 사용하지 않는다.
+    # CONTROL: V25 confirmed + 기존 보호 + 기존 TP(1.5/3/BE) + V27-1 stop.
+    # CORE: SAFE entry + TP1.8 full + 4-stage early-loss overlay + V27-1 fallback.
+    # MKT50/MKT100: CORE에 BTC/ETH 4h flat-regime guard를 50% size / 100% entry-off로 적용.
+    research_final_forward_enabled: bool = True
+    research_final_max_entries_per_15m: int = 2
+    research_final_max_open_positions: int = 4
+    research_final_tp_pct: float = 1.80
+    research_final_market_flat_abs_4h_pct: float = 0.08
+    research_final_10m_pnl_pct: float = -1.00
+    research_final_10m_mfe_max_pct: float = 0.10
+    research_final_15m_pnl_pct: float = -1.50
+    research_final_25m_mfe_min_pct: float = 0.30
+    research_final_25m_mfe_max_pct: float = 1.20
+    research_final_25m_pnl_pct: float = -1.20
+    research_final_30m_pnl_pct: float = -0.90
+    research_final_30m_delta5_pct: float = -0.30
 
     # STOP EARLY50: 현재 TIER1보다 한 단계 빠른 50% Stage1 후보.
     research_parallel_early_min_age_minutes: float = 15.0
@@ -645,7 +663,9 @@ class DailyConfig:
         cfg.research_pv2746_block_ghost_enabled = True
         cfg.research_pv2746_stop_ghost_enabled = True
         cfg.research_pv271r_enabled = False
-        cfg.research_parallel_lab_enabled = True
+        # v4.3.86: 과거 Parallel Lab은 신규진입 OFF. 열린 Shadow는 관리루프에서 끝까지 마무리한다.
+        cfg.research_parallel_lab_enabled = False
+        cfg.research_final_forward_enabled = True
         return cfg
 
 
@@ -810,6 +830,11 @@ SCAN_REJECTED_FIELDS = [
     "parallel_lab_group", "parallel_lab_rule", "parallel_lab_filter_block",
     "parallel_lab_filter_flags", "parallel_lab_source_setup_id", "parallel_lab_master_variant",
     "parallel_lab_stop_trigger", "parallel_lab_stop_signal_pct", "parallel_lab_late_streak",
+    # v4.3.86 final forward telemetry
+    "final_fwd_variant", "final_source_setup_id", "final_safe_block", "final_safe_flags",
+    "final_market_guard", "final_market_mode", "final_size_mult",
+    "final_stop_stage", "final_remaining_frac", "final_realized_weighted_pct",
+    "final_strategy_gross_pct",
     "shadow_id", "research_variant", "shadow_entry_time", "mfe_pct", "mae_pct",
     "shadow_age_min", "shadow_exit_pct", "shadow_stop_type",
 ]
@@ -7278,6 +7303,215 @@ class DailyBot:
             "p_v2746_filter_frozen": True,
         }
 
+    def _final_safe_filter_meta(self, details: dict[str, Any]) -> dict[str, Any]:
+        """v4.3.86 frozen SAFE entry filter from 9/1~9/17 replay (C OR RN OR RS)."""
+        def fv(key: str) -> float | None:
+            try:
+                v = details.get(key)
+                return None if v in (None, "") else float(v)
+            except (TypeError, ValueError):
+                return None
+
+        rsi = fv("rsi")
+        ema20_prev2 = fv("ema20_slope_prev2_pct")
+        ema9_prev1 = fv("ema9_slope_prev1_pct")
+        pull = fv("pullback_from_high_pct")
+        rsi_chg1 = fv("rsi_change_prev1")
+
+        c = bool(rsi is not None and ema20_prev2 is not None and rsi <= 62.46 and ema20_prev2 >= 0.0815)
+        rn = bool(ema9_prev1 is not None and pull is not None and ema9_prev1 >= 0.39405 and pull <= -0.472)
+        rs = bool(rsi is not None and rsi_chg1 is not None and rsi >= 66.005 and rsi_chg1 <= -1.9521)
+        flags = [name for name, ok in (("C", c), ("RN", rn), ("RS", rs)) if ok]
+        return {
+            "final_safe_block": bool(flags),
+            "final_safe_flags": ",".join(flags),
+            "final_safe_c": c,
+            "final_safe_rn": rn,
+            "final_safe_rs": rs,
+            "final_safe_version": "SAFE_C_RN_RS_20260918",
+        }
+
+    def _final_market_guard_meta(self, details: dict[str, Any]) -> dict[str, Any]:
+        """BTC/ETH 4h가 둘 다 ±0.08% 안쪽인 flat regime guard."""
+        try:
+            btc4 = float(details.get("btc_4h_change_pct"))
+            eth4 = float(details.get("eth_4h_change_pct"))
+        except (TypeError, ValueError):
+            return {
+                "final_market_guard": False,
+                "final_market_guard_available": False,
+                "final_market_guard_reason": "missing_4h_telemetry",
+            }
+        th = abs(float(self.cfg.research_final_market_flat_abs_4h_pct))
+        active = bool(abs(btc4) <= th and abs(eth4) <= th)
+        return {
+            "final_market_guard": active,
+            "final_market_guard_available": True,
+            "final_market_guard_reason": "BTC_ETH_4H_FLAT" if active else "NORMAL",
+            "final_market_btc4h_pct": round(btc4, 4),
+            "final_market_eth4h_pct": round(eth4, 4),
+            "final_market_threshold_abs_pct": th,
+        }
+
+    def _open_final_forward_variant(
+        self, *, variant: str, symbol: str, details: dict[str, Any], source_setup_id: str,
+        entry_price: float, closed_5m_price: float, five_bullish: bool, high_break: bool,
+        market_mode: str, size_mult: float, safe_meta: dict[str, Any], market_meta: dict[str, Any],
+    ) -> bool:
+        """Final Forward 한 경로를 독립 portfolio schedule로 연다 (research-only)."""
+        if entry_price <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND symbol=? AND completed=0 LIMIT 1",
+                (variant, symbol),
+            ).fetchone():
+                return False
+        live_cd, live_remaining, _ = self._research_live_cooldown_status(variant, symbol, now)
+        if live_cd:
+            append_entry_record(
+                symbol, f"RESEARCH_{variant}_SKIPPED", variant, float(details.get("p_v2_score") or 0), entry_price,
+                f"LIVE90_COOLDOWN remaining={live_remaining:.1f}m",
+                extra={**details, **safe_meta, **market_meta, "final_fwd_variant": variant,
+                       "final_market_mode": market_mode, "final_size_mult": size_mult},
+            )
+            return False
+        stop_cd, stop_remaining, _ = self._variant_stop_cooldown_status(variant, symbol, now)
+        if stop_cd:
+            append_entry_record(
+                symbol, f"RESEARCH_{variant}_SKIPPED", variant, float(details.get("p_v2_score") or 0), entry_price,
+                f"STOP180_COOLDOWN remaining={stop_remaining:.1f}m",
+                extra={**details, **safe_meta, **market_meta, "final_fwd_variant": variant,
+                       "final_market_mode": market_mode, "final_size_mult": size_mult},
+            )
+            return False
+        allowed, why = self._variant_can_open_now(
+            variant, now, self.cfg.research_final_max_entries_per_15m, self.cfg.research_final_max_open_positions
+        )
+        if not allowed:
+            append_entry_record(
+                symbol, f"RESEARCH_{variant}_SKIPPED", variant, float(details.get("p_v2_score") or 0), entry_price, why,
+                extra={**details, **safe_meta, **market_meta, "final_fwd_variant": variant,
+                       "final_market_mode": market_mode, "final_size_mult": size_mult},
+            )
+            return False
+
+        setup_id = f"{source_setup_id}|{variant}"
+        with db() as conn:
+            if conn.execute(
+                "SELECT 1 FROM research_shadow_reviews WHERE variant=? AND setup_id=? LIMIT 1", (variant, setup_id)
+            ).fetchone():
+                return False
+            opened_at = now.isoformat()
+            shadow_id = f"RSH-{variant}-{now.strftime('%Y%m%dT%H%M%S%f')}-{symbol}"
+            is_control = variant == "P_FWD_CONTROL"
+            target_pct = float(self.cfg.tp2_pct) if is_control else float(self.cfg.research_final_tp_pct)
+            tp2_price = entry_price * (1 + target_pct / 100.0)
+            be_price = entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100.0)
+            snap = dict(details)
+            snap.update({
+                **safe_meta, **market_meta,
+                "final_fwd_variant": variant,
+                "final_market_mode": market_mode,
+                "final_size_mult": float(size_mult),
+                "final_source_setup_id": source_setup_id,
+                "final_tp_pct": (None if is_control else float(self.cfg.research_final_tp_pct)),
+                "final_remaining_frac": 1.0,
+                "final_realized_weighted_pct": 0.0,
+                "final_stop_stage": "NONE",
+                "final_checkpoint10_done": False,
+                "final_checkpoint15_done": False,
+                "final_checkpoint25_done": False,
+                "final_checkpoint30_done": False,
+                "p_v25_5m_bullish": bool(five_bullish),
+                "p_v25_prev_high_break": bool(high_break),
+                "p_v25_closed_5m_price": float(closed_5m_price),
+            })
+            conn.execute(
+                """INSERT INTO research_shadow_reviews(
+                    shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                    missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
+                    last_checked_at,last_5m_bucket,last_15m_bucket,mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    shadow_id, variant, symbol, opened_at, int(now.timestamp()*1000), entry_price,
+                    float(details.get("p_score") or 0), float(details.get("p_v2_score") or 0),
+                    "FINAL_FORWARD", json.dumps(snap, ensure_ascii=False, default=str),
+                    tp2_price, be_price, entry_price, entry_price, entry_price, opened_at,
+                    str(int(now.timestamp())//300), str(int(now.timestamp())//900), 0.0, 0.0, setup_id, 0,
+                ),
+            )
+        append_entry_record(
+            symbol, f"RESEARCH_{variant}_ENTRY", variant, float(details.get("p_v2_score") or 0), entry_price,
+            f"FinalForward mode={market_mode}; size={size_mult:.2f}; actual_order=0",
+            extra={**details, **safe_meta, **market_meta, "shadow_id": shadow_id,
+                   "research_variant": variant, "shadow_entry_time": _kst_stamp(opened_at),
+                   "final_fwd_variant": variant, "final_market_mode": market_mode,
+                   "final_size_mult": float(size_mult), "final_remaining_frac": 1.0,
+                   "final_realized_weighted_pct": 0.0, "final_stop_stage": "NONE"},
+        )
+        return True
+
+    def _open_final_forward_bundle(
+        self, symbol: str, details: dict[str, Any], source_setup_id: str, entry_price: float,
+        closed_5m_price: float, five_bullish: bool, high_break: bool,
+    ) -> None:
+        """v4.3.86: CONTROL / CORE / MKT50 / MKT100 final forward bundle."""
+        if not self.cfg.research_final_forward_enabled or entry_price <= 0:
+            return
+        safe_meta = self._final_safe_filter_meta(details)
+        market_meta = self._final_market_guard_meta(details)
+
+        # 1) CONTROL: V25 confirmed + 보호장치 + 기존 TP + V27-1 stop.
+        self._open_final_forward_variant(
+            variant="P_FWD_CONTROL", symbol=symbol, details=details, source_setup_id=source_setup_id,
+            entry_price=entry_price, closed_5m_price=closed_5m_price, five_bullish=five_bullish, high_break=high_break,
+            market_mode="CONTROL", size_mult=1.0, safe_meta=safe_meta, market_meta=market_meta,
+        )
+
+        # NEW 계열은 SAFE가 ENTRY를 차단하면 세 경로 모두 실제 진입하지 않는다.
+        if bool(safe_meta.get("final_safe_block")):
+            for variant, mode in (("P_FWD_CORE","NONE"),("P_FWD_MKT50","MKT50"),("P_FWD_MKT100","MKT100")):
+                append_entry_record(
+                    symbol, f"RESEARCH_{variant}_BLOCKED_SAFE", variant, float(details.get("p_v2_score") or 0), entry_price,
+                    f"SAFE block={safe_meta.get('final_safe_flags') or 'UNKNOWN'}; actual_order=0",
+                    extra={**details, **safe_meta, **market_meta, "final_fwd_variant":variant, "final_source_setup_id":source_setup_id,
+                           "final_market_mode":mode, "final_size_mult":0.0},
+                )
+            return
+
+        # 2) CORE: SAFE + TP1.8 + new stop, market guard 없음.
+        self._open_final_forward_variant(
+            variant="P_FWD_CORE", symbol=symbol, details=details, source_setup_id=source_setup_id,
+            entry_price=entry_price, closed_5m_price=closed_5m_price, five_bullish=five_bullish, high_break=high_break,
+            market_mode="NONE", size_mult=1.0, safe_meta=safe_meta, market_meta=market_meta,
+        )
+
+        guard = bool(market_meta.get("final_market_guard"))
+        # 3) MKT50: guard일 때만 50% size.
+        self._open_final_forward_variant(
+            variant="P_FWD_MKT50", symbol=symbol, details=details, source_setup_id=source_setup_id,
+            entry_price=entry_price, closed_5m_price=closed_5m_price, five_bullish=five_bullish, high_break=high_break,
+            market_mode="MKT50", size_mult=(0.5 if guard else 1.0), safe_meta=safe_meta, market_meta=market_meta,
+        )
+
+        # 4) MKT100: guard면 진짜 신규진입 OFF. 슬롯/쿨다운도 소비하지 않는다.
+        if guard:
+            append_entry_record(
+                symbol, "RESEARCH_P_FWD_MKT100_BLOCKED_MARKET", "P_FWD_MKT100",
+                float(details.get("p_v2_score") or 0), entry_price,
+                "BTC/ETH 4h flat guard => entry OFF; actual_order=0",
+                extra={**details, **safe_meta, **market_meta, "final_fwd_variant":"P_FWD_MKT100", "final_source_setup_id":source_setup_id,
+                       "final_market_mode":"MKT100", "final_size_mult":0.0},
+            )
+        else:
+            self._open_final_forward_variant(
+                variant="P_FWD_MKT100", symbol=symbol, details=details, source_setup_id=source_setup_id,
+                entry_price=entry_price, closed_5m_price=closed_5m_price, five_bullish=five_bullish, high_break=high_break,
+                market_mode="MKT100", size_mult=1.0, safe_meta=safe_meta, market_meta=market_meta,
+            )
+
     def _parallel_insert_shadow(
         self,
         *,
@@ -8443,7 +8677,12 @@ class DailyBot:
         if self.cfg.research_pv25_control_enabled:
             self._open_pv25_confirmed_shadow(symbol, details, setup_id, live_entry_price, five_bullish, high_break)
 
-        # v4.3.83: 한 V25 confirmed opportunity에서 손절/진입 병렬 연구를 동시에 시작한다.
+        # v4.3.86: 최종 Forward 4경로. 기존 LIVE 주문과 완전히 분리된 Shadow다.
+        self._open_final_forward_bundle(
+            symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
+        )
+
+        # v4.3.83: 과거 병렬 Lab은 config에서 신규 OFF. 열린 Shadow 관리만 유지한다.
         # 손절은 P_STOP_CONTROL schedule을 공통으로 사용하고, 진입은 각 경로별 독립 portfolio schedule을 사용한다.
         self._open_parallel_stop_bundle(
             symbol, details, setup_id, live_entry_price, closed_price, five_bullish, high_break
@@ -8675,7 +8914,12 @@ class DailyBot:
             is_parallel_stop = variant in parallel_stop_variants
             is_parallel_entry = variant in parallel_entry_variants
             is_parallel_recovery = bool(is_parallel_stop or is_parallel_entry)
-            is_v271 = variant == "P_V27_1"
+            final_new_variants = {"P_FWD_CORE", "P_FWD_MKT50", "P_FWD_MKT100"}
+            is_final_new = variant in final_new_variants
+            is_final_control = variant == "P_FWD_CONTROL"
+            # Final Forward CONTROL/New 모두 V27-1 fallback stop 골격을 공유한다.
+            # New 3경로는 아래에서 TP1.8 full + 4단 손절 overlay만 별도로 적용한다.
+            is_v271 = bool(variant == "P_V27_1" or is_final_control or is_final_new)
             is_v271r = bool(variant == "P_V27_1R" or is_parallel_recovery)
             is_pv2745 = variant == "P_V27_4_5"
             is_v271_like = bool(is_v271 or is_v271r or is_pv2745)
@@ -8701,8 +8945,12 @@ class DailyBot:
                 opened_at = str(review["opened_at"])
                 tp1_done = bool(int(review["tp1_done"] or 0))
                 v26_late_fail_streak = int(review["v26_late_fail_streak"] or 0)
-                tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
-                tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
+                if is_final_new:
+                    tp1_price = entry_price * (1 + float(self.cfg.research_final_tp_pct) / 100)
+                    tp2_price = tp1_price  # +1.8% 전량익절: generic TP1/TP2 path를 같은 가격으로 수렴시킨다.
+                else:
+                    tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
+                    tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
                 be_price = float(review["be_price"] or entry_price * (1 + float(self.cfg.breakeven_stop_pct) / 100))
                 opened = datetime.fromisoformat(opened_at)
                 if opened.tzinfo is None:
@@ -8889,6 +9137,107 @@ class DailyBot:
                     tp1_was_done = tp1_done
                     # minute_bars는 위에서 v4.3.84 intraminute guard를 적용한
                     # '진입 다음 완성 1분봉부터'의 경로만 재사용한다.
+
+                    # v4.3.86 Final Forward New 4-stage stop overlay.
+                    # 10m DEAD: pnl<=-1.0 & MFE<=+0.10 => remaining의 50% 축소
+                    # 15m: pnl<=-1.5 => remaining 전량 종료
+                    # 25m GIVEBACK: 0.3<=MFE<=1.2 & pnl<=-1.2 => remaining의 50% 축소
+                    # 30m DETERIORATION: pnl<=-0.9 & 25m대비 5분 추가하락<=-0.3p => remaining 전량 종료
+                    # 그 외에는 아래 기존 V27-1 stop 엔진이 fallback으로 계속 관리한다.
+                    if is_final_new and not result and not tp1_done and observed_high < tp1_price:
+                        pnl_now = (price / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+                        final_remaining = float(review_snap.get("final_remaining_frac") if review_snap.get("final_remaining_frac") not in (None, "") else 1.0)
+                        final_realized = float(review_snap.get("final_realized_weighted_pct") or 0.0)
+
+                        def _final_save_snapshot() -> None:
+                            with db() as conn:
+                                conn.execute(
+                                    "UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
+                                    (json.dumps(review_snap, ensure_ascii=False, default=str), int(review["id"])),
+                                )
+
+                        def _final_partial(stage_name: str, fraction_of_remaining: float) -> None:
+                            nonlocal final_remaining, final_realized
+                            frac_of_rem = min(1.0, max(0.0, float(fraction_of_remaining)))
+                            close_frac = final_remaining * frac_of_rem
+                            if close_frac <= 0:
+                                return
+                            final_realized += close_frac * pnl_now
+                            final_remaining = max(0.0, final_remaining - close_frac)
+                            review_snap["final_remaining_frac"] = round(final_remaining, 6)
+                            review_snap["final_realized_weighted_pct"] = round(final_realized, 6)
+                            review_snap["final_stop_stage"] = stage_name
+                            _final_save_snapshot()
+                            append_entry_record(
+                                symbol, f"RESEARCH_{variant}_{stage_name}", variant,
+                                float(review["new_p_score"] or 0), price,
+                                f"partial close={close_frac:.3f} of original; pnl={pnl_now:.3f}%; actual_order=0",
+                                extra={
+                                    "shadow_id": str(review["shadow_id"] or ""), "research_variant": variant,
+                                    "final_fwd_variant": variant, "final_market_mode": str(review_snap.get("final_market_mode") or ""),
+                                    "final_size_mult": float(review_snap.get("final_size_mult") or 1.0),
+                                    "final_stop_stage": stage_name, "final_remaining_frac": round(final_remaining, 6),
+                                    "final_realized_weighted_pct": round(final_realized, 6),
+                                    "mfe_pct": round(mfe_pct, 4), "mae_pct": round(mae_pct, 4), "shadow_age_min": round(age_min, 2),
+                                    **market_snapshot,
+                                },
+                            )
+
+                        # 10분 체크포인트는 최초 1회만 판정한다.
+                        if age_min >= 10.0 and not bool(review_snap.get("final_checkpoint10_done")):
+                            review_snap["final_checkpoint10_done"] = True
+                            review_snap["final_checkpoint10_pnl_pct"] = round(pnl_now, 4)
+                            review_snap["final_checkpoint10_mfe_pct"] = round(mfe_pct, 4)
+                            if pnl_now <= float(self.cfg.research_final_10m_pnl_pct) and mfe_pct <= float(self.cfg.research_final_10m_mfe_max_pct):
+                                _final_partial("STOP10_DEAD50", 0.50)
+                            else:
+                                _final_save_snapshot()
+
+                        # 15분까지 -1.5% 아래면 남은 물량 전량 종료.
+                        if not result and age_min >= 15.0 and not bool(review_snap.get("final_checkpoint15_done")):
+                            review_snap["final_checkpoint15_done"] = True
+                            review_snap["final_checkpoint15_pnl_pct"] = round(pnl_now, 4)
+                            if pnl_now <= float(self.cfg.research_final_15m_pnl_pct):
+                                result, result_price = "STOP", price
+                                review_snap["final_stop_stage"] = "STOP15_FULL"
+                                result_details = {"stop_type":"FINAL_STOP15_FULL", "final_stop_stage":"STOP15_FULL"}
+                            _final_save_snapshot()
+
+                        # 25분: 초반에는 조금 갔지만 되밀린 GIVEBACK만 remaining 50% 축소.
+                        if not result and age_min >= 25.0 and not bool(review_snap.get("final_checkpoint25_done")):
+                            review_snap["final_checkpoint25_done"] = True
+                            review_snap["final_checkpoint25_pnl_pct"] = round(pnl_now, 4)
+                            review_snap["final_checkpoint25_mfe_pct"] = round(mfe_pct, 4)
+                            if (
+                                float(self.cfg.research_final_25m_mfe_min_pct) <= mfe_pct <= float(self.cfg.research_final_25m_mfe_max_pct)
+                                and pnl_now <= float(self.cfg.research_final_25m_pnl_pct)
+                            ):
+                                _final_partial("STOP25_GIVEBACK50", 0.50)
+                            else:
+                                _final_save_snapshot()
+
+                        # 30분: 25분 체크 이후 5분간 추가로 -0.3%p 이상 밀리면 remaining 종료.
+                        if not result and age_min >= 30.0 and not bool(review_snap.get("final_checkpoint30_done")):
+                            review_snap["final_checkpoint30_done"] = True
+                            review_snap["final_checkpoint30_pnl_pct"] = round(pnl_now, 4)
+                            p25 = review_snap.get("final_checkpoint25_pnl_pct")
+                            try:
+                                delta5 = pnl_now - float(p25)
+                            except (TypeError, ValueError):
+                                delta5 = None
+                            review_snap["final_checkpoint30_delta5_pct"] = (round(delta5, 4) if delta5 is not None else None)
+                            if (
+                                pnl_now <= float(self.cfg.research_final_30m_pnl_pct)
+                                and delta5 is not None
+                                and delta5 <= float(self.cfg.research_final_30m_delta5_pct)
+                            ):
+                                result, result_price = "STOP", price
+                                review_snap["final_stop_stage"] = "STOP30_DETERIORATION"
+                                result_details = {
+                                    "stop_type":"FINAL_STOP30_DETERIORATION", "final_stop_stage":"STOP30_DETERIORATION",
+                                    "final_delta5_pct": round(delta5, 4),
+                                }
+                            _final_save_snapshot()
 
                     # P_V27_4_5 BE Recovery 관리.
                     # TP1 50% + BE에서 원포지션 25%는 이미 확보된 상태이며 마지막 25%만 관리한다.
@@ -9201,7 +9550,12 @@ class DailyBot:
                                     conn.execute("UPDATE research_shadow_reviews SET snapshot_json=? WHERE id=?",
                                         (json.dumps(review_snap,ensure_ascii=False,default=str),int(review["id"])))
                                 second_pct = (second_price / entry_price - 1) * 100
-                                gross_pct = frac * first_pct + (1 - frac) * second_pct
+                                if is_final_new:
+                                    rem = float(review_snap.get("final_remaining_frac") if review_snap.get("final_remaining_frac") not in (None, "") else 1.0)
+                                    realized = float(review_snap.get("final_realized_weighted_pct") or 0.0)
+                                    gross_pct = realized + rem * (frac * first_pct + (1 - frac) * second_pct)
+                                else:
+                                    gross_pct = frac * first_pct + (1 - frac) * second_pct
                                 result, result_price = "STOP", entry_price * (1 + gross_pct / 100)
                                 result_details = {
                                     "stop_type": ("V27_1_STAGED_STOP" if is_v271 else ("V27_4_5_V271_STAGED_STOP" if is_pv2745 else "V27_1R_STAGED_STOP")),
@@ -9216,6 +9570,8 @@ class DailyBot:
                                     "v271_rebound_pct": float(self.cfg.research_pv271_rebound_from_signal_pct),
                                     "v271_engine_variant": variant,
                                     "v271_signal_started_at": str(v271_stage.get("started_at") or ""),
+                                    "final_trade_gross_override": (round(gross_pct,4) if is_final_new else None),
+                                    "final_stop_stage": ("V271_FALLBACK_STAGE" if is_final_new else ""),
                                 }
                     else:
                         # v4.3.83 Parallel STOP Lab.
@@ -9585,7 +9941,7 @@ class DailyBot:
                     not result
                     and (
                         variant in ("P_V26", "P_V27", "P_V27_BLOCK_GHOST", "P_V27_FILTER_ONLY", "P_V27_1", "P_V27_1R", "P_V27_2", "P_V27_2_BLOCK_GHOST", "P_V27_2_FILTER_ONLY", "P_V27_3", "P_V27_3_BLOCK_GHOST", "P_V27_3_FILTER_ONLY", "P_V27_4", "P_V27_4_FILTER_ONLY", "P_V27_4_1", "P_V27_4_2", "P_V27_4_2_BLOCK_GHOST", "P_V27_4_3", "P_V27_4_3_BLOCK_GHOST", "P_V27_4_4", "P_V27_4_5", "P_V27_4_6", "P_V27_4_6_BLOCK_GHOST")
-                        or is_parallel_recovery
+                        or is_parallel_recovery or is_final_control or is_final_new
                     )
                     and not tp1_done
                     and not (is_v271_like and v271_stage_active)
@@ -9738,6 +10094,47 @@ class DailyBot:
 
                 if result:
                     result_ts = utc_now()
+                    # v4.3.86 Final New: 부분축소(10m/25m) + 마지막 exit를 원포지션 기준으로 합산하고,
+                    # MKT50은 guard 발동 시 전체 전략손익을 0.5배로 반영한다.
+                    if is_final_new:
+                        size_mult = float(review_snap.get("final_size_mult") if review_snap.get("final_size_mult") not in (None, "") else 1.0)
+                        rem = float(review_snap.get("final_remaining_frac") if review_snap.get("final_remaining_frac") not in (None, "") else 1.0)
+                        realized = float(review_snap.get("final_realized_weighted_pct") or 0.0)
+                        override = result_details.get("final_trade_gross_override")
+                        if override not in (None, ""):
+                            trade_gross = float(override)
+                        else:
+                            exit_pct_raw = (float(result_price) / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+                            trade_gross = realized + rem * exit_pct_raw
+                        strategy_gross = trade_gross * size_mult
+                        result_price = entry_price * (1.0 + strategy_gross / 100.0)
+                        review_snap["final_remaining_frac"] = 0.0
+                        review_snap["final_strategy_gross_pct"] = round(strategy_gross, 6)
+                        result_details.update({
+                            "final_trade_gross_pct": round(trade_gross, 6),
+                            "final_strategy_gross_pct": round(strategy_gross, 6),
+                            "final_size_mult": size_mult,
+                            "final_realized_weighted_pct": round(realized, 6),
+                            "final_remaining_frac_before_exit": round(rem, 6),
+                            "final_stop_stage": str(review_snap.get("final_stop_stage") or result_details.get("final_stop_stage") or ""),
+                        })
+                    elif is_final_control:
+                        # CONTROL은 기존 TP1(+1.5%) 50% + TP2(+3%)/BE(+0.15%) 구조의
+                        # 실제 원포지션 가중 손익을 기록한다. 단순 최종가격 수익률(3%/0.15%)로
+                        # 기록하면 NEW와 비교가 왜곡되므로 TP1 실현분을 반드시 합산한다.
+                        exit_pct_raw = (float(result_price) / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+                        if tp1_done:
+                            strategy_gross = 0.50 * float(self.cfg.tp1_pct) + 0.50 * exit_pct_raw
+                        else:
+                            strategy_gross = exit_pct_raw
+                        result_price = entry_price * (1.0 + strategy_gross / 100.0)
+                        review_snap["final_strategy_gross_pct"] = round(strategy_gross, 6)
+                        result_details.update({
+                            "final_trade_gross_pct": round(strategy_gross, 6),
+                            "final_strategy_gross_pct": round(strategy_gross, 6),
+                            "final_size_mult": 1.0,
+                            "final_control_tp1_weighted": bool(tp1_done),
+                        })
                     net_pct = (float(result_price) / entry_price - 1) * 100 if entry_price > 0 else 0.0
                     if variant == "P_V26" and result == "STOP":
                         try:
@@ -9864,6 +10261,17 @@ class DailyBot:
                                "parallel_lab_stop_trigger": str(review_snap.get("parallel_lab_stop_trigger") or result_details.get("parallel_lab_stop_trigger") or ""),
                                "parallel_lab_stop_signal_pct": review_snap.get("parallel_lab_stop_signal_pct",""),
                                "parallel_lab_late_streak": review_snap.get("parallel_lab_late_streak",""),
+                               "final_fwd_variant": str(review_snap.get("final_fwd_variant") or ""),
+                               "final_source_setup_id": str(review_snap.get("final_source_setup_id") or ""),
+                               "final_safe_block": bool(review_snap.get("final_safe_block")),
+                               "final_safe_flags": str(review_snap.get("final_safe_flags") or ""),
+                               "final_market_guard": bool(review_snap.get("final_market_guard")),
+                               "final_market_mode": str(review_snap.get("final_market_mode") or ""),
+                               "final_size_mult": review_snap.get("final_size_mult",""),
+                               "final_stop_stage": str(review_snap.get("final_stop_stage") or result_details.get("final_stop_stage") or ""),
+                               "final_remaining_frac": review_snap.get("final_remaining_frac",""),
+                               "final_realized_weighted_pct": review_snap.get("final_realized_weighted_pct",""),
+                               "final_strategy_gross_pct": result_details.get("final_strategy_gross_pct", review_snap.get("final_strategy_gross_pct","")),
                                "p_v274_ghost_type": variant if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_source_shadow_id": str(review_snap.get("p_v274_source_shadow_id") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_ghost_classification": str(result_details.get("classification") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
