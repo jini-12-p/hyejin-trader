@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.87-FinalForward4-TP18FullLogFix"
+BOT_RUNTIME_VERSION = "RC-v4.3.88-FixedShadow-SAFERelax-MKT100-PP12"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -497,6 +497,21 @@ class DailyConfig:
     research_final_30m_pnl_pct: float = -0.90
     research_final_30m_delta5_pct: float = -0.30
 
+    # v4.3.88 Fixed Shadow (research-only; LIVE/order path untouched).
+    # 최종 고정안: V25 -> SAFE(C/RN/RS) -> SAFE 특수레짐 비위험군 RELAX
+    # -> MKT100 -> TP +1.8% full -> 현 Final stop overlay + V27-1 fallback
+    # -> MFE +1.2% ARM 후 확정 5m 종가가 진입가 대비 -1.15% 이하이면 FULL 보호종료.
+    research_fixed_shadow_enabled: bool = True
+    research_fixed_safe_relax_window_short_hours: float = 14.0
+    research_fixed_safe_relax_window_long_hours: float = 18.0
+    research_fixed_safe_relax_edge_pctp: float = 8.0
+    research_fixed_safe_relax_min_safe_n: int = 5
+    research_fixed_safe_relax_min_pass_n: int = 5
+    research_fixed_micro_market_avg15_max_pct: float = -0.05
+    research_fixed_micro_market_ema_gap_max_pct: float = 1.20
+    research_fixed_pp_arm_mfe_pct: float = 1.20
+    research_fixed_pp_close_pct: float = -1.15
+
     # STOP EARLY50: 현재 TIER1보다 한 단계 빠른 50% Stage1 후보.
     research_parallel_early_min_age_minutes: float = 15.0
     research_parallel_early_max_age_minutes: float = 45.0
@@ -666,6 +681,7 @@ class DailyConfig:
         # v4.3.86: 과거 Parallel Lab은 신규진입 OFF. 열린 Shadow는 관리루프에서 끝까지 마무리한다.
         cfg.research_parallel_lab_enabled = False
         cfg.research_final_forward_enabled = True
+        cfg.research_fixed_shadow_enabled = True
         return cfg
 
 
@@ -835,6 +851,12 @@ SCAN_REJECTED_FIELDS = [
     "final_market_guard", "final_market_mode", "final_size_mult",
     "final_stop_stage", "final_remaining_frac", "final_realized_weighted_pct",
     "final_strategy_gross_pct",
+    # v4.3.88 fixed-shadow telemetry
+    "fixed_safe_micro_risk", "fixed_safe_regime_relax_on", "fixed_safe_relaxed",
+    "fixed_safe_effective_block", "fixed_safe_regime_edge_pctp",
+    "fixed_safe_14h_safe_n", "fixed_safe_14h_safe_pos_pct", "fixed_safe_14h_pass_n", "fixed_safe_14h_pass_pos_pct", "fixed_safe_14h_diff_pctp",
+    "fixed_safe_18h_safe_n", "fixed_safe_18h_safe_pos_pct", "fixed_safe_18h_pass_n", "fixed_safe_18h_pass_pos_pct", "fixed_safe_18h_diff_pctp",
+    "fixed_pp_armed", "fixed_pp_arm_mfe_pct", "fixed_pp_last_close_pct", "fixed_pp_triggered",
     "shadow_id", "research_variant", "shadow_entry_time", "mfe_pct", "mae_pct",
     "shadow_age_min", "shadow_exit_pct", "shadow_stop_type",
 ]
@@ -7331,6 +7353,130 @@ class DailyBot:
             "final_safe_version": "SAFE_C_RN_RS_20260918",
         }
 
+    def _fixed_micro_market_meta(self, details: dict[str, Any]) -> dict[str, Any]:
+        """v4.3.88: SAFE RELAX에서 절대 풀지 않을 미세시장 위험형.
+
+        연구 고정 기준: BTC/ETH 15m 평균 <= -0.05% AND 종목 EMA9-20 gap <= 1.20%.
+        SAFE 자체를 새로 켜는 조건이 아니라, SAFE가 이미 BLOCK한 거래를 RELAX할 때의 금지조건이다.
+        """
+        try:
+            btc15 = float(details.get("btc_15m_change_pct"))
+            eth15 = float(details.get("eth_15m_change_pct"))
+            gap = float(details.get("ema9_ema20_gap_pct"))
+        except (TypeError, ValueError):
+            return {
+                "fixed_safe_micro_risk": False,
+                "fixed_safe_micro_available": False,
+                "fixed_safe_micro_reason": "missing_telemetry",
+            }
+        avg15 = (btc15 + eth15) / 2.0
+        active = bool(
+            avg15 <= float(self.cfg.research_fixed_micro_market_avg15_max_pct)
+            and gap <= float(self.cfg.research_fixed_micro_market_ema_gap_max_pct)
+        )
+        return {
+            "fixed_safe_micro_risk": active,
+            "fixed_safe_micro_available": True,
+            "fixed_safe_micro_reason": "BTCETH15_WEAK_AND_GAP_SMALL" if active else "NORMAL",
+            "fixed_safe_btc15_pct": round(btc15, 4),
+            "fixed_safe_eth15_pct": round(eth15, 4),
+            "fixed_safe_btceth15_avg_pct": round(avg15, 4),
+            "fixed_safe_ema9_20_gap_pct": round(gap, 4),
+        }
+
+    def _fixed_safe_relax_regime_meta(self, now: datetime | None = None) -> dict[str, Any]:
+        """v4.3.88: 최근 CONTROL 성과로 SAFE 비위험 차단군의 '역전 레짐'만 감지한다.
+
+        14h와 18h 두 창 모두에서 비위험 SAFE 차단군의 양(+) 종료 비율이
+        SAFE PASS군보다 +8%p 이상 높고, 양쪽 표본이 최소수 이상일 때만 RELAX ON.
+        결과는 research-only P_FWD_CONTROL의 완료거래만 사용하므로 LIVE 주문과 무관하다.
+        """
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        short_h = float(self.cfg.research_fixed_safe_relax_window_short_hours)
+        long_h = float(self.cfg.research_fixed_safe_relax_window_long_hours)
+        edge = float(self.cfg.research_fixed_safe_relax_edge_pctp)
+        min_safe = max(1, int(self.cfg.research_fixed_safe_relax_min_safe_n))
+        min_pass = max(1, int(self.cfg.research_fixed_safe_relax_min_pass_n))
+        cutoff = now - timedelta(hours=max(short_h, long_h))
+
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT result_ts,entry_price,result_price,snapshot_json
+                   FROM research_shadow_reviews
+                   WHERE variant='P_FWD_CONTROL' AND completed=1 AND result_ts>=?
+                   ORDER BY result_ts""",
+                (cutoff.isoformat(),),
+            ).fetchall()
+
+        obs: list[tuple[datetime, bool, bool, bool]] = []
+        for row in rows:
+            try:
+                ts = datetime.fromisoformat(str(row["result_ts"] or ""))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                snap = json.loads(str(row["snapshot_json"] or "{}"))
+                safe_block = bool(snap.get("final_safe_block"))
+                micro_meta = self._fixed_micro_market_meta(snap)
+                micro = bool(micro_meta.get("fixed_safe_micro_risk"))
+                micro_available = bool(micro_meta.get("fixed_safe_micro_available"))
+                entry = float(row["entry_price"] or 0)
+                result_price = float(row["result_price"] or 0)
+                positive = bool(entry > 0 and result_price > entry)
+                # SAFE 차단군은 micro telemetry가 확인되는 경우에만 비위험/위험을 분류한다.
+                # 과거 telemetry 누락을 비위험으로 오인해 RELAX가 켜지는 일을 막는다.
+                if safe_block and not micro_available:
+                    continue
+                obs.append((ts, safe_block, micro, positive))
+            except Exception:
+                continue
+
+        def _window(hours: float) -> dict[str, Any]:
+            cut = now - timedelta(hours=hours)
+            safe_vals: list[bool] = []
+            pass_vals: list[bool] = []
+            for ts, safe_block, micro, positive in obs:
+                if ts < cut:
+                    continue
+                if safe_block:
+                    if not micro:
+                        safe_vals.append(positive)
+                else:
+                    pass_vals.append(positive)
+            safe_n = len(safe_vals); pass_n = len(pass_vals)
+            safe_rate = (100.0 * sum(safe_vals) / safe_n) if safe_n else None
+            pass_rate = (100.0 * sum(pass_vals) / pass_n) if pass_n else None
+            diff = (safe_rate - pass_rate) if safe_rate is not None and pass_rate is not None else None
+            enough = bool(safe_n >= min_safe and pass_n >= min_pass)
+            on = bool(enough and diff is not None and diff >= edge)
+            return {
+                "safe_n": safe_n, "pass_n": pass_n,
+                "safe_rate": safe_rate, "pass_rate": pass_rate,
+                "diff": diff, "enough": enough, "on": on,
+            }
+
+        w14 = _window(short_h)
+        w18 = _window(long_h)
+        active = bool(w14["on"] and w18["on"])
+        return {
+            "fixed_safe_regime_relax_on": active,
+            "fixed_safe_regime_edge_pctp": edge,
+            "fixed_safe_regime_min_safe_n": min_safe,
+            "fixed_safe_regime_min_pass_n": min_pass,
+            "fixed_safe_14h_safe_n": w14["safe_n"],
+            "fixed_safe_14h_safe_pos_pct": (round(w14["safe_rate"], 3) if w14["safe_rate"] is not None else None),
+            "fixed_safe_14h_pass_n": w14["pass_n"],
+            "fixed_safe_14h_pass_pos_pct": (round(w14["pass_rate"], 3) if w14["pass_rate"] is not None else None),
+            "fixed_safe_14h_diff_pctp": (round(w14["diff"], 3) if w14["diff"] is not None else None),
+            "fixed_safe_18h_safe_n": w18["safe_n"],
+            "fixed_safe_18h_safe_pos_pct": (round(w18["safe_rate"], 3) if w18["safe_rate"] is not None else None),
+            "fixed_safe_18h_pass_n": w18["pass_n"],
+            "fixed_safe_18h_pass_pos_pct": (round(w18["pass_rate"], 3) if w18["pass_rate"] is not None else None),
+            "fixed_safe_18h_diff_pctp": (round(w18["diff"], 3) if w18["diff"] is not None else None),
+            "fixed_safe_regime_version": "CONTROL_POS_14H18H_EDGE8_V1",
+        }
+
     def _final_market_guard_meta(self, details: dict[str, Any]) -> dict[str, Any]:
         """BTC/ETH 4h가 둘 다 ±0.08% 안쪽인 flat regime guard."""
         try:
@@ -7424,6 +7570,10 @@ class DailyBot:
                 "final_checkpoint15_done": False,
                 "final_checkpoint25_done": False,
                 "final_checkpoint30_done": False,
+                "fixed_pp_armed": False,
+                "fixed_pp_arm_mfe_pct": None,
+                "fixed_pp_last_close_pct": None,
+                "fixed_pp_triggered": False,
                 "p_v25_5m_bullish": bool(five_bullish),
                 "p_v25_prev_high_break": bool(high_break),
                 "p_v25_closed_5m_price": float(closed_5m_price),
@@ -7470,7 +7620,55 @@ class DailyBot:
             market_mode="CONTROL", size_mult=1.0, safe_meta=safe_meta, market_meta=market_meta,
         )
 
-        # NEW 계열은 SAFE가 ENTRY를 차단하면 세 경로 모두 실제 진입하지 않는다.
+        # v4.3.88 FIXED_SHADOW: 오늘 확정한 수정안을 별도 research-only 경로로 고정한다.
+        # 기존 CONTROL/CORE/MKT50/MKT100/LIVE에는 어떤 영향도 주지 않는다.
+        if bool(self.cfg.research_fixed_shadow_enabled):
+            fixed_micro = self._fixed_micro_market_meta(details)
+            fixed_regime = self._fixed_safe_relax_regime_meta(datetime.now(timezone.utc))
+            original_safe_block = bool(safe_meta.get("final_safe_block"))
+            # 미세시장 위험형은 SAFE 역전레짐이어도 절대 RELAX하지 않는다.
+            relaxed = bool(
+                original_safe_block
+                and bool(fixed_regime.get("fixed_safe_regime_relax_on"))
+                and bool(fixed_micro.get("fixed_safe_micro_available"))
+                and not bool(fixed_micro.get("fixed_safe_micro_risk"))
+            )
+            effective_safe_block = bool(original_safe_block and not relaxed)
+            fixed_meta = {
+                **fixed_micro, **fixed_regime,
+                "fixed_safe_relaxed": relaxed,
+                "fixed_safe_effective_block": effective_safe_block,
+            }
+            fixed_safe_meta = {**safe_meta, **fixed_meta}
+            guard = bool(market_meta.get("final_market_guard"))
+            if effective_safe_block:
+                append_entry_record(
+                    symbol, "RESEARCH_P_FWD_FIXED_SHADOW_BLOCKED_SAFE", "P_FWD_FIXED_SHADOW",
+                    float(details.get("p_v2_score") or 0), entry_price,
+                    f"FIXED SAFE block={safe_meta.get('final_safe_flags') or 'UNKNOWN'}; relax={int(relaxed)}; actual_order=0",
+                    extra={**details, **fixed_safe_meta, **market_meta,
+                           "final_fwd_variant":"P_FWD_FIXED_SHADOW", "final_source_setup_id":source_setup_id,
+                           "final_market_mode":"MKT100", "final_size_mult":0.0},
+                )
+            elif guard:
+                append_entry_record(
+                    symbol, "RESEARCH_P_FWD_FIXED_SHADOW_BLOCKED_MARKET", "P_FWD_FIXED_SHADOW",
+                    float(details.get("p_v2_score") or 0), entry_price,
+                    "FIXED MKT100 BTC/ETH 4h flat guard => entry OFF; actual_order=0",
+                    extra={**details, **fixed_safe_meta, **market_meta,
+                           "final_fwd_variant":"P_FWD_FIXED_SHADOW", "final_source_setup_id":source_setup_id,
+                           "final_market_mode":"MKT100", "final_size_mult":0.0},
+                )
+            else:
+                self._open_final_forward_variant(
+                    variant="P_FWD_FIXED_SHADOW", symbol=symbol, details=details, source_setup_id=source_setup_id,
+                    entry_price=entry_price, closed_5m_price=closed_5m_price,
+                    five_bullish=five_bullish, high_break=high_break,
+                    market_mode="MKT100", size_mult=1.0,
+                    safe_meta=fixed_safe_meta, market_meta=market_meta,
+                )
+
+        # 기존 NEW 3계열은 SAFE가 ENTRY를 차단하면 실제 진입하지 않는다.
         if bool(safe_meta.get("final_safe_block")):
             for variant, mode in (("P_FWD_CORE","NONE"),("P_FWD_MKT50","MKT50"),("P_FWD_MKT100","MKT100")):
                 append_entry_record(
@@ -8914,7 +9112,7 @@ class DailyBot:
             is_parallel_stop = variant in parallel_stop_variants
             is_parallel_entry = variant in parallel_entry_variants
             is_parallel_recovery = bool(is_parallel_stop or is_parallel_entry)
-            final_new_variants = {"P_FWD_CORE", "P_FWD_MKT50", "P_FWD_MKT100"}
+            final_new_variants = {"P_FWD_CORE", "P_FWD_MKT50", "P_FWD_MKT100", "P_FWD_FIXED_SHADOW"}
             is_final_new = variant in final_new_variants
             is_final_control = variant == "P_FWD_CONTROL"
             # Final Forward CONTROL/New 모두 V27-1 fallback stop 골격을 공유한다.
@@ -9183,8 +9381,61 @@ class DailyBot:
                                 },
                             )
 
+                        # v4.3.88 FIXED_SHADOW PROFIT_PROTECT.
+                        # +1.2% MFE를 한 번이라도 확인하면 ARM. 그 뒤 확정 5분봉 종가가
+                        # 진입가 대비 -1.15% 이하이면 남은 물량 전량 보호종료한다.
+                        # FINAL NEW 공통이 아니라 P_FWD_FIXED_SHADOW에만 적용한다.
+                        if variant == "P_FWD_FIXED_SHADOW" and not result:
+                            pp_armed = bool(review_snap.get("fixed_pp_armed"))
+                            if (not pp_armed) and mfe_pct >= float(self.cfg.research_fixed_pp_arm_mfe_pct):
+                                pp_armed = True
+                                review_snap["fixed_pp_armed"] = True
+                                review_snap["fixed_pp_arm_mfe_pct"] = round(mfe_pct, 4)
+                                review_snap["fixed_pp_arm_ts"] = utc_now()
+                                _final_save_snapshot()
+                                append_entry_record(
+                                    symbol, "RESEARCH_P_FWD_FIXED_SHADOW_PP12_ARM", "P_FWD_FIXED_SHADOW",
+                                    float(review["new_p_score"] or 0), price,
+                                    f"MFE={mfe_pct:.3f}% >= {self.cfg.research_fixed_pp_arm_mfe_pct:.2f}%; actual_order=0",
+                                    extra={
+                                        "shadow_id":str(review["shadow_id"] or ""),
+                                        "research_variant":"P_FWD_FIXED_SHADOW",
+                                        "final_fwd_variant":"P_FWD_FIXED_SHADOW",
+                                        "fixed_pp_armed":True,
+                                        "fixed_pp_arm_mfe_pct":round(mfe_pct,4),
+                                        "mfe_pct":round(mfe_pct,4), "mae_pct":round(mae_pct,4),
+                                        "shadow_age_min":round(age_min,2), **market_snapshot,
+                                    },
+                                )
+
+                            if pp_armed and five_due and not result:
+                                m5_pp = _parallel_m5(symbol)
+                                if m5_pp is not None and len(m5_pp) > 0:
+                                    close5 = float(m5_pp.iloc[-1].close)
+                                    high5 = float(m5_pp.iloc[-1].high)
+                                    close5_pct = (close5 / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+                                    review_snap["fixed_pp_last_close_pct"] = round(close5_pct, 4)
+                                    review_snap["fixed_pp_last_close_price"] = close5
+                                    review_snap["fixed_pp_last_high_price"] = high5
+                                    # 같은 확정 5분봉 안에서 +1.8% TP가 한 번이라도 닿았다면
+                                    # 거래소 TP가 먼저 체결됐어야 하므로 PP가 그 TP를 덮어쓰지 않는다.
+                                    pp_bar_hit_tp = bool(high5 >= tp1_price)
+                                    if (not pp_bar_hit_tp) and close5_pct <= float(self.cfg.research_fixed_pp_close_pct):
+                                        result, result_price = "PROFIT_PROTECT_EXIT", close5
+                                        review_snap["fixed_pp_triggered"] = True
+                                        review_snap["final_stop_stage"] = "PP12_CLOSE_M115_FULL"
+                                        result_details = {
+                                            "stop_type":"PP12_CLOSE_M115_FULL",
+                                            "final_stop_stage":"PP12_CLOSE_M115_FULL",
+                                            "fixed_pp_armed":True,
+                                            "fixed_pp_arm_mfe_pct":review_snap.get("fixed_pp_arm_mfe_pct"),
+                                            "fixed_pp_last_close_pct":round(close5_pct,4),
+                                            "fixed_pp_triggered":True,
+                                        }
+                                    _final_save_snapshot()
+
                         # 10분 체크포인트는 최초 1회만 판정한다.
-                        if age_min >= 10.0 and not bool(review_snap.get("final_checkpoint10_done")):
+                        if not result and age_min >= 10.0 and not bool(review_snap.get("final_checkpoint10_done")):
                             review_snap["final_checkpoint10_done"] = True
                             review_snap["final_checkpoint10_pnl_pct"] = round(pnl_now, 4)
                             review_snap["final_checkpoint10_mfe_pct"] = round(mfe_pct, 4)
@@ -10290,6 +10541,25 @@ class DailyBot:
                                "final_remaining_frac": review_snap.get("final_remaining_frac",""),
                                "final_realized_weighted_pct": review_snap.get("final_realized_weighted_pct",""),
                                "final_strategy_gross_pct": result_details.get("final_strategy_gross_pct", review_snap.get("final_strategy_gross_pct","")),
+                               "fixed_safe_micro_risk": review_snap.get("fixed_safe_micro_risk",""),
+                               "fixed_safe_regime_relax_on": review_snap.get("fixed_safe_regime_relax_on",""),
+                               "fixed_safe_relaxed": review_snap.get("fixed_safe_relaxed",""),
+                               "fixed_safe_effective_block": review_snap.get("fixed_safe_effective_block",""),
+                               "fixed_safe_regime_edge_pctp": review_snap.get("fixed_safe_regime_edge_pctp",""),
+                               "fixed_safe_14h_safe_n": review_snap.get("fixed_safe_14h_safe_n",""),
+                               "fixed_safe_14h_safe_pos_pct": review_snap.get("fixed_safe_14h_safe_pos_pct",""),
+                               "fixed_safe_14h_pass_n": review_snap.get("fixed_safe_14h_pass_n",""),
+                               "fixed_safe_14h_pass_pos_pct": review_snap.get("fixed_safe_14h_pass_pos_pct",""),
+                               "fixed_safe_14h_diff_pctp": review_snap.get("fixed_safe_14h_diff_pctp",""),
+                               "fixed_safe_18h_safe_n": review_snap.get("fixed_safe_18h_safe_n",""),
+                               "fixed_safe_18h_safe_pos_pct": review_snap.get("fixed_safe_18h_safe_pos_pct",""),
+                               "fixed_safe_18h_pass_n": review_snap.get("fixed_safe_18h_pass_n",""),
+                               "fixed_safe_18h_pass_pos_pct": review_snap.get("fixed_safe_18h_pass_pos_pct",""),
+                               "fixed_safe_18h_diff_pctp": review_snap.get("fixed_safe_18h_diff_pctp",""),
+                               "fixed_pp_armed": review_snap.get("fixed_pp_armed",""),
+                               "fixed_pp_arm_mfe_pct": review_snap.get("fixed_pp_arm_mfe_pct",""),
+                               "fixed_pp_last_close_pct": review_snap.get("fixed_pp_last_close_pct",""),
+                               "fixed_pp_triggered": review_snap.get("fixed_pp_triggered",""),
                                "p_v274_ghost_type": variant if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_source_shadow_id": str(review_snap.get("p_v274_source_shadow_id") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
                                "p_v274_ghost_classification": str(result_details.get("classification") or "") if variant in ("P_V27_4_BLOCK_GHOST","P_V27_4_STOP_GHOST") else "",
