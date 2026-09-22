@@ -25,7 +25,7 @@ DB_PATH = Path(__file__).with_name("bybit_swing_bot.db")
 CONFIG_PATH = Path(__file__).with_name("config.json")
 KST = timezone(timedelta(hours=9))
 SCAN_REJECTED_CSV_PATH = Path(__file__).with_name("scan_rejected.csv")
-BOT_RUNTIME_VERSION = "RC-v4.3.88-FixedShadow-SAFERelax-MKT100-PP12"
+BOT_RUNTIME_VERSION = "RC-v4.3.89-ManualPShadow-TP20-Stop4"
 
 # HJ 신고점 돌파 예외는 한 번의 순간 스파이크로 열지 않는다.
 # 같은 종목이 다음 스캔에서도 돌파 상태를 유지해야 "확인된 돌파"로 인정한다.
@@ -9112,7 +9112,7 @@ class DailyBot:
             is_parallel_stop = variant in parallel_stop_variants
             is_parallel_entry = variant in parallel_entry_variants
             is_parallel_recovery = bool(is_parallel_stop or is_parallel_entry)
-            final_new_variants = {"P_FWD_CORE", "P_FWD_MKT50", "P_FWD_MKT100", "P_FWD_FIXED_SHADOW"}
+            final_new_variants = {"P_FWD_CORE", "P_FWD_MKT50", "P_FWD_MKT100", "P_FWD_FIXED_SHADOW", "P_MANUAL_SHADOW"}
             is_final_new = variant in final_new_variants
             is_final_control = variant == "P_FWD_CONTROL"
             # Final Forward CONTROL/New 모두 V27-1 fallback stop 골격을 공유한다.
@@ -9144,8 +9144,17 @@ class DailyBot:
                 tp1_done = bool(int(review["tp1_done"] or 0))
                 v26_late_fail_streak = int(review["v26_late_fail_streak"] or 0)
                 if is_final_new:
-                    tp1_price = entry_price * (1 + float(self.cfg.research_final_tp_pct) / 100)
-                    tp2_price = tp1_price  # +1.8% 전량익절 기준값. final-new는 TP18_FULL 단일 이벤트로 종료한다.
+                    # 각 Final Shadow가 진입 snapshot에 저장한 TP를 우선 사용한다.
+                    # 기존 자동 Final Forward는 +1.8%, P_MANUAL_SHADOW는 +2.0%로 독립 검증한다.
+                    final_tp_pct = float(
+                        review_snap.get("final_tp_pct")
+                        if review_snap.get("final_tp_pct") not in (None, "")
+                        else self.cfg.research_final_tp_pct
+                    )
+                    tp1_price = entry_price * (1 + final_tp_pct / 100)
+                    tp2_price = tp1_price  # Final New 계열은 전량익절 단일 이벤트로 종료한다.
+                    tp_full_result = "TP20_FULL" if variant == "P_MANUAL_SHADOW" else "TP18_FULL"
+                    tp_full_price_key = "tp20_price" if variant == "P_MANUAL_SHADOW" else "tp18_price"
                 else:
                     tp1_price = entry_price * (1 + float(self.cfg.tp1_pct) / 100)
                     tp2_price = float(review["tp2_price"] or entry_price * (1 + float(self.cfg.tp2_pct) / 100))
@@ -9336,7 +9345,7 @@ class DailyBot:
                     # minute_bars는 위에서 v4.3.84 intraminute guard를 적용한
                     # '진입 다음 완성 1분봉부터'의 경로만 재사용한다.
 
-                    # v4.3.86 Final Forward New 4-stage stop overlay.
+                    # v4.3.89 Final Forward + Manual P Shadow 공통 4-stage stop overlay.
                     # 10m DEAD: pnl<=-1.0 & MFE<=+0.10 => remaining의 50% 축소
                     # 15m: pnl<=-1.5 => remaining 전량 종료
                     # 25m GIVEBACK: 0.3<=MFE<=1.2 & pnl<=-1.2 => remaining의 50% 축소
@@ -10000,8 +10009,8 @@ class DailyBot:
                                     tp1_done = True
                                     if is_final_new:
                                         # v4.3.87: NEW 3경로는 +1.8% 전량익절을 TP18_FULL 한 줄로만 기록한다.
-                                        result, result_price = "TP18_FULL", tp1_price
-                                        result_details = {"tp18_price":tp1_price,"source":"confirmed_1m_high","final_full_tp":True}
+                                        result, result_price = tp_full_result, tp1_price
+                                        result_details = {tp_full_price_key:tp1_price,"tp_full_pct":final_tp_pct,"source":"confirmed_1m_high","final_full_tp":True}
                                         break
                                     if mb["high"] >= tp2_price:
                                         result, result_price = "TP2", tp2_price
@@ -10015,8 +10024,8 @@ class DailyBot:
                                 if is_final_new:
                                     # 이전 v4.3.86에서 tp1_done=1 상태로 남아 있던 미완료 row도 단일 TP18로 정리한다.
                                     if hit_tp2:
-                                        result, result_price = "TP18_FULL", tp2_price
-                                        result_details = {"tp18_price":tp2_price,"source":"confirmed_1m_high","final_full_tp":True}
+                                        result, result_price = tp_full_result, tp2_price
+                                        result_details = {tp_full_price_key:tp2_price,"tp_full_pct":final_tp_pct,"source":"confirmed_1m_high","final_full_tp":True}
                                     continue
                                 if is_pv2744:
                                     if hit_tp2 and hit_be and not v2744_be_partial_done:
@@ -10124,12 +10133,12 @@ class DailyBot:
                         if not result and not tp1_done and price >= tp1_price:
                             tp1_done = True
                             if is_final_new:
-                                result, result_price = "TP18_FULL", tp1_price
-                                result_details = {"tp18_price":tp1_price,"source":"ticker","final_full_tp":True}
+                                result, result_price = tp_full_result, tp1_price
+                                result_details = {tp_full_price_key:tp1_price,"tp_full_pct":final_tp_pct,"source":"ticker","final_full_tp":True}
                         if not result and tp1_done and not (is_pv2745 and v2745_be_recovery_active) and price >= tp2_price:
                             if is_final_new:
-                                result, result_price = "TP18_FULL", tp2_price
-                                result_details = {"tp18_price":tp2_price,"source":"ticker","final_full_tp":True}
+                                result, result_price = tp_full_result, tp2_price
+                                result_details = {tp_full_price_key:tp2_price,"tp_full_pct":final_tp_pct,"source":"ticker","final_full_tp":True}
                             else:
                                 result, result_price = "TP2", tp2_price
                                 result_details = {"tp2_price":tp2_price,"source":"ticker"}
