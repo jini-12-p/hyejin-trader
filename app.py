@@ -29,7 +29,7 @@ from strategy import StrategySettings, analyze_symbol, evaluate_live_entry, anal
 
 st.set_page_config(page_title="HJ Trader", page_icon="📈", layout="centered", initial_sidebar_state="collapsed")
 DB_PATH = Path(__file__).with_name("hyejin_trader.db")
-APP_VERSION = "STABLE-v4.3.11-LiveStable-DBLight1"
+APP_VERSION = "STABLE-v4.3.12-ManualPShadow"
 TOP_GAINER_LIMIT = 30
 STOCK_SCAN_LIMIT = 10
 DEFAULT_WATCHLIST: list[str] = []
@@ -1655,6 +1655,124 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
         except Exception:
             return str(value)[:19]
 
+    def _bs_public_last_price(symbol: str) -> float:
+        """Bybit public ticker에서 현재가만 읽는다. 주문 API는 호출하지 않는다."""
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return 0.0
+        try:
+            resp = requests.get(
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": "linear", "symbol": sym},
+                timeout=8,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if int(payload.get("retCode", -1)) != 0:
+                return 0.0
+            items = payload.get("result", {}).get("list", [])
+            if not items:
+                return 0.0
+            return float(items[0].get("lastPrice") or 0)
+        except Exception:
+            return 0.0
+
+    def _bs_open_manual_shadow(symbol: str, note: str = "") -> tuple[bool, str]:
+        """수동 선택 종목을 research-only P_MANUAL_SHADOW로 등록한다. 실제 주문은 0건이다."""
+        sym = str(symbol or "").upper().strip()
+        base = sym[:-4] if sym.endswith("USDT") else ""
+        if not base or not base.replace("1000", "", 1).isalnum():
+            return False, "USDT 무기한 종목명을 입력해주세요. 예: ARBUSDT"
+
+        # 반자동도 연구용 Final Forward와 같은 슬롯/15분 진입 상한을 지킨다.
+        try:
+            max_open = max(1, int(bs_cfg.get("research_final_max_open_positions", 4) or 4))
+        except Exception:
+            max_open = 4
+        try:
+            max_15m = max(1, int(bs_cfg.get("research_final_max_entries_per_15m", 2) or 2))
+        except Exception:
+            max_15m = 2
+
+        price = _bs_public_last_price(sym)
+        if price <= 0:
+            return False, f"{sym} 현재가를 확인하지 못했습니다."
+
+        now = datetime.now(timezone.utc)
+        opened_at = now.isoformat()
+        cutoff_15m = (now - timedelta(minutes=15)).isoformat()
+        shadow_id = f"RSH-P_MANUAL_SHADOW-{now.strftime('%Y%m%dT%H%M%S%f')}-{sym}"
+        setup_id = f"MANUAL-{now.strftime('%Y%m%dT%H%M%S%f')}-{sym}"
+        tp_pct = 2.0
+        be_pct = float(bs_cfg.get("breakeven_stop_pct", 0.15) or 0.15)
+        tp_price = price * (1.0 + tp_pct / 100.0)
+        be_price = price * (1.0 + be_pct / 100.0)
+        clean_note = str(note or "").strip()[:300]
+
+        snap = {
+            "manual_shadow": True,
+            "manual_source": "STREAMLIT_BUTTON",
+            "manual_requested_at": opened_at,
+            "manual_note": clean_note,
+            "final_fwd_variant": "P_MANUAL_SHADOW",
+            "final_market_mode": "MANUAL",
+            "final_size_mult": 1.0,
+            "final_tp_pct": tp_pct,
+            "final_remaining_frac": 1.0,
+            "final_realized_weighted_pct": 0.0,
+            "final_stop_stage": "NONE",
+            "final_checkpoint10_done": False,
+            "final_checkpoint15_done": False,
+            "final_checkpoint25_done": False,
+            "final_checkpoint30_done": False,
+            # PP12는 자동 Fixed Shadow 전용. Manual은 TP2.0 + 4단손절 + V27-1 fallback만 검증한다.
+            "fixed_pp_armed": False,
+            "fixed_pp_triggered": False,
+            "actual_order": 0,
+        }
+
+        try:
+            with sqlite3.connect(BYBIT_SWING_DB, timeout=20) as conn:
+                conn.row_factory = sqlite3.Row
+                open_n = int(conn.execute(
+                    "SELECT COUNT(*) FROM research_shadow_reviews WHERE variant='P_MANUAL_SHADOW' AND completed=0"
+                ).fetchone()[0] or 0)
+                if open_n >= max_open:
+                    return False, f"MANUAL Shadow 슬롯이 가득 찼습니다. ({open_n}/{max_open})"
+
+                already = conn.execute(
+                    "SELECT 1 FROM research_shadow_reviews WHERE variant='P_MANUAL_SHADOW' AND symbol=? AND completed=0 LIMIT 1",
+                    (sym,),
+                ).fetchone()
+                if already:
+                    return False, f"{sym} 수동 Shadow가 이미 진행 중입니다."
+
+                recent_n = int(conn.execute(
+                    "SELECT COUNT(*) FROM research_shadow_reviews WHERE variant='P_MANUAL_SHADOW' AND opened_at>=?",
+                    (cutoff_15m,),
+                ).fetchone()[0] or 0)
+                if recent_n >= max_15m:
+                    return False, f"최근 15분 MANUAL 진입 상한 {max_15m}건에 도달했습니다."
+
+                conn.execute(
+                    """INSERT INTO research_shadow_reviews(
+                        shadow_id,variant,symbol,opened_at,entry_ts_ms,entry_price,old_p_score,new_p_score,
+                        missing_condition,snapshot_json,tp2_price,be_price,highest_price,lowest_price,last_price,
+                        last_checked_at,last_5m_bucket,last_15m_bucket,mfe_pct,mae_pct,setup_id,v26_late_fail_streak
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        shadow_id, "P_MANUAL_SHADOW", sym, opened_at, int(now.timestamp()*1000), price, 0.0, 0.0,
+                        "MANUAL_ENTRY", json.dumps(snap, ensure_ascii=False), tp_price, be_price, price, price, price,
+                        opened_at, str(int(now.timestamp())//300), str(int(now.timestamp())//900), 0.0, 0.0, setup_id, 0,
+                    ),
+                )
+            return True, (
+                f"{sym} · 가상 진입가 {price:.10g} · TP +2.0% · "
+                f"4단손절/V27-1 자동관리 · 실제 주문 0"
+            )
+        except Exception as exc:
+            return False, f"수동 Shadow 등록 실패: {type(exc).__name__}: {exc}"
+
     bs_cfg = {}
     if BYBIT_SWING_CONFIG.exists():
         try:
@@ -1737,6 +1855,109 @@ if view_mode not in {"Bybit만 보기", "OKX PAPER만 보기"}:
 
             paused = _bs_state_get("pause_new_entries", "0") == "1"
             shutdown = _bs_state_get("shutdown_when_flat", "0") == "1"
+
+            st.markdown("### 🧪 MANUAL P Shadow · 반자동 가상매매")
+            st.caption(
+                "차트 판단/진입 선택은 직접 · 버튼을 누른 순간 Bybit 현재가로 가상진입 · "
+                "이후 TP +2.0% + 현재 4단손절 + V27-1 fallback을 봇이 자동관리 · 실제 주문 0"
+            )
+            ms1, ms2 = st.columns([2, 1])
+            manual_shadow_symbol = ms1.text_input(
+                "수동 가상진입 종목", value="", placeholder="예: ARBUSDT",
+                key="bs_manual_shadow_symbol", label_visibility="collapsed",
+            ).upper().strip()
+            manual_shadow_note = st.text_input(
+                "선택 이유 메모(선택)", value="", placeholder="예: 15분 눌림 후 양봉전환 / 거래량 재확대",
+                key="bs_manual_shadow_note", label_visibility="collapsed",
+            )
+            if ms2.button("🧪 가상진입", use_container_width=True, key="bs_manual_shadow_entry"):
+                ok, msg = _bs_open_manual_shadow(manual_shadow_symbol, manual_shadow_note)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.warning(msg)
+
+            try:
+                with sqlite3.connect(BYBIT_SWING_DB) as _mc:
+                    _mc.row_factory = sqlite3.Row
+                    manual_open = _mc.execute(
+                        """SELECT id,symbol,opened_at,entry_price,last_price,mfe_pct,mae_pct,snapshot_json
+                           FROM research_shadow_reviews
+                           WHERE variant='P_MANUAL_SHADOW' AND completed=0
+                           ORDER BY opened_at DESC"""
+                    ).fetchall()
+                    manual_done = _mc.execute(
+                        """SELECT id,symbol,opened_at,entry_price,result,result_ts,result_price,mfe_pct,mae_pct,snapshot_json,result_details
+                           FROM research_shadow_reviews
+                           WHERE variant='P_MANUAL_SHADOW' AND completed=1
+                           ORDER BY result_ts DESC"""
+                    ).fetchall()
+
+                _manual_max_open = max(1, int(bs_cfg.get("research_final_max_open_positions", 4) or 4))
+                _manual_max_15 = max(1, int(bs_cfg.get("research_final_max_entries_per_15m", 2) or 2))
+                st.caption(f"연구 제한: 동시 {_manual_max_open}슬롯 · 15분 내 최대 {_manual_max_15}진입")
+
+                if manual_open:
+                    st.write(f"진행 중 **{len(manual_open)}건**")
+                    for _r in manual_open:
+                        _entry=float(_r['entry_price'] or 0); _last=float(_r['last_price'] or _entry)
+                        _pct=((_last/_entry)-1)*100 if _entry>0 else 0.0
+                        try: _osnap=json.loads(_r['snapshot_json'] or '{}')
+                        except Exception: _osnap={}
+                        _stage=str(_osnap.get('final_stop_stage') or 'NONE')
+                        _target=_entry*1.02 if _entry>0 else 0.0
+                        st.write(
+                            f"• {_r['symbol']} · {_kst_time(_r['opened_at'])} · 진입 {_entry:.10g} · "
+                            f"현재 {_last:.10g} ({_pct:+.2f}%) · TP {_target:.10g} · "
+                            f"MFE {float(_r['mfe_pct'] or 0):+.2f}% · MAE {float(_r['mae_pct'] or 0):+.2f}% · {_stage}"
+                        )
+                else:
+                    st.caption("현재 진행 중인 MANUAL P Shadow 없음")
+
+                if manual_done:
+                    manual_export=[]
+                    for _r in manual_done:
+                        try: _snap=json.loads(_r['snapshot_json'] or '{}')
+                        except Exception: _snap={}
+                        try: _det=json.loads(_r['result_details'] or '{}')
+                        except Exception: _det={}
+                        _gross=_det.get('final_strategy_gross_pct', _snap.get('final_strategy_gross_pct'))
+                        if _gross in (None, ''):
+                            _entry=float(_r['entry_price'] or 0); _exit=float(_r['result_price'] or 0)
+                            _gross=((_exit/_entry)-1)*100 if _entry>0 and _exit>0 else 0.0
+                        manual_export.append({
+                            'entry_kst':_kst_time(_r['opened_at']),
+                            'symbol':_r['symbol'],
+                            'entry_price':_r['entry_price'],
+                            'tp_pct':_snap.get('final_tp_pct',2.0),
+                            'manual_note':_snap.get('manual_note',''),
+                            'result':_r['result'],
+                            'result_kst':_kst_time(_r['result_ts']),
+                            'result_price':_r['result_price'],
+                            'gross_pct':round(float(_gross or 0),6),
+                            'mfe_pct':round(float(_r['mfe_pct'] or 0),6),
+                            'mae_pct':round(float(_r['mae_pct'] or 0),6),
+                            'final_stop_stage':_det.get('final_stop_stage', _snap.get('final_stop_stage','')),
+                        })
+
+                    with st.expander(f"최근 MANUAL P Shadow 결과 · 누적 {len(manual_export)}건", expanded=False):
+                        for _x in manual_export[:10]:
+                            st.write(
+                                f"• {_x['symbol']} · {_x['result']} · {_x['gross_pct']:+.3f}% · "
+                                f"진입 {_x['entry_kst']} → 종료 {_x['result_kst']}"
+                            )
+                        _mout=io.StringIO()
+                        _mw=csv.DictWriter(_mout, fieldnames=list(manual_export[0].keys()))
+                        _mw.writeheader(); _mw.writerows(manual_export)
+                        st.download_button(
+                            "📥 MANUAL P Shadow 전체 CSV", _mout.getvalue().encode('utf-8-sig'),
+                            file_name=f"manual_p_shadow_{datetime.now().strftime('%Y%m%d_%H%M')}_KST.csv",
+                            mime="text/csv", use_container_width=True, key="bs_manual_shadow_csv",
+                        )
+            except Exception as exc:
+                st.warning(f"MANUAL P Shadow 표시 실패: {exc}")
+
             st.markdown("### 🛠️ Bybit Swing 봇 제어")
             st.success("신규 진입 허용" if not paused else "신규 진입 중지")
             b1,b2,b3=st.columns(3)
