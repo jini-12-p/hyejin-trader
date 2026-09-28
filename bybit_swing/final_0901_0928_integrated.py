@@ -82,13 +82,30 @@ def feat(one,cp):
  if q:
   cs=[x["c"] for x in q];e=ema(cs[-80:],20);ep=ema(cs[-81:-1],20) if len(cs)>=2 else None;o["sl"]=(e/ep-1)*100 if e and ep else None;o["rsi"]=rsi(cs)
  return o
+_fwd_meta = None
+def get_fwd_meta():
+ global _fwd_meta
+ if _fwd_meta is not None:return _fwd_meta
+ scan=next((q for q in [ROOT/"scan_FORWARD_20260923_TO_NOW_MKTREGIME_KST.csv",ROOT/"scan_FORWARD_20260923_TO_NOW_V22LOCK_KST.csv",ROOT/"scan_rejected.csv"] if q.exists()),None)
+ if scan is None:raise RuntimeError("no forward scan found")
+ M.SCAN=scan;M.EVAL_START_KST=datetime(2026,9,23,tzinfo=KST);M.WARM_START_KST=datetime(2026,9,22,8,tzinfo=KST)
+ df,a,b,end=M.load_scan_window();M.configure_unified(end);M.U.load_market_series()
+ setups={s["setup_id"]:s for s in M.U.load_setups()};cache={};out={}
+ for sid,st in setups.items():
+  out[sid]={"entry_price":st["entry_price"],"st":st}
+ _fwd_meta=(out,cache)
+ return _fwd_meta
+
 def policy(r):
  key=(r["symbol"],str(r["entry_time_kst"])[:19])
  if key in hist:return hist[key][0],hist[key][1],0
  if str(r["entry_time_kst"])[:10] < "2026-09-23":return f(r["net_pct"]), "NO_OBSERVER",0
  ent=datetime.strptime(str(r["entry_time_kst"])[:19],"%Y-%m-%d %H:%M:%S").replace(tzinfo=KST).astimezone(UTC)
- stop=datetime.strptime(str(r["exit_time_kst"])[:19],"%Y-%m-%d %H:%M:%S").replace(tzinfo=KST).astimezone(UTC);ep=f(r.get("entry_price"))
- if ep is None:return f(r["net_pct"]),"NO_ENTRY_PRICE",0
+ meta,cache=get_fwd_meta();sid=str(r["setup_id"])
+ if sid not in meta:return f(r["net_pct"]),"NO_SETUP_META",0
+ st=meta[sid]["st"];ep=f(meta[sid]["entry_price"])
+ sim=M.get_sim(st,cache)
+ stop=sim.exit_time
  one=M.api_1m(r["symbol"],ent-timedelta(minutes=90),stop+timedelta(hours=6,minutes=5));sf=feat(one,stop)
  obs=sf["vr"] is not None and sf["sl"] is not None and sf["vr"]<=2.61 and sf["sl"]>=.00061
  if not obs:return f(r["net_pct"]),"NO_OBSERVER",0
