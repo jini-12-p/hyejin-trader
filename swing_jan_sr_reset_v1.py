@@ -25,7 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-VERSION = "JAN_SR_RESET_V1_20260930"
+VERSION = "JAN_SR_RESET_V1_1_20260930"
 KST = "Asia/Seoul"
 STEP = pd.Timedelta(minutes=15)
 START = pd.Timestamp("2026-01-01", tz=KST).tz_convert("UTC")
@@ -105,6 +105,7 @@ low<=S1*1.004 AND close>=S1*0.998 AND close>open AND close>previous_close.
 S/R은 신호봉 시작 전에 알려진 상태만 사용; 신호봉이 레벨을 소급해 만들지 않음.
 A/B/C 모두 72시간 완전한 1H 히스토리가 있을 때부터 비교. D는 18개 완전한 4H도 필요.
 캔들 공백은 보간하지 않음. 필요한 과거봉이 비면 신호 안 만듦.
+15분 정각이 아닌 비정규/부분 봉은 가격이나 시각을 반올림해 만들지 않고 제외하며 감사표에 기록.
 보유 중 공백은 별도 기록, 낡은 가격에 임의로 STOP 체결시키지 않음.
 
 [진입가격 2개 시나리오]
@@ -176,18 +177,26 @@ def read_cache(path: Path) -> tuple[pd.DataFrame, dict]:
             raise ValueError(f"{path.name}: conflicting duplicate timestamps")
         d = d[~d.index.duplicated(keep="first")]
     d = d[(d.index >= DATA_START) & (d.index < HORIZON)]
+
+    # Some newly listed instruments can contain a partial first candle whose
+    # timestamp is not aligned to the exchange's normal 15m grid.  Never round
+    # or shift such a bar because that would manufacture a price at a time that
+    # did not exist.  Drop it and keep an explicit audit count instead.
+    on_grid = ((d.index.asi8 % STEP.value) == 0)
+    off_grid = int((~on_grid).sum())
+    d = d.loc[on_grid].copy()
+
     finite = np.isfinite(d.to_numpy()).all(axis=1)
     valid = (finite & (d[["open","high","low","close"]] > 0).all(axis=1)
              & (d.high >= d[["open","close","low"]].max(axis=1))
              & (d.low <= d[["open","close","high"]].min(axis=1))
              & (d.volume >= 0) & (d.turnover >= 0))
-    if len(d) and ((d.index.asi8 % STEP.value) != 0).any():
-        raise ValueError(f"{path.name}: times not on a 15m grid")
     invalid = int((~valid).sum())
     d = d.loc[valid].copy()
     jan = d[(d.index >= START) & (d.index < END)]
     gaps = int(np.maximum(np.diff(d.index.asi8)//STEP.value - 1, 0).sum()) if len(d)>1 else 0
-    audit = dict(file=path.name, usable_bars=len(d), january_bars=len(jan), invalid_rows=invalid,
+    audit = dict(file=path.name, usable_bars=len(d), january_bars=len(jan),
+                 off_grid_rows_dropped=off_grid, invalid_rows=invalid,
                  observed_first=d.index.min() if len(d) else None,
                  observed_last=d.index.max() if len(d) else None,
                  missing_intervals_inside_observed_span=gaps)
