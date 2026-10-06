@@ -27,7 +27,7 @@ a later exact replay must recalculate slots/cooldowns/replacement entries.
 from __future__ import annotations
 from pathlib import Path
 from datetime import timedelta
-import json, math, zipfile
+import json, math, zipfile, sys, types
 import numpy as np
 import pandas as pd
 
@@ -49,8 +49,12 @@ marker = "\nsay('V21 PP12 SELECTIVE EXACT: frozen DYN_HARD_STOP + PP Gate A/ABC/
 if marker not in src:
     raise SystemExit('V21 PREFIX MARKER NOT FOUND')
 prefix = src.split(marker, 1)[0]
-ns = {'__name__':'__v21_prefix__', '__file__':str(V21)}
-exec(compile(prefix, str(V21), 'exec'), ns)
+_mod_name = '__v21_prefix__'
+_mod = types.ModuleType(_mod_name)
+_mod.__file__ = str(V21)
+sys.modules[_mod_name] = _mod
+exec(compile(prefix, str(V21), 'exec'), _mod.__dict__)
+ns = _mod.__dict__
 
 U = ns['U']; ja_idx = ns['ja_idx']; se_idx = ns['se_idx']
 KST = ns['KST']; UTC = ns['UTC']
