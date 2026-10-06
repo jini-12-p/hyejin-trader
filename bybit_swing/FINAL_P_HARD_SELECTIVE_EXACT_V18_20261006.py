@@ -1772,7 +1772,7 @@ def v14_common_loss_guard(t):
     return bool(d6 is not None and d6 <= -30.0)
 
 def v14_residual_block(policy,sid,r,t):
-    r1,r2,r3=residual_risk_flags(r)
+    r1,r2,r3=residual_risk_flags_by_sid(sid)
     # R2/R3 are the low-9M-damage residual guards and stay on in every V14 policy.
     if r2 or r3:
         return True
